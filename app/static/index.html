@@ -195,6 +195,16 @@ mark { background: var(--warn-soft); color: inherit; border-radius: 3px; padding
   </section>
 </main>
 
+<dialog id="login">
+  <form class="body" onsubmit="doLogin(event)" style="min-width:320px">
+    <strong>Sign in to Payload Hub</strong>
+    <label for="loginUser">Username</label><input id="loginUser" autocomplete="username" required>
+    <label for="loginPass">Password</label><input id="loginPass" type="password" autocomplete="current-password" required>
+    <div class="meta" id="loginError" style="color:var(--bad)"></div>
+    <button type="submit">Sign in</button>
+  </form>
+</dialog>
+
 <dialog id="detail">
   <div class="head"><strong id="dTitle"></strong><span id="dStatus"></span><button class="secondary" style="margin-left:auto" onclick="detail.close()">Close</button></div>
   <div class="body" id="dBody"></div>
@@ -208,11 +218,36 @@ const ms = (v) => (v == null ? "–" : `${Number(v).toFixed(v < 10 ? 1 : 0)} ms`
 const time = (t) => new Date(t).toLocaleTimeString();
 const pill = (s) => `<span class="status ${esc(s)}">${esc(s)}</span>`;
 
+function token() { try { return sessionStorage.getItem("ph_token"); } catch { return null; } }
+
+async function authFetch(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${token() || ""}` } });
+  if (r.status === 401 && path.startsWith("/api/")) { showLogin(); throw new Error("Sign in required"); }
+  return r;
+}
+
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const r = await authFetch(path, opts);
   const body = await r.json().catch(() => ({}));
   if (!r.ok && r.status !== 503) throw new Error(body.detail ? JSON.stringify(body.detail) : r.statusText);
   return body;
+}
+
+function showLogin() { if (!$("login").open) $("login").showModal(); }
+
+async function doLogin(e) {
+  e.preventDefault();
+  $("loginError").textContent = "";
+  const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: $("loginUser").value, password: $("loginPass").value }) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { $("loginError").textContent = body.detail || "Sign-in failed"; return; }
+  try { sessionStorage.setItem("ph_token", body.token); } catch {}
+  $("login").close();
+  $("loginPass").value = "";
+  if (!token()) showLogin();
+loadSamples().then(() => applySample(true)).catch(() => {});
+  refresh();
 }
 
 async function loadSamples(select) {
@@ -268,7 +303,7 @@ async function uploadDoc(file) {
   $("docError").hidden = true;
   const form = new FormData(); form.append("file", file);
   try {
-    const r = await fetch("/api/mapping-doc", { method: "POST", body: form });
+    const r = await authFetch("/api/mapping-doc", { method: "POST", body: form });
     const body = await r.json();
     if (!r.ok) throw new Error(body.detail || r.statusText);
     mappingDoc = body;

@@ -9,10 +9,11 @@ Locally, start the backend first, then:
 
 On Streamlit Community Cloud there is no separate backend, so set EMBED_BACKEND = "true" in the
 app's secrets: the backend (and with it the Kafka pipeline) then starts inside this process.
-All settings - Kafka, DATABASE_URL, ANTHROPIC_API_KEY, APP_PASSWORD - can come from secrets.
+All settings - Kafka, DATABASE_URL, ANTHROPIC_API_KEY, ADMIN_PASSWORD - can come from secrets.
+Sign-in uses the users stored in PostgreSQL; the first start creates Administrator (password from
+ADMIN_PASSWORD, default "manage").
 """
 import asyncio
-import hmac
 import os
 import threading
 import time as clock
@@ -36,23 +37,6 @@ def _load_secrets():
 
 _load_secrets()
 
-
-def _require_password():
-    password = os.getenv("APP_PASSWORD")
-    if not password or st.session_state.get("authed"):
-        return
-    st.title("🔀 Payload Hub")
-    with st.form("login"):
-        entered = st.text_input("Password", type="password")
-        if st.form_submit_button("Sign in", type="primary"):
-            if hmac.compare_digest(entered.encode(), password.encode()):
-                st.session_state.authed = True
-                st.rerun()
-            st.error("Wrong password.")
-    st.stop()
-
-
-_require_password()
 
 # Streamlit Community Cloud checks repositories out under /mount/src; there is no separate backend
 # there, so the pipeline always runs in-process. Elsewhere EMBED_BACKEND decides.
@@ -138,7 +122,7 @@ def _start_backend():
     return server
 
 
-from ui import agent, common, connections, monitoring, partners, send, transactions  # noqa: E402
+from ui import agent, common, connections, monitoring, partners, send, transactions, users  # noqa: E402
 
 if EMBED_BACKEND:
     if problem := _setup_problem():
@@ -159,6 +143,62 @@ else:
     common.API = os.getenv("PAYLOAD_HUB_API", "http://localhost:8000")
 
 
+def _login_page():
+    st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
+    _, middle, _ = st.columns([1, 1.2, 1])
+    with middle:
+        st.title("🔀 Payload Hub")
+        st.caption("Kafka payload transformation · partner adapters · AI mapping agent")
+        if message := st.session_state.pop("login_message", None):
+            st.info(message)
+        with st.form("login"):
+            username = st.text_input("Username", autocomplete="username")
+            password = st.text_input("Password", type="password", autocomplete="current-password")
+            if st.form_submit_button("Sign in", type="primary", width="stretch"):
+                try:
+                    r = common.api("POST", "/api/auth/login", json={"username": username, "password": password})
+                except common.ApiError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state.auth_token, st.session_state.auth_user = r["token"], r["user"]
+                    st.rerun()
+        if EMBEDDED_DEFAULT_ADMIN:
+            st.caption("⚠️ Using the built-in Administrator account? Change its default password after signing in "
+                       "(sidebar → My account).")
+    st.stop()
+
+
+EMBEDDED_DEFAULT_ADMIN = EMBED_BACKEND and not os.getenv("ADMIN_PASSWORD")
+if not common.token():
+    _login_page()
+
+
+def _account():
+    u = common.user()
+    perms = [p for p, ok in (("read", u.get("can_read")), ("write", u.get("can_write")),
+                             ("delete", u.get("can_delete")), ("admin", u.get("is_admin"))) if ok]
+    st.markdown(f"**👤 {u.get('username')}**")
+    st.caption(" · ".join(perms) or "no permissions")
+    with st.expander("My account"):
+        with st.form("change_password", clear_on_submit=True):
+            current = st.text_input("Current password", type="password")
+            new = st.text_input("New password", type="password", help="At least 6 characters.")
+            if st.form_submit_button("Change password"):
+                try:
+                    common.api("POST", "/api/auth/password", json={"current_password": current, "new_password": new})
+                except common.ApiError as e:
+                    st.error("New password must be at least 6 characters." if "string_too_short" in str(e) else str(e))
+                else:
+                    common.sign_out("Password changed - please sign in with the new one.")
+                    st.rerun()
+    if st.button("Sign out", width="stretch"):
+        try:
+            common.api("POST", "/api/auth/logout")
+        finally:
+            common.sign_out("You've signed out.")
+        st.rerun()
+
+
 @st.fragment(run_every=10)
 def _health():
     h = common.api("GET", "/health", fatal=False)
@@ -169,14 +209,17 @@ def _health():
     st.caption("  \n".join(f"{'🟢' if v in ('up', 'running') else '🔴'} {k}: {v}" for k, v in items))
 
 
-nav = st.navigation([
+pages = [
     st.Page(partners.page, title="Partners", icon="🤝", url_path="partners", default=True),
     st.Page(connections.page, title="Connections", icon="🔌", url_path="connections"),
     st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
     st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
     st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),
     st.Page(monitoring.page, title="Monitoring", icon="📊", url_path="monitoring"),
-])
+]
+if common.can("admin"):
+    pages.append(st.Page(users.page, title="Users", icon="👥", url_path="users"))
+nav = st.navigation(pages)
 
 with st.sidebar:
     st.caption("Kafka payload transformation · PostgreSQL log · AI mapping agent")
@@ -184,8 +227,7 @@ with st.sidebar:
     _health()
     if not EMBED_BACKEND:
         st.caption(f"[Prometheus metrics]({common.API}/metrics) · [HTML UI]({common.API}/)")
-    if os.getenv("APP_PASSWORD") and st.button("Sign out"):
-        st.session_state.authed = False
-        st.rerun()
+    st.divider()
+    _account()
 
 nav.run()

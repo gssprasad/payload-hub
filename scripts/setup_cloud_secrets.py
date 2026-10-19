@@ -98,14 +98,15 @@ def main():
     ca_cert = find_ca_cert()
 
     print("\n3) App")
-    app_password = ask("Password for the demo app (Enter = generate one)", hidden=True, required=False)
+    app_password = ask("Initial Administrator password for the cloud app (Enter = generate one)", hidden=True,
+                       required=False)
     generated = not app_password
     app_password = app_password or secrets.token_urlsafe(9)
     anthropic_key = ask("Anthropic API key for the AI agent (Enter = skip)", hidden=True, required=False)
 
     env = {
         "EMBED_BACKEND": "true",
-        "APP_PASSWORD": app_password,
+        "ADMIN_PASSWORD": app_password,
         "DATABASE_URL": database_url,
         "KAFKA_BOOTSTRAP": bootstrap,
         "KAFKA_SECURITY_PROTOCOL": "SASL_SSL",
@@ -128,7 +129,7 @@ def main():
     SECRETS_FILE.chmod(0o600)
     print(f"\nSaved {SECRETS_FILE.relative_to(ROOT)} (not committed to git).")
     if generated:
-        print(f"Demo app password (generated): {app_password}")
+        print(f"Administrator password (generated): {app_password}  - sign in as 'Administrator'")
 
     if db_error or kafka_error:
         print("\nFix the failed connection and run this again before deploying. Common causes:")

@@ -85,6 +85,26 @@ export ANTHROPIC_API_KEY=your-key-here
 
 Each agent run is a paid Claude API call (typically a few cents).
 
+## Users and sign-in
+
+Both UIs require signing in. On first start the app creates **Administrator** with the password
+from `ADMIN_PASSWORD`, or `manage` if that isn't set. **Change it after the first sign-in**
+(sidebar → *My account*).
+
+Administrators add users on the **Users** page and give each one any of:
+
+| Permission | Allows |
+|------------|--------|
+| Read   | Viewing partners, transactions, monitoring and connections |
+| Write  | Onboarding and editing partners, mappings and connections; sending messages; running the AI agent |
+| Delete | Removing partners, documents and connections |
+| Admin  | Managing users |
+
+Permissions are enforced by the API itself (`/api/...` needs a session token), not just hidden in
+the UI. Passwords are stored as PBKDF2-SHA256 hashes. Sessions last 12 hours and end at once
+when a user signs out, changes password or is disabled. Partner endpoints (`/inbound/...`) keep
+using partner API keys; `/health` and `/metrics` stay open for monitoring tools.
+
 ## Partners
 
 The Streamlit app has six pages: **Partners**, **Connections**, **AI Agent**, **Send & Test**,
@@ -247,6 +267,6 @@ Streamlit Cloud runs only `streamlit_app.py`, so the pipeline runs inside it
 5. **Streamlit Cloud** (share.streamlit.io): **Create app** > select the repository, branch
    `main`, main file `streamlit_app.py`. Under **Advanced settings**, pick Python 3.12 or newer
    and paste the secrets. For an app that already exists: **Manage app > ⋮ > Settings > Secrets**.
-6. Open the app URL and sign in with `APP_PASSWORD`.
+6. Open the app URL and sign in as `Administrator` with `ADMIN_PASSWORD`.
 
 Streamlit Cloud puts idle apps to sleep; open the link shortly before a demo so it is awake.

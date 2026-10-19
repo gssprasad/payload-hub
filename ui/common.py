@@ -15,16 +15,44 @@ class ApiError(Exception):
     """The backend rejected a request; the message is safe to show to the user."""
 
 
+def token() -> str | None:
+    return st.session_state.get("auth_token")
+
+
+def user() -> dict:
+    return st.session_state.get("auth_user") or {}
+
+
+def can(permission: str) -> bool:
+    """permission: read | write | delete | admin"""
+    u = user()
+    return bool(u.get("is_admin") if permission == "admin" else u.get(f"can_{permission}"))
+
+
+def sign_out(message: str | None = None):
+    for k in ("auth_token", "auth_user"):
+        st.session_state.pop(k, None)
+    if message:
+        st.session_state.login_message = message
+
+
 def api(method: str, path: str, fatal: bool = True, **kwargs):
-    """Call the backend. If it is unreachable, stop the page with a readable message
+    """Call the backend as the signed-in user. If it is unreachable, stop the page with a readable message
     (or return None when fatal=False, e.g. for the sidebar health check)."""
+    headers = {**kwargs.pop("headers", {}), **({"Authorization": f"Bearer {token()}"} if token() else {})}
     try:
-        r = requests.request(method, f"{API}{path}", timeout=kwargs.pop("timeout", 30), **kwargs)
+        r = requests.request(method, f"{API}{path}", timeout=kwargs.pop("timeout", 30), headers=headers, **kwargs)
     except requests.ConnectionError:
         if not fatal:
             return None
         st.error(f"Can't reach the Payload Hub backend at {API}. Locally, start it with "
                  "`.venv/bin/uvicorn app.main:app --port 8000`. On Streamlit Cloud, check the app's secrets.")
+        st.stop()
+    if r.status_code == 401 and path.startswith("/api/") and path != "/api/auth/login":
+        sign_out("Your session has ended - please sign in again.")
+        st.rerun()
+    if r.status_code == 403:
+        st.error(f"🔒 {r.json().get('detail', 'Not allowed.')} Ask an administrator if you need it.")
         st.stop()
     if r.status_code == 204:
         return None
@@ -47,9 +75,16 @@ def queue_label(p: dict) -> str:
     return "Dedicated" if p.get("queue_mode") == "dedicated" else "Shared"
 
 
-@st.cache_data(ttl=5)
 def partners() -> list[dict]:
+    return _partners(token())
+
+
+@st.cache_data(ttl=5)
+def _partners(session_key: str | None) -> list[dict]:  # cached per signed-in session
     return api("GET", "/api/partners")
+
+
+partners.clear = _partners.clear
 
 
 def show_events(events: list[dict]):

@@ -53,7 +53,7 @@ def _for_partner(ready: bool):
     docs = p.get("documents", [])
     upload = st.file_uploader("Add a mapping document to this partner (optional)", type=["xlsx", "xlsm", "csv"],
                               key=f"agent_upload_{code}")
-    if upload is not None and st.button("Save document to partner", key=f"agent_save_doc_{code}"):
+    if upload is not None and st.button("Save document to partner", key=f"agent_save_doc_{code}", disabled=not common.can("write")):
         try:
             api("POST", f"/api/partners/{code}/documents", files={"file": (upload.name, upload.getvalue())})
         except ApiError as e:
@@ -68,7 +68,7 @@ def _for_partner(ready: bool):
                                 placeholder="Optional with documents, e.g. 'Dates as YYYY-MM-DD. Skip internal notes.'")
     if p["expression"]:
         st.caption("This partner already has a mapping; a successful run replaces it.")
-    if st.button("Run agent", type="primary", disabled=not ready):
+    if st.button("Run agent", type="primary", disabled=not (ready and common.can("write"))):
         if not chosen and len(instructions.strip()) < 3:
             st.warning("Choose a mapping document or write instructions.")
             return
@@ -113,7 +113,7 @@ def _standalone(ready: bool):
     payload = st.text_area("Sample payload *", height=220, placeholder="Paste a real example of the input message")
     instructions = st.text_area("Instructions", height=110,
                                 placeholder="Optional with a document, e.g. 'Turn this order into a shipment as XML…'")
-    if st.button("Run agent", type="primary", disabled=not ready):
+    if st.button("Run agent", type="primary", disabled=not (ready and common.can("write"))):
         if not payload.strip():
             st.warning("Paste a sample payload - the agent tests its mapping against it.")
             return

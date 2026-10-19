@@ -120,7 +120,29 @@ UPDATE partners SET api_key = 'ph_' || md5(random()::text || code) WHERE api_key
 
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS delivery_status text;
+
+CREATE TABLE IF NOT EXISTS users (
+    username      text PRIMARY KEY,
+    password_hash text NOT NULL,
+    can_read      boolean NOT NULL DEFAULT true,
+    can_write     boolean NOT NULL DEFAULT false,
+    can_delete    boolean NOT NULL DEFAULT false,
+    is_admin      boolean NOT NULL DEFAULT false,
+    active        boolean NOT NULL DEFAULT true,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    last_login_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (lower(username));
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash text PRIMARY KEY,
+    username   text NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
 """
+
+USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, created_at, last_login_at"
 
 PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_format", "sample_input",
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
@@ -482,6 +504,87 @@ async def set_delivery(txn_id, status):
     async with pool.connection() as conn:
         await conn.execute("UPDATE transactions SET delivery_status = %s, updated_at = now() WHERE id = %s",
                            (status, txn_id))
+
+
+async def count_users():
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) AS n FROM users")
+        return (await cur.fetchone())["n"]
+
+
+async def list_users():
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"SELECT {USER_COLUMNS} FROM users ORDER BY lower(username)")
+        return await cur.fetchall()
+
+
+async def get_user(username, with_hash=False):
+    cols = USER_COLUMNS + (", password_hash" if with_hash else "")
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"SELECT {cols} FROM users WHERE lower(username) = lower(%s)", (username,))
+        return await cur.fetchone()
+
+
+async def create_user(username, password_hash, can_read, can_write, can_delete, is_admin):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO users (username, password_hash, can_read, can_write, can_delete, is_admin)
+               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING username""",
+            (username, password_hash, can_read, can_write, can_delete, is_admin))
+        return (await cur.fetchone()) is not None
+
+
+async def update_user(username, **fields):
+    allowed = {"password_hash", "can_read", "can_write", "can_delete", "is_admin", "active"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    async with pool.connection() as conn:
+        await conn.execute(f"UPDATE users SET {sets} WHERE lower(username) = lower(%s)", (*fields.values(), username))
+        if "password_hash" in fields or fields.get("active") is False:
+            await conn.execute("DELETE FROM sessions WHERE lower(username) = lower(%s)", (username,))
+
+
+async def delete_user(username):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM users WHERE lower(username) = lower(%s)", (username,))
+
+
+async def count_active_admins(excluding=None):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM users WHERE is_admin AND active AND lower(username) <> lower(coalesce(%s, ''))",
+            (excluding,))
+        return (await cur.fetchone())["n"]
+
+
+async def touch_login(username):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE users SET last_login_at = now() WHERE username = %s", (username,))
+
+
+async def create_session(token_hash, username, hours):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM sessions WHERE expires_at < now()")
+        await conn.execute(
+            "INSERT INTO sessions (token_hash, username, expires_at) VALUES (%s, %s, now() + make_interval(hours => %s))",
+            (token_hash, username, hours))
+
+
+async def get_session_user(token_hash):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""SELECT {', '.join('u.' + c.strip() for c in USER_COLUMNS.split(','))}
+                FROM sessions s JOIN users u ON u.username = s.username
+                WHERE s.token_hash = %s AND s.expires_at > now() AND u.active""",
+            (token_hash,))
+        return await cur.fetchone()
+
+
+async def delete_session(token_hash):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM sessions WHERE token_hash = %s", (token_hash,))
 
 
 async def ping():

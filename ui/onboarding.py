@@ -166,7 +166,7 @@ def _review(wiz):
                                          if wiz.get("inbound_connection") else "") + "  \n"
                 f"**Outbound:** " + (f"`{wiz['outbound_connection']}` → `{wiz.get('outbound_target', '')}`"
                                      if wiz.get("outbound_connection") else "store only"))
-    if st.button("✅ Create partner", type="primary"):
+    if st.button("✅ Create partner", type="primary", disabled=not common.can("write")):
         body = {k: (wiz.get(k) or None) for k in ("name", "code", "description", "contact", "sample_input",
                                                   "expected_output", "expression", "inbound_connection",
                                                   "inbound_source", "outbound_connection", "outbound_target")}

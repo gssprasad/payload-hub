@@ -88,7 +88,7 @@ def _add_connection(types):
         with st.form(f"new_conn_{type_key}", clear_on_submit=False):
             name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{type_key}")
             config, secret = _fields_form(type_key, spec, {}, f"new_{type_key}")
-            if st.form_submit_button("Save and test", type="primary"):
+            if st.form_submit_button("Save and test", type="primary", disabled=not common.can("write")):
                 try:
                     c = api("POST", "/api/connections",
                             json={"name": name, "type": type_key, "config": config, "secret": secret})
@@ -117,8 +117,8 @@ def _connection_card(c, types):
             r = api("POST", f"/api/connections/{c['id']}/test")
             (st.toast if r["ok"] else st.error)(r["detail"])
             st.rerun()
-        show_send = b[1].toggle("Send", key=f"send_toggle_{c['id']}", help="Send a test message through this connection")
-        show_edit = b[2].toggle("Edit", key=f"edit_toggle_{c['id']}")
+        show_send = b[1].toggle("Send", key=f"send_toggle_{c['id']}", disabled=not common.can("write"), help="Send a test message through this connection")
+        show_edit = b[2].toggle("Edit", key=f"edit_toggle_{c['id']}", disabled=not common.can("write"))
 
         if show_send:
             with st.form(f"send_{c['id']}"):
@@ -127,7 +127,7 @@ def _connection_card(c, types):
                 body = st.text_area("Message body", '{"hello": "from Payload Hub"}', height=120, key=f"send_body_{c['id']}")
                 ctype = st.selectbox("Content type", ["application/json", "application/xml", "text/plain"],
                                      key=f"send_ct_{c['id']}")
-                if st.form_submit_button("Send message"):
+                if st.form_submit_button("Send message", disabled=not common.can("write")):
                     r = api("POST", f"/api/connections/{c['id']}/send",
                             json={"target": target, "body": body, "content_type": ctype})
                     (st.success if r["ok"] else st.error)(r["detail"])
@@ -146,7 +146,7 @@ def _connection_card(c, types):
                     else:
                         (st.toast if r["test_ok"] else st.error)(r["test_detail"])
                         st.rerun()
-                if delete.form_submit_button("Delete connection"):
+                if delete.form_submit_button("Delete connection", disabled=not common.can("delete")):
                     try:
                         api("DELETE", f"/api/connections/{c['id']}")
                     except ApiError as e:

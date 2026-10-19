@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from . import adapters, agent, connectors, db, mapping_doc, pipeline
+from . import adapters, agent, auth, connectors, db, mapping_doc, pipeline
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -25,6 +25,7 @@ STATIC = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(_app):
     await db.init()
+    await auth.ensure_admin()
     await pipeline.start()
     await connectors.start()
     yield
@@ -34,6 +35,126 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Payload Hub", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    """Every /api call needs a signed-in user with the right permission (read / write / delete / admin).
+    Partner endpoints (/inbound), the test receiver, /health and /metrics are outside /api."""
+    path = request.url.path
+    if not path.startswith("/api/") or path == "/api/auth/login":
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    token = header[7:] if header.lower().startswith("bearer ") else None
+    user = await auth.user_for_token(token)
+    if user is None:
+        return JSONResponse({"detail": "Sign in required."}, status_code=401)
+    permission = auth.required_permission(request.method, path)
+    if not auth.allowed(user, permission):
+        return JSONResponse({"detail": f"Your account doesn't have {permission} permission."}, status_code=403)
+    request.state.user = user
+    request.state.token = token
+    return await call_next(request)
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+async def login(req: LoginIn):
+    result = await auth.login(req.username.strip(), req.password)
+    if result is None:
+        raise HTTPException(401, "Wrong username or password, or the account is disabled.")
+    token, user = result
+    return {"token": token, "user": user}
+
+
+@app.post("/api/auth/logout", status_code=204)
+async def logout(request: Request):
+    await db.delete_session(auth.token_hash(request.state.token))
+
+
+@app.get("/api/auth/me")
+async def me(request: Request):
+    return request.state.user
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6, max_length=200)
+
+
+@app.post("/api/auth/password", status_code=204)
+async def change_password(req: PasswordChange, request: Request):
+    username = request.state.user["username"]
+    stored = await db.get_user(username, with_hash=True)
+    if not auth.verify_password(req.current_password, stored["password_hash"]):
+        raise HTTPException(400, "Current password is wrong.")
+    await db.update_user(username, password_hash=auth.hash_password(req.new_password))
+
+
+# ---------- users (admins only) ----------
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=2, max_length=60, pattern=r"^[A-Za-z0-9._@-]+$")
+    password: str = Field(min_length=6, max_length=200)
+    can_read: bool = True
+    can_write: bool = False
+    can_delete: bool = False
+    is_admin: bool = False
+
+
+class UserUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=6, max_length=200)
+    can_read: bool | None = None
+    can_write: bool | None = None
+    can_delete: bool | None = None
+    is_admin: bool | None = None
+    active: bool | None = None
+
+
+@app.get("/api/users")
+async def users():
+    return await db.list_users()
+
+
+@app.post("/api/users", status_code=201)
+async def add_user(req: UserIn):
+    if not await db.create_user(req.username, auth.hash_password(req.password), req.can_read, req.can_write,
+                                req.can_delete, req.is_admin):
+        raise HTTPException(409, f"User '{req.username}' already exists.")
+    return await db.get_user(req.username)
+
+
+@app.put("/api/users/{username}")
+async def update_user(username: str, req: UserUpdate, request: Request):
+    target = await db.get_user(username)
+    if not target:
+        raise HTTPException(404, "User not found.")
+    fields = req.model_dump(exclude_unset=True, exclude={"password"})
+    removing_admin = (fields.get("is_admin") is False or fields.get("active") is False) and target["is_admin"]
+    if removing_admin and await db.count_active_admins(excluding=target["username"]) == 0:
+        raise HTTPException(409, "There must be at least one active administrator.")
+    if target["username"].lower() == request.state.user["username"].lower() and fields.get("active") is False:
+        raise HTTPException(409, "You can't disable your own account.")
+    if req.password:
+        fields["password_hash"] = auth.hash_password(req.password)
+    await db.update_user(target["username"], **fields)
+    return await db.get_user(target["username"])
+
+
+@app.delete("/api/users/{username}", status_code=204)
+async def delete_user(username: str, request: Request):
+    target = await db.get_user(username)
+    if not target:
+        raise HTTPException(404, "User not found.")
+    if target["username"].lower() == request.state.user["username"].lower():
+        raise HTTPException(409, "You can't delete your own account.")
+    if target["is_admin"] and await db.count_active_admins(excluding=target["username"]) == 0:
+        raise HTTPException(409, "There must be at least one active administrator.")
+    await db.delete_user(target["username"])
 
 
 class TransformRequest(BaseModel):
@@ -48,6 +169,7 @@ class TransformRequest(BaseModel):
 
 @app.get("/")
 async def index():
+    """The original single-page UI; it now needs a signed-in session (it shows a sign-in box)."""
     return FileResponse(STATIC / "index.html")
 
 

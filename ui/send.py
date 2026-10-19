@@ -32,7 +32,7 @@ def _partner_send():
     p = api("GET", f"/api/partners/{code}")
     st.caption(f"Goes to **{p['topic_in']}** → transformer → **{p['topic_out']}** (failures: {p['topic_dlq']})")
     payload = st.text_area("Payload", p["sample_input"] or "", height=280, key=f"send_payload_{code}")
-    if st.button("Send via Kafka", type="primary"):
+    if st.button("Send via Kafka", type="primary", disabled=not common.can("write")):
         _submit({"partner_code": code, "payload": payload})
 
 
@@ -59,7 +59,7 @@ def _adhoc_send():
     left, right = st.columns(2)
     left.text_area("Payload", key="adhoc_payload", height=280)
     right.text_area("Mapping expression (JMESPath)", key="adhoc_expr", height=280)
-    if st.button("Send via Kafka", type="primary"):
+    if st.button("Send via Kafka", type="primary", disabled=not common.can("write")):
         same = samples.get(ss.adhoc_mapping, {}).get("expression") == ss.adhoc_expr
         _submit({"payload": ss.adhoc_payload, "input_format": ss.adhoc_in, "output_format": ss.adhoc_out,
                  "expression": ss.adhoc_expr, "mapping_name": ss.adhoc_mapping if same else "custom"})

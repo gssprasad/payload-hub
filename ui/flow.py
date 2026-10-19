@@ -71,9 +71,9 @@ def _http_endpoint(p):
                 "**Try it** below for the demo. On your laptop it's a real URL you can call with curl or Postman.")
     c1, c2 = st.columns([3, 2])
     c1.text_input("Endpoint URL", url, disabled=True, key=f"url_{code}")
-    show = c2.toggle("Show API key", key=f"showkey_{code}")
-    c2.text_input("API key (header X-API-Key)", p["api_key"] if show else "•" * 20, disabled=True, key=f"key_{code}_{show}")
-    if c2.button("Rotate API key", key=f"rotate_{code}", help="Issue a new key; the old one stops working at once."):
+    show = c2.toggle("Show API key", key=f"showkey_{code}", disabled=not common.can("write"), help="Needs write permission.")
+    c2.text_input("API key (header X-API-Key)", p["api_key"] if show and common.can("write") else "•" * 20, disabled=True, key=f"key_{code}_{show}")
+    if c2.button("Rotate API key", key=f"rotate_{code}", disabled=not common.can("write"), help="Issue a new key; the old one stops working at once."):
         api("POST", f"/api/partners/{code}/api-key")
         st.toast("New API key issued", icon="🔑")
         st.rerun()
@@ -87,7 +87,7 @@ def _http_endpoint(p):
     with st.expander("▶️ Try it", expanded=False):
         payload = st.text_area("Request body", p["sample_input"] or "", height=200, key=f"try_body_{code}")
         wait = st.toggle("Wait for the result", value=True, key=f"try_wait_{code}")
-        if st.button("Send request", type="primary", key=f"try_send_{code}"):
+        if st.button("Send request", type="primary", key=f"try_send_{code}", disabled=not common.can("write")):
             try:
                 r = requests.post(url, data=payload.encode(), timeout=30, params={"wait": str(wait).lower()},
                                   headers={"X-API-Key": p["api_key"], "Content-Type": ctype})
@@ -127,7 +127,7 @@ def _adapters_form(p, conns, listeners):
             target = st.text_input("Queue / topic / path", p.get("outbound_target") or f"{code}.out",
                                    key=f"out_tgt_{code}")
             st.caption("Retries 3 times, then parks the message on the partner's failure queue.")
-        if st.form_submit_button("Save adapters", type="primary"):
+        if st.form_submit_button("Save adapters", type="primary", disabled=not common.can("write")):
             try:
                 api("PUT", f"/api/partners/{code}/adapters",
                     json={"inbound_connection": inbound or None, "inbound_source": source if inbound else None,
@@ -143,7 +143,7 @@ def _adapters_form(p, conns, listeners):
     elif p.get("inbound_connection") and p.get("inbound_source"):
         with st.expander("📨 Put a test message on the inbound queue"):
             body = st.text_area("Message", p["sample_input"] or "", height=160, key=f"mq_body_{code}")
-            if st.button("Send to inbound queue", key=f"mq_send_{code}"):
+            if st.button("Send to inbound queue", key=f"mq_send_{code}", disabled=not common.can("write")):
                 ctype = "application/xml" if p["input_format"] == "xml" else "application/json"
                 r = api("POST", f"/api/connections/{p['inbound_connection']}/send",
                         json={"target": p["inbound_source"], "body": body, "content_type": ctype})
@@ -156,7 +156,7 @@ def _kafka_queues(p):
     st.subheader("🟧 Kafka queues")
     st.markdown(f"**{queue_label(p)}**: `{p['topic_in']}` → `{p['topic_out']}` · failures `{p['topic_dlq']}`")
     target = "shared" if p["queue_mode"] == "dedicated" else "dedicated"
-    if st.button(f"Move to {target} queues", key=f"move_{code}",
+    if st.button(f"Move to {target} queues", key=f"move_{code}", disabled=not common.can("write"),
                  help="Messages already queued finish on the current queue; new ones use the new queue."):
         try:
             api("POST", f"/api/partners/{code}/queue", data={"queue_mode": target})
