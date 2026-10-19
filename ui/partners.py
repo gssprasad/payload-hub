@@ -168,14 +168,7 @@ def _mapping_tab(p):
         common.partners.clear()
         st.rerun()
     if r := st.session_state.get(f"agent_result_{code}"):
-        icon = "✅" if r["status"] == "SAVED" else "❌"
-        st.markdown(f"{icon} **{r['status']}** · {len(r['steps'])} tool calls · {r['duration_ms'] / 1000:.1f} s · "
-                    f"{r['usage']['input_tokens']:,} in / {r['usage']['output_tokens']:,} out tokens")
-        if r.get("explanation"):
-            st.info(r["explanation"])
-        if r.get("mapping"):
-            st.success("Saved as this partner's mapping (shown above).")
-            st.code(r["mapping"]["preview"], language=lang(r["mapping"]["output_format"]))
+        common.show_agent_result(r)
 
 
 def _documents_tab(p):

@@ -59,3 +59,34 @@ def show_events(events: list[dict]):
         df["at"] = pd.to_datetime(df["at"]).dt.tz_convert(None).dt.strftime("%H:%M:%S.%f").str[:-3]
         st.dataframe(df, hide_index=True, width="stretch",
                      column_config={"at": "Time", "stage": "Stage", "detail": "Detail"})
+
+
+def show_agent_result(r: dict):
+    """Status line, explanation, saved mapping with preview, and the agent's tool calls."""
+    icon = {"SAVED": "✅", "NOT_SAVED": "⚠️"}.get(r["status"], "❌")
+    st.markdown(f"{icon} **{r['status']}** · {len(r['steps'])} tool calls · {r['duration_ms'] / 1000:.1f} s · "
+                f"{r['usage']['input_tokens']:,} in / {r['usage']['output_tokens']:,} out tokens")
+    if r.get("explanation"):
+        st.info(r["explanation"])
+    if m := r.get("mapping"):
+        st.success(f"Saved as **{m['label']}** (`{m['name']}`)")
+        a, b = st.columns(2)
+        a.markdown("**Mapping expression**")
+        a.code(m["expression"], language="text")
+        b.markdown(f"**Preview output** ({m['output_format'].upper()})")
+        b.code(m["preview"], language=lang(m["output_format"]))
+    show_agent_steps(r["steps"])
+
+
+def show_agent_steps(steps: list[dict]):
+    if not steps:
+        return
+    with st.expander(f"What the agent did ({len(steps)} steps)"):
+        for i, s in enumerate(steps, 1):
+            detail = {"test_mapping": "output OK" if s["ok"] else s.get("result"),
+                      "save_mapping": f"saved “{s.get('name')}”" if s["ok"] else s.get("result"),
+                      "inspect_input": f"parsed the payload as {s.get('input_format')}"
+                                       + ("" if s["ok"] else f": {s.get('result')}")}.get(s["tool"], "")
+            st.markdown(f"{i}. {'✅' if s['ok'] else '❌'} `{s['tool']}` - {detail}")
+            if s["tool"] == "test_mapping" and s.get("expression"):
+                st.code(s["expression"], language="text")

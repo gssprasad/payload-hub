@@ -87,8 +87,8 @@ Each agent run is a paid Claude API call (typically a few cents).
 
 ## Partners
 
-The Streamlit app has four pages: **Partners**, **Send & Test**, **Transactions** and
-**Monitoring**.
+The Streamlit app has five pages: **Partners**, **AI Agent**, **Send & Test**, **Transactions**
+and **Monitoring**.
 
 **Onboarding.** On the Partners page, open *Onboard a new partner* and enter the name, input and
 output formats, a sample input, an optional expected output and an optional mapping. Choose the
@@ -110,6 +110,11 @@ mapping from its documents and sample input, and saves it on the partner.
 
 **Sending.** On Send & Test, choose *Partner* to send with that partner's mapping and queue, or
 *Ad-hoc mapping* to try any expression on the shared queues.
+
+**AI Agent.** A page for the mapping agent: shows whether an Anthropic key is configured, builds a
+mapping for a partner (from its documents and sample input, saved on the partner) or a standalone
+mapping (upload an Excel spec and paste a sample payload), and keeps a run history showing each
+step the agent took.
 
 **Monitoring.** A separate page with a partner filter: totals, success rate, latency, a
 per-minute chart, a by-partner table, every Kafka queue with messages and backlog, and recent

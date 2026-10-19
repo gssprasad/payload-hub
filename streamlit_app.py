@@ -138,7 +138,7 @@ def _start_backend():
     return server
 
 
-from ui import common, monitoring, partners, send, transactions  # noqa: E402
+from ui import agent, common, monitoring, partners, send, transactions  # noqa: E402
 
 if EMBED_BACKEND:
     if problem := _setup_problem():
@@ -170,6 +170,7 @@ def _health():
 
 nav = st.navigation([
     st.Page(partners.page, title="Partners", icon="🤝", url_path="partners", default=True),
+    st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
     st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
     st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),
     st.Page(monitoring.page, title="Monitoring", icon="📊", url_path="monitoring"),

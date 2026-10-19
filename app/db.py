@@ -378,6 +378,17 @@ async def delete_partner_document(code, doc_id):
         await conn.execute("DELETE FROM partner_documents WHERE partner_code = %s AND id = %s", (code, doc_id))
 
 
+async def get_agent_run(run_id):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT id, created_at, request, status, mapping_name, tool_calls, input_tokens, output_tokens,
+                      duration_ms, explanation, steps, mapping_doc_name, partner_code
+               FROM agent_runs WHERE id = %s""",
+            (run_id,),
+        )
+        return await cur.fetchone()
+
+
 async def ping():
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")

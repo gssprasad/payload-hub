@@ -1,5 +1,6 @@
 """FastAPI app: REST API, monitoring endpoints and the web UI."""
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
@@ -100,6 +101,21 @@ async def run_agent(req: AgentRequest):
 @app.get("/api/agent/runs")
 async def agent_runs(limit: int = 20):
     return await db.list_agent_runs(min(limit, 200))
+
+
+@app.get("/api/agent/runs/{run_id}")
+async def agent_run(run_id: int):
+    run = await db.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(404, "Agent run not found.")
+    return run
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    """Whether the agent can call Claude. Never returns the key itself."""
+    configured = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+    return {"configured": configured, "model": agent.MODEL}
 
 
 @app.post("/api/transform")
