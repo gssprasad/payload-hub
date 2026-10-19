@@ -156,7 +156,8 @@ async def list_transactions(limit=50, status=None, q=None, since=None, until=Non
         clauses.append("status = %s")
         args.append(status)
     if q:
-        like = f"%{q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')}%"
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped}%"
         text_match = ("mapping_name ILIKE %s OR partner_code ILIKE %s OR input_payload ILIKE %s"
                       " OR output_payload ILIKE %s OR error ILIKE %s")
         args += [like] * 5
