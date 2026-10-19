@@ -1,0 +1,26 @@
+{
+  "order": {
+    "id": "NR-20931",
+    "placedAt": "2026-10-18T14:05:00+05:30",
+    "currency": "INR",
+    "customer": {
+      "firstName": "Arjun",
+      "lastName": "Menon",
+      "email": "Arjun.Menon@Example.com",
+      "phone": "+91-98450-11223"
+    },
+    "delivery": {
+      "line1": "14 MG Road",
+      "city": "Bengaluru",
+      "pincode": "560001",
+      "country": "IN"
+    },
+    "items": [
+      {"sku": "YM-01", "name": "Yoga mat", "qty": 2, "price": 1299.0},
+      {"sku": "BL-07", "name": "Yoga block", "qty": 3, "price": 449.0},
+      {"sku": "ST-12", "name": "Cotton strap", "qty": 1, "price": 299.0}
+    ],
+    "giftWrap": true,
+    "couponCode": "FESTIVE10"
+  }
+}

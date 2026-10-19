@@ -1,0 +1,9 @@
+{
+  "order": {
+    "id": "NR-20932",
+    "customer": {"firstName": "Arjun", "lastName": "Menon"},
+    "items": [
+      {"sku": "YM-01", "qty": 2,
+    ]
+  }
+}

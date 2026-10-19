@@ -1,0 +1,27 @@
+{
+  "salesOrder": {
+    "orderId": "SO-ZP-45821",
+    "sourcePo": "ZP-45821",
+    "orderDate": "2026-10-15",
+    "currency": "INR",
+    "customer": {
+      "name": "Zenith Pharma Pvt Ltd",
+      "contact": "Meera Iyer",
+      "email": "meera.iyer@zenithpharma.example"
+    },
+    "shipTo": {
+      "addressLine": "Plot 12, Genome Valley",
+      "city": "Hyderabad",
+      "postalCode": "500078",
+      "country": "IN"
+    },
+    "lines": [
+      {"lineNumber": 1, "sku": "MED-PCM-500", "description": "PARACETAMOL 500MG STRIP", "quantity": 200, "unitPrice": 18.5, "lineTotal": 3700.0},
+      {"lineNumber": 2, "sku": "MED-AMX-250", "description": "AMOXICILLIN 250MG CAPSULE", "quantity": 120, "unitPrice": 42.75, "lineTotal": 5130.0},
+      {"lineNumber": 3, "sku": "SUP-GLV-M", "description": "NITRILE GLOVES MEDIUM", "quantity": 50, "unitPrice": 310.0, "lineTotal": 15500.0}
+    ],
+    "orderTotal": 24330.0,
+    "expedite": true,
+    "channel": "EDI"
+  }
+}

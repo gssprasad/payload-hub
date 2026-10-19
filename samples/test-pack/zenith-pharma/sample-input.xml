@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PurchaseOrder poNumber="ZP-45821" orderDate="2026-10-15" currency="INR">
+  <Buyer>
+    <CompanyName>Zenith Pharma Pvt Ltd</CompanyName>
+    <ContactFirstName>Meera</ContactFirstName>
+    <ContactLastName>Iyer</ContactLastName>
+    <Email>MEERA.IYER@ZENITHPHARMA.EXAMPLE</Email>
+    <Phone>+91-40-5550-1234</Phone>
+  </Buyer>
+  <ShipTo>
+    <Street>Plot 12, Genome Valley</Street>
+    <City>Hyderabad</City>
+    <State>TS</State>
+    <PostalCode>500078</PostalCode>
+    <Country>IN</Country>
+  </ShipTo>
+  <Lines>
+    <Line lineNo="1">
+      <ItemCode>MED-PCM-500</ItemCode>
+      <Description>Paracetamol 500mg strip</Description>
+      <Quantity>200</Quantity>
+      <UnitPrice>18.50</UnitPrice>
+      <UOM>STRIP</UOM>
+    </Line>
+    <Line lineNo="2">
+      <ItemCode>MED-AMX-250</ItemCode>
+      <Description>Amoxicillin 250mg capsule</Description>
+      <Quantity>120</Quantity>
+      <UnitPrice>42.75</UnitPrice>
+      <UOM>BOX</UOM>
+    </Line>
+    <Line lineNo="3">
+      <ItemCode>SUP-GLV-M</ItemCode>
+      <Description>Nitrile gloves medium</Description>
+      <Quantity>50</Quantity>
+      <UnitPrice>310.00</UnitPrice>
+      <UOM>BOX</UOM>
+    </Line>
+  </Lines>
+  <Priority>HIGH</Priority>
+  <Notes>Deliver before 10 AM</Notes>
+</PurchaseOrder>

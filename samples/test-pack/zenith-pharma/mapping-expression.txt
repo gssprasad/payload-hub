@@ -1,0 +1,30 @@
+{
+  salesOrder: {
+    orderId: concat('SO-', PurchaseOrder."@poNumber"),
+    sourcePo: PurchaseOrder."@poNumber",
+    orderDate: PurchaseOrder."@orderDate",
+    currency: PurchaseOrder."@currency",
+    customer: {
+      name: PurchaseOrder.Buyer.CompanyName,
+      contact: concat(PurchaseOrder.Buyer.ContactFirstName, ' ', PurchaseOrder.Buyer.ContactLastName),
+      email: lower(PurchaseOrder.Buyer.Email)
+    },
+    shipTo: {
+      addressLine: PurchaseOrder.ShipTo.Street,
+      city: PurchaseOrder.ShipTo.City,
+      postalCode: PurchaseOrder.ShipTo.PostalCode,
+      country: PurchaseOrder.ShipTo.Country
+    },
+    lines: to_array(PurchaseOrder.Lines.Line)[].{
+      lineNumber: to_number("@lineNo"),
+      sku: ItemCode,
+      description: upper(Description),
+      quantity: to_number(Quantity),
+      unitPrice: to_number(UnitPrice),
+      lineTotal: multiply(Quantity, UnitPrice)
+    },
+    orderTotal: sum(to_array(PurchaseOrder.Lines.Line)[].multiply(Quantity, UnitPrice)),
+    expedite: PurchaseOrder.Priority == 'HIGH',
+    channel: 'EDI'
+  }
+}

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shipment>
+  <shipmentId>SHP-NR-20931</shipmentId>
+  <orderRef>NR-20931</orderRef>
+  <carrier>BLUEDART</carrier>
+  <serviceLevel>STANDARD</serviceLevel>
+  <recipient>
+    <name>Arjun Menon</name>
+    <email>arjun.menon@example.com</email>
+    <address>14 MG Road</address>
+    <city>BENGALURU</city>
+    <postalCode>560001</postalCode>
+    <country>IN</country>
+  </recipient>
+  <packages>
+    <package>
+      <sku>YM-01</sku>
+      <quantity>2</quantity>
+      <description>YOGA MAT</description>
+    </package>
+    <package>
+      <sku>BL-07</sku>
+      <quantity>3</quantity>
+      <description>YOGA BLOCK</description>
+    </package>
+    <package>
+      <sku>ST-12</sku>
+      <quantity>1</quantity>
+      <description>COTTON STRAP</description>
+    </package>
+  </packages>
+  <totalUnits>6</totalUnits>
+  <giftWrap>true</giftWrap>
+</shipment>

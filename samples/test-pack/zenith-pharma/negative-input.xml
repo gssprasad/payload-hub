@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PurchaseOrder poNumber="ZP-45822" orderDate="2026-10-16" currency="INR">
+  <Buyer>
+    <CompanyName>Zenith Pharma Pvt Ltd</CompanyName>
+  </Buyer>
+  <Lines>
+    <Line lineNo="1">
+      <ItemCode>MED-PCM-500</ItemCode>
+      <Quantity>200</Quantity>
+  </Lines>
+</PurchaseOrder>

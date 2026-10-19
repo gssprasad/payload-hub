@@ -1,0 +1,21 @@
+{
+  shipment: {
+    shipmentId: concat('SHP-', order.id),
+    orderRef: order.id,
+    carrier: 'BLUEDART',
+    serviceLevel: 'STANDARD',
+    recipient: {
+      name: concat(order.customer.firstName, ' ', order.customer.lastName),
+      email: lower(order.customer.email),
+      address: order.delivery.line1,
+      city: upper(order.delivery.city),
+      postalCode: order.delivery.pincode,
+      country: order.delivery.country
+    },
+    packages: {
+      package: order.items[].{sku: sku, quantity: to_string(qty), description: upper(name)}
+    },
+    totalUnits: to_string(sum(order.items[].qty)),
+    giftWrap: to_string(order.giftWrap)
+  }
+}
