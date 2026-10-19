@@ -63,7 +63,8 @@ def _client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic()
 
 
-async def run(request: str, payload: str, input_format: str | None, mapping_doc: dict | None = None):
+async def run(request: str, payload: str, input_format: str | None, mapping_doc: dict | None = None,
+              partner_code: str | None = None):
     """Run the agent for one request and return its result (also logged to agent_runs)."""
     started = time.perf_counter()
     steps: list[dict] = []
@@ -119,6 +120,10 @@ async def run(request: str, payload: str, input_format: str | None, mapping_doc:
         except TransformError as e:
             steps.append({"tool": "save_mapping", "name": name, "ok": False, "result": str(e)})
             return f"Not saved - the mapping fails: {e}"
+        if partner_code:  # partner mappings are stored on the partner, under the partner's code
+            name = partner_code
+            await db.update_partner(partner_code, expression=expression, input_format=input_format,
+                                    output_format=output_format, mapping_source="agent")
         await db.save_mapping(name, label, input_format, output_format, expression,
                               request or f"From mapping document {mapping_doc['filename']}")
         saved.update(name=name, label=label, expression=expression, input_format=input_format,
@@ -182,5 +187,5 @@ async def run(request: str, payload: str, input_format: str | None, mapping_doc:
 
     result["usage"] = usage
     result["duration_ms"] = round((time.perf_counter() - started) * 1000)
-    result["id"] = await db.log_agent_run(request, result, mapping_doc)
+    result["id"] = await db.log_agent_run(request, result, mapping_doc, partner_code)
     return result

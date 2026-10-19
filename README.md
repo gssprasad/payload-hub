@@ -85,6 +85,36 @@ export ANTHROPIC_API_KEY=your-key-here
 
 Each agent run is a paid Claude API call (typically a few cents).
 
+## Partners
+
+The Streamlit app has four pages: **Partners**, **Send & Test**, **Transactions** and
+**Monitoring**.
+
+**Onboarding.** On the Partners page, open *Onboard a new partner* and enter the name, input and
+output formats, a sample input, an optional expected output and an optional mapping. Choose the
+queues:
+
+| Queue mode | Kafka topics | Use it when |
+|------------|--------------|-------------|
+| Shared     | `payload.in`, `payload.out`, `payload.dlq` | low volume, quick onboarding |
+| Dedicated  | `partner.<code>.in`, `.out`, `.dlq` (created automatically) | isolating a partner's traffic, failures and backlog |
+
+A partner can be moved between shared and dedicated queues later (Queue tab). The pipeline
+subscribes by topic pattern, so new dedicated queues are picked up within about 5 seconds with
+no restart.
+
+**Per-partner mapping.** Each partner has a Mapping tab (formats, sample input, expected output,
+JMESPath expression, *Test mapping*) and a Mapping documents tab (upload, preview, download and
+delete Excel/CSV specifications). *Generate mapping* asks the AI agent to build the partner's
+mapping from its documents and sample input, and saves it on the partner.
+
+**Sending.** On Send & Test, choose *Partner* to send with that partner's mapping and queue, or
+*Ad-hoc mapping* to try any expression on the shared queues.
+
+**Monitoring.** A separate page with a partner filter: totals, success rate, latency, a
+per-minute chart, a by-partner table, every Kafka queue with messages and backlog, and recent
+agent runs.
+
 ## Mapping documents (Excel)
 
 In the Mapping agent panel, drop or choose an Excel workbook (`.xlsx`, `.xlsm`) or a CSV file.
@@ -135,6 +165,14 @@ mapping and the step-by-step event timeline.
 | GET    | `/api/transactions/{id}`    | One transaction with its event timeline         |
 | GET    | `/api/stats`                | Totals, latency, per-minute counts              |
 | GET    | `/api/agent/runs`           | Agent run history                               |
+| GET/POST | `/api/partners`           | List / onboard partners (`queue_mode`: shared or dedicated) |
+| GET/PUT/DELETE | `/api/partners/{code}` | One partner                                  |
+| POST   | `/api/partners/{code}/queue` | Move between shared and dedicated queues       |
+| POST   | `/api/partners/{code}/test`  | Run the partner's mapping on its sample input  |
+| POST/GET | `/api/partners/{code}/documents` | Upload / list mapping documents          |
+| POST   | `/api/partners/{code}/agent` | Generate the partner's mapping with the agent  |
+| GET    | `/api/queues`               | Kafka topics with messages and backlog         |
+| GET    | `/api/stats/partners`       | Per-partner totals and latency                 |
 
 ## Mapping functions
 
@@ -147,7 +185,8 @@ values are strings.
 Streamlit Cloud runs only `streamlit_app.py`, so the pipeline runs inside it
 (`EMBED_BACKEND = "true"`) against hosted Kafka and PostgreSQL.
 
-1. **Kafka (Aiven, free plan)**: create an Apache Kafka service. On its Overview page choose
+1. **Kafka (Aiven, free plan)**: create an Apache Kafka service. Free plans limit the number of
+   topics, and each dedicated partner adds three, so use shared queues for most demo partners. On its Overview page choose
    the **SASL** authentication method, then copy the host:port, user, password and the CA
    certificate. Topics are created automatically on first start.
 2. **PostgreSQL (Neon, free plan)**: create a project and copy its connection string.

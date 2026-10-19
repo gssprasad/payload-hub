@@ -1,4 +1,8 @@
-"""Kafka pipeline: payload.in -> transformer -> payload.out -> result sink (failures -> payload.dlq).
+"""Kafka pipeline: <queue>.in -> transformer -> <queue>.out -> result sink (failures -> <queue>.dlq).
+
+Queues are either the shared ones (payload.in / payload.out / payload.dlq) or a partner's dedicated
+ones (partner.<code>.in / .out / .dlq). The workers subscribe by topic pattern, so a newly onboarded
+partner's dedicated queues are picked up within seconds without a restart.
 
 This plays the role Apache Camel routes would play in the Java version:
     from("kafka:payload.in").process(transform).to("kafka:payload.out")
@@ -9,7 +13,7 @@ import logging
 import os
 import time
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.helpers import create_ssl_context
 from prometheus_client import Counter, Gauge, Histogram
@@ -21,7 +25,27 @@ log = logging.getLogger("pipeline")
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 TOPIC_IN, TOPIC_OUT, TOPIC_DLQ = "payload.in", "payload.out", "payload.dlq"
+SHARED_TOPICS = (TOPIC_IN, TOPIC_OUT, TOPIC_DLQ)
 TOPIC_PARTITIONS = int(os.getenv("KAFKA_TOPIC_PARTITIONS", "2"))
+IN_PATTERN = r"^(payload|partner\.[a-z0-9-]+)\.in$"
+OUT_PATTERN = r"^(payload|partner\.[a-z0-9-]+)\.out$"
+GROUP_TRANSFORMER, GROUP_SINK = "payload-hub-transformer", "payload-hub-result-sink"
+
+TXN_TOTAL = Counter("payload_transactions_total", "Transactions by final status",
+                    ["status", "mapping", "partner"])
+TRANSFORM_SECONDS = Histogram("payload_transform_seconds", "Time spent in the transformer step")
+END_TO_END_SECONDS = Histogram("payload_end_to_end_seconds", "API receive -> result stored")
+IN_FLIGHT = Gauge("payload_in_flight", "Transactions published but not yet completed")
+
+producer: AIOKafkaProducer | None = None
+_tasks: list[asyncio.Task] = []
+_waiters: dict[str, asyncio.Future] = {}
+_started_at: dict[str, float] = {}
+_queue_cache: tuple[float, list] = (0.0, [])
+
+
+def partner_topics(code: str) -> tuple[str, str, str]:
+    return f"partner.{code}.in", f"partner.{code}.out", f"partner.{code}.dlq"
 
 
 def _connection() -> dict:
@@ -39,28 +63,20 @@ def _connection() -> dict:
     return conn
 
 
-async def _ensure_topics():
-    """Create the pipeline topics if they don't exist (hosted Kafka often disables auto-creation)."""
+async def ensure_topics(names) -> list[str]:
+    """Create any of the given topics that don't exist yet. Returns the ones created."""
     admin = AIOKafkaAdminClient(**_connection())
     await admin.start()
     try:
-        missing = {TOPIC_IN, TOPIC_OUT, TOPIC_DLQ} - set(await admin.list_topics())
+        missing = sorted(set(names) - set(await admin.list_topics()))
         if missing:
-            # replication_factor -1 = use the broker's default
-            await admin.create_topics([NewTopic(t, TOPIC_PARTITIONS, -1) for t in sorted(missing)])
-            log.info("created topics %s", sorted(missing))
+            brokers = len((await admin.describe_cluster()).get("brokers", [])) or 1
+            replication = int(os.getenv("KAFKA_REPLICATION_FACTOR", min(3, brokers)))
+            await admin.create_topics([NewTopic(t, TOPIC_PARTITIONS, replication) for t in missing])
+            log.info("created topics %s", missing)
+        return missing
     finally:
         await admin.close()
-
-TXN_TOTAL = Counter("payload_transactions_total", "Transactions by final status", ["status", "mapping"])
-TRANSFORM_SECONDS = Histogram("payload_transform_seconds", "Time spent in the transformer step")
-END_TO_END_SECONDS = Histogram("payload_end_to_end_seconds", "API receive -> result stored")
-IN_FLIGHT = Gauge("payload_in_flight", "Transactions published but not yet completed")
-
-producer: AIOKafkaProducer | None = None
-_tasks: list[asyncio.Task] = []
-_waiters: dict[str, asyncio.Future] = {}
-_started_at: dict[str, float] = {}
 
 
 def _encode(obj) -> bytes:
@@ -69,17 +85,19 @@ def _encode(obj) -> bytes:
 
 async def start():
     global producer
-    await _ensure_topics()
+    await ensure_topics(SHARED_TOPICS)
     producer = AIOKafkaProducer(**_connection(), value_serializer=_encode, acks="all")
     await producer.start()
-    for name, coro in (("transformer", _transformer), ("result-sink", _result_sink)):
+    for name, group, pattern, coro in (("transformer", GROUP_TRANSFORMER, IN_PATTERN, _transformer),
+                                       ("result-sink", GROUP_SINK, OUT_PATTERN, _result_sink)):
         consumer = AIOKafkaConsumer(
-            TOPIC_IN if name == "transformer" else TOPIC_OUT,
             **_connection(),
-            group_id=f"payload-hub-{name}",
+            group_id=group,
             auto_offset_reset="earliest",
             value_deserializer=json.loads,
+            metadata_max_age_ms=5000,  # notice new partner topics within ~5 s
         )
+        consumer.subscribe(pattern=pattern)
         await consumer.start()
         task = asyncio.create_task(coro(consumer), name=name)
         task.add_done_callback(_log_crash)
@@ -95,15 +113,16 @@ async def stop():
 
 
 async def submit(txn_id: str, message: dict, wait_seconds: float = 15):
-    """Publish to payload.in and wait (briefly) for the pipeline to finish this transaction."""
+    """Publish to the message's input queue and wait (briefly) for the pipeline to finish it."""
     fut = asyncio.get_running_loop().create_future()
     _waiters[txn_id] = fut
     _started_at[txn_id] = time.perf_counter()
     IN_FLIGHT.inc()
     try:
-        meta = await producer.send_and_wait(TOPIC_IN, message, key=txn_id.encode())
+        meta = await producer.send_and_wait(message["topic_in"], message, key=txn_id.encode())
         await db.record_event(
-            txn_id, "PUBLISHED", f"{TOPIC_IN} partition {meta.partition} offset {meta.offset}", status="QUEUED"
+            txn_id, "PUBLISHED", f"{message['topic_in']} partition {meta.partition} offset {meta.offset}",
+            status="QUEUED",
         )
         return await asyncio.wait_for(asyncio.shield(fut), wait_seconds)
     except asyncio.TimeoutError:
@@ -117,6 +136,7 @@ async def _transformer(consumer: AIOKafkaConsumer):
         async for rec in consumer:
             msg = rec.value
             txn_id = msg["id"]
+            topic_out, topic_dlq = msg.get("topic_out", TOPIC_OUT), msg.get("topic_dlq", TOPIC_DLQ)
             await db.record_event(
                 txn_id, "TRANSFORMING", f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}", status="TRANSFORMING"
             )
@@ -125,19 +145,19 @@ async def _transformer(consumer: AIOKafkaConsumer):
                 output = transform(msg["payload"], msg["input_format"], msg["expression"], msg["output_format"])
                 elapsed = (time.perf_counter() - t0) * 1000
                 TRANSFORM_SECONDS.observe(elapsed / 1000)
-                await producer.send_and_wait(TOPIC_OUT, {**msg, "output": output, "transform_ms": elapsed}, key=rec.key)
+                await producer.send_and_wait(topic_out, {**msg, "output": output, "transform_ms": elapsed}, key=rec.key)
                 await db.record_event(
-                    txn_id, "TRANSFORMED", f"{len(output)} bytes of {msg['output_format'].upper()} in {elapsed:.1f} ms",
+                    txn_id, "TRANSFORMED",
+                    f"{len(output)} bytes of {msg['output_format'].upper()} in {elapsed:.1f} ms -> {topic_out}",
                     status="TRANSFORMED", transform_ms=elapsed,
                 )
             except TransformError as e:
                 elapsed = (time.perf_counter() - t0) * 1000
-                await producer.send_and_wait(TOPIC_DLQ, {**msg, "error": str(e)}, key=rec.key)
-                await _finish(txn_id, msg["mapping_name"], "FAILED", error=str(e), transform_ms=elapsed,
-                              detail=f"sent to {TOPIC_DLQ}: {e}")
+                await producer.send_and_wait(topic_dlq, {**msg, "error": str(e)}, key=rec.key)
+                await _finish(msg, "FAILED", error=str(e), transform_ms=elapsed, detail=f"sent to {topic_dlq}: {e}")
             except Exception:  # keep the consumer alive on unexpected errors
                 log.exception("transformer crashed on %s", txn_id)
-                await _finish(txn_id, msg["mapping_name"], "FAILED", error="Internal error in transformer",
+                await _finish(msg, "FAILED", error="Internal error in transformer",
                               detail="unexpected exception - see server log")
     finally:
         await consumer.stop()
@@ -147,7 +167,7 @@ async def _result_sink(consumer: AIOKafkaConsumer):
     try:
         async for rec in consumer:
             msg = rec.value
-            await _finish(msg["id"], msg["mapping_name"], "COMPLETED", output_payload=msg["output"],
+            await _finish(msg, "COMPLETED", output_payload=msg["output"],
                           detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
     finally:
         await consumer.stop()
@@ -158,14 +178,56 @@ def _log_crash(task: asyncio.Task):
         log.error("consumer %s stopped", task.get_name(), exc_info=task.exception())
 
 
-async def _finish(txn_id, mapping, status, detail, **fields):
+async def _finish(msg, status, detail, **fields):
+    txn_id = msg["id"]
     started = _started_at.pop(txn_id, None)
     total_ms = (time.perf_counter() - started) * 1000 if started else None
     if started:
         END_TO_END_SECONDS.observe(total_ms / 1000)
         IN_FLIGHT.dec()
-    TXN_TOTAL.labels(status=status, mapping=mapping).inc()
+    TXN_TOTAL.labels(status=status, mapping=msg["mapping_name"], partner=msg.get("partner_code") or "-").inc()
     await db.record_event(txn_id, status, detail, status=status, total_ms=total_ms, **fields)
     fut = _waiters.get(txn_id)
     if fut and not fut.done():
         fut.set_result(await db.get_transaction(txn_id))
+
+
+async def queue_stats(max_age: float = 5.0) -> list[dict]:
+    """Messages and consumer backlog for every pipeline topic (cached for a few seconds)."""
+    global _queue_cache
+    if time.monotonic() - _queue_cache[0] < max_age:
+        return _queue_cache[1]
+    admin = AIOKafkaAdminClient(**_connection())
+    probe = AIOKafkaConsumer(**_connection(), enable_auto_commit=False)
+    await admin.start()
+    await probe.start()
+    try:
+        topics = sorted(t for t in await admin.list_topics() if t.startswith(("payload.", "partner.")))
+        described = await admin.describe_topics(topics) if topics else []
+        parts = [TopicPartition(d["topic"], p["partition"]) for d in described for p in d["partitions"]]
+        ends = await probe.end_offsets(parts) if parts else {}
+        starts = await probe.beginning_offsets(parts) if parts else {}
+        committed = {}
+        for group in (GROUP_TRANSFORMER, GROUP_SINK):
+            committed[group] = {tp: m.offset for tp, m in (await admin.list_consumer_group_offsets(group)).items()}
+        rows = []
+        for t in topics:
+            tps = [tp for tp in parts if tp.topic == t]
+            kind = t.rsplit(".", 1)[-1]
+            group = GROUP_TRANSFORMER if kind == "in" else GROUP_SINK if kind == "out" else None
+            lag = None
+            if group:
+                lag = sum(max(0, ends[tp] - max(committed[group].get(tp, starts[tp]), starts[tp])) for tp in tps)
+            rows.append({
+                "topic": t,
+                "queue": "shared" if t.startswith("payload.") else t.split(".")[1],
+                "kind": kind,
+                "partitions": len(tps),
+                "messages": sum(ends[tp] - starts[tp] for tp in tps),
+                "backlog": lag,
+            })
+        _queue_cache = (time.monotonic(), rows)
+        return rows
+    finally:
+        await probe.stop()
+        await admin.close()

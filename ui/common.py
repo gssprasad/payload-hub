@@ -1,0 +1,58 @@
+"""Helpers shared by the Streamlit pages."""
+import json
+
+import requests
+import streamlit as st
+
+API = "http://localhost:8000"  # set by streamlit_app.py before any page runs
+STATUSES = ["COMPLETED", "FAILED", "QUEUED", "TRANSFORMING", "TRANSFORMED"]
+STATUS_ICON = {"COMPLETED": "✅", "FAILED": "❌", "SAVED": "✅", "NOT_SAVED": "⚠️"}
+GOOD, CRITICAL = "#0ca30c", "#d03b3b"
+
+
+class ApiError(Exception):
+    """The backend rejected a request; the message is safe to show to the user."""
+
+
+def api(method: str, path: str, **kwargs):
+    """Call the backend; stop the page with a readable message if it is unreachable."""
+    try:
+        r = requests.request(method, f"{API}{path}", timeout=kwargs.pop("timeout", 30), **kwargs)
+    except requests.ConnectionError:
+        st.error(f"Can't reach the Payload Hub backend at {API}. Start it with "
+                 "`.venv/bin/uvicorn app.main:app --port 8000`.")
+        st.stop()
+    if r.status_code == 204:
+        return None
+    is_json = r.headers.get("content-type", "").startswith("application/json")
+    if r.status_code >= 400 and r.status_code != 503:
+        detail = r.json().get("detail", r.text) if is_json else r.text
+        raise ApiError(detail if isinstance(detail, str) else json.dumps(detail))
+    return r.json() if is_json else r.content
+
+
+def status_label(s: str) -> str:
+    return f"{STATUS_ICON.get(s, '⏳')} {s}"
+
+
+def lang(fmt: str) -> str:
+    return "xml" if fmt == "xml" else "json"
+
+
+def queue_label(p: dict) -> str:
+    return "Dedicated" if p.get("queue_mode") == "dedicated" else "Shared"
+
+
+@st.cache_data(ttl=5)
+def partners() -> list[dict]:
+    return api("GET", "/api/partners")
+
+
+def show_events(events: list[dict]):
+    import pandas as pd
+
+    if events:
+        df = pd.DataFrame(events)
+        df["at"] = pd.to_datetime(df["at"]).dt.tz_convert(None).dt.strftime("%H:%M:%S.%f").str[:-3]
+        st.dataframe(df, hide_index=True, width="stretch",
+                     column_config={"at": "Time", "stage": "Stage", "detail": "Detail"})
