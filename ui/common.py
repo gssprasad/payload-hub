@@ -5,6 +5,7 @@ import requests
 import streamlit as st
 
 API = "http://localhost:8000"  # set by streamlit_app.py before any page runs
+EMBEDDED = False  # True on Streamlit Cloud, where the backend runs inside the Streamlit process
 STATUSES = ["COMPLETED", "FAILED", "QUEUED", "TRANSFORMING", "TRANSFORMED"]
 STATUS_ICON = {"COMPLETED": "✅", "FAILED": "❌", "SAVED": "✅", "NOT_SAVED": "⚠️"}
 GOOD, CRITICAL = "#0ca30c", "#d03b3b"

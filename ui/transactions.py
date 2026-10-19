@@ -47,11 +47,14 @@ def page():
     df["status"] = df["status"].map(status_label)
     df["partner"] = df["partner_code"].map(lambda c: partner_names.get(c, c) if c else "Ad-hoc")
     df["formats"] = df["input_format"] + " → " + df["output_format"]
-    view = df[["created_at", "id", "partner", "topic", "mapping_name", "formats", "status", "transform_ms", "total_ms", "error"]]
+    df["delivery"] = df["delivery_status"].map({"DELIVERED": "📤 Delivered", "DELIVERY_FAILED": "⚠️ Failed"}).fillna("–")
+    view = df[["created_at", "id", "partner", "source", "topic", "mapping_name", "formats", "status", "delivery",
+               "transform_ms", "total_ms", "error"]]
     event = st.dataframe(
         view, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
         column_config={
-            "created_at": "Time", "id": "Transaction", "partner": "Partner", "topic": "Queue", "mapping_name": "Mapping",
+            "created_at": "Time", "id": "Transaction", "partner": "Partner", "source": "Source", "topic": "Queue",
+            "delivery": "Delivery", "mapping_name": "Mapping",
             "formats": "Formats", "status": "Status", "error": "Error",
             "transform_ms": st.column_config.NumberColumn("Transform (ms)", format="%.1f"),
             "total_ms": st.column_config.NumberColumn("End-to-end (ms)", format="%.1f"),
@@ -63,7 +66,8 @@ def page():
     t = api("GET", f"/api/transactions/{txns[rows[0]]['id']}")
     st.subheader(f"Transaction {t['id']}")
     who = partner_names.get(t["partner_code"], t["partner_code"]) if t["partner_code"] else "Ad-hoc"
-    st.markdown(f"{status_label(t['status'])} · {who} · queue `{t['topic'] or '-'}` · "
+    st.markdown(f"{status_label(t['status'])} · {who} · from {t.get('source') or 'UI'} · queue `{t['topic'] or '-'}` · "
+                + (f"delivery **{t['delivery_status'].lower().replace('_', ' ')}** · " if t.get("delivery_status") else "") +
                 f"{t['input_format']} → {t['output_format']}")
     show_events(t["events"])
     if t.get("error"):

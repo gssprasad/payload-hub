@@ -87,12 +87,12 @@ Each agent run is a paid Claude API call (typically a few cents).
 
 ## Partners
 
-The Streamlit app has five pages: **Partners**, **AI Agent**, **Send & Test**, **Transactions**
-and **Monitoring**.
+The Streamlit app has six pages: **Partners**, **Connections**, **AI Agent**, **Send & Test**,
+**Transactions** and **Monitoring**.
 
-**Onboarding.** On the Partners page, open *Onboard a new partner* and enter the name, input and
-output formats, a sample input, an optional expected output and an optional mapping. Choose the
-queues:
+**Onboarding.** On the Partners page, *Onboard a new partner* opens a step-by-step wizard: basics,
+payloads and mapping (and an optional mapping document), Kafka queues, inbound, outbound, and a
+review with the flow diagram. Kafka queue choices:
 
 | Queue mode | Kafka topics | Use it when |
 |------------|--------------|-------------|
@@ -119,6 +119,46 @@ step the agent took.
 **Monitoring.** A separate page with a partner filter: totals, success rate, latency, a
 per-minute chart, a by-partner table, every Kafka queue with messages and backlog, and recent
 agent runs.
+
+## Connections, HTTP endpoints and MQ adapters
+
+```
+ HTTP POST /inbound/<partner> ─┐                                           ┌─► RabbitMQ / ActiveMQ / IBM MQ queue
+ RabbitMQ / ActiveMQ / IBM MQ ─┼─► Kafka <queue>.in ─► transformer ─► .out ─┼─► HTTP webhook
+ Kafka topic ──────────────────┘                    └─► .dlq (failures)     └─► Kafka topic   (or store only)
+```
+
+**Connections page.** Add a connection once (RabbitMQ, ActiveMQ / Artemis over STOMP, IBM MQ, an
+HTTP webhook or Kafka), test it, send a test message through it, and see which partners use it.
+Passwords are write-only: the API never returns them. A built-in **test receiver**
+(`/test-receiver/<name>`) acts as a webhook target for demos; its inbox is on the Connections page.
+
+**Partner HTTP endpoint.** Every partner gets `POST /inbound/<code>` with its own API key
+(header `X-API-Key`), shown on the partner's *Flow & endpoints* tab with a curl example and a
+*Try it* button. It returns the transformed output (200) or the error (422). With `?wait=false`
+it returns 202 and a transaction id to poll at `/inbound/<code>/transactions/<id>`.
+
+**Inbound and outbound per partner.** On *Flow & endpoints* (or in the onboarding wizard), pick
+a connection and queue/topic to listen on, and where to deliver results. Deliveries are retried 3
+times, then parked on the partner's failure queue. The tab shows the whole flow as a diagram with
+live status.
+
+Local brokers for testing (Homebrew):
+
+```bash
+brew install rabbitmq activemq && brew services start rabbitmq && brew services start activemq
+```
+
+Homebrew's RabbitMQ enables its STOMP plugin on port 61613, which clashes with ActiveMQ.
+Disable it (`rabbitmq-plugins disable rabbitmq_stomp`) and enable ActiveMQ's STOMP connector in
+its `activemq.xml`.
+
+**IBM MQ** needs IBM's MQ client libraries (the IBM MQ redistributable client or MQ for
+Developers), then `pip install ibmmq`. Until then the Connections page shows IBM MQ as "client
+not installed". IBM MQ can't run on Streamlit Cloud.
+
+On Streamlit Cloud the partner HTTP endpoints run inside the app and aren't reachable from
+outside; use *Try it* for demos. They're fully callable when the backend runs on your laptop or a server.
 
 ## Mapping documents (Excel)
 

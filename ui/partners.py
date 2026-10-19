@@ -1,42 +1,45 @@
-"""Partners page: onboard partners and manage each partner's mapping, documents and queues."""
+"""Partners page: onboarding wizard, and each partner's flow, endpoints, mapping, documents and details."""
 import pandas as pd
 import streamlit as st
 
-from . import common
+from . import common, flow, onboarding
 from .common import ApiError, api, lang, queue_label
-
-QUEUE_HELP = {
-    "shared": "Shared - uses the common queues payload.in / payload.out / payload.dlq",
-    "dedicated": "Dedicated - gets its own queues partner.<code>.in / .out / .dlq",
-}
-
 
 def page():
     st.title("🤝 Partners")
-    st.caption("Onboard partners, keep each partner's mapping documents, and choose shared or dedicated Kafka queues.")
-
+    st.caption("Onboard partners, set up each one's mapping, documents, HTTP endpoint, MQ adapters and Kafka queues.")
     partners = common.partners()
-    _partner_table(partners)
-    _onboard_form()
 
-    if not partners:
-        st.info("No partners yet - onboard one above.")
-        return
+    if st.session_state.get("onboarding") or not partners:
+        with st.container(border=True):
+            st.subheader("➕ Onboard a new partner")
+            onboarding.wizard()
+        if not partners:
+            return
+    elif st.button("➕ Onboard a new partner", type="primary"):
+        st.session_state.onboarding = True
+        st.rerun()
+
+    _partner_table(partners)
     st.divider()
     codes = [p["code"] for p in partners]
-    default = st.session_state.pop("select_partner", None)
-    code = st.selectbox("Manage partner", codes, index=codes.index(default) if default in codes else 0,
+    requested = st.session_state.pop("select_partner", None)  # e.g. a partner that was just onboarded
+    if requested in codes:
+        st.session_state.manage_partner = requested
+    elif st.session_state.get("manage_partner") not in codes:
+        st.session_state.manage_partner = codes[0]
+    code = st.selectbox("Manage partner", codes, key="manage_partner",
                         format_func=lambda c: next(f"{p['name']} ({c})" for p in partners if p["code"] == c))
     p = api("GET", f"/api/partners/{code}")
-    details, mapping, documents, queue = st.tabs(["Details", "Mapping", "Mapping documents", "Queue"])
-    with details:
-        _details_tab(p)
+    flow_tab_, mapping, documents, details = st.tabs(["Flow & endpoints", "Mapping", "Mapping documents", "Details"])
+    with flow_tab_:
+        flow.flow_tab(p)
     with mapping:
         _mapping_tab(p)
     with documents:
         _documents_tab(p)
-    with queue:
-        _queue_tab(p)
+    with details:
+        _details_tab(p)
 
 
 def _partner_table(partners):
@@ -48,48 +51,17 @@ def _partner_table(partners):
     df["mapping"] = df.apply(lambda r: ("🤖 AI" if r["mapping_source"] == "agent" else "✍️ Manual")
                              if r["has_mapping"] else "— none", axis=1)
     df["status"] = df["active"].map({True: "Active", False: "Inactive"})
-    st.dataframe(df[["name", "code", "status", "formats", "queue", "mapping", "documents", "transactions"]],
+    df["inbound"] = df.apply(lambda r: "HTTP" + (f" + {r['inbound_connection']}:{r['inbound_source']}"
+                                                 if r["inbound_connection"] else ""), axis=1)
+    df["outbound"] = df.apply(lambda r: f"{r['outbound_connection']}:{r['outbound_target'] or ''}"
+                              if r["outbound_connection"] else "store only", axis=1)
+    st.dataframe(df[["name", "code", "status", "formats", "inbound", "queue", "outbound", "mapping", "documents",
+                     "transactions"]],
                  hide_index=True, width="stretch",
                  column_config={"name": "Partner", "code": "Code", "status": "Status", "formats": "Formats",
-                                "queue": "Queue", "mapping": "Mapping", "documents": "Docs",
-                                "transactions": "Transactions"})
+                                "inbound": "Inbound", "queue": "Kafka queue", "outbound": "Outbound",
+                                "mapping": "Mapping", "documents": "Docs", "transactions": "Transactions"})
 
-
-def _onboard_form():
-    with st.expander("➕ Onboard a new partner", expanded=not common.partners()):
-        with st.form("onboard", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            name = c1.text_input("Partner name *", placeholder="e.g. Acme Retail")
-            code = c2.text_input("Code", placeholder="auto from name, e.g. acme-retail")
-            description = st.text_input("Description", placeholder="e.g. Sends purchase orders, receives invoices")
-            contact = st.text_input("Contact", placeholder="e.g. integration team email")
-            c3, c4 = st.columns(2)
-            input_format = c3.selectbox("Input format", ["json", "xml"])
-            output_format = c4.selectbox("Output format", ["json", "xml"])
-            queue_mode = st.radio("Queues", ["shared", "dedicated"], format_func=QUEUE_HELP.get)
-            sample_input = st.text_area("Sample input", height=150,
-                                        help="Used to test the mapping and by the AI agent.")
-            expected_output = st.text_area("Expected output (optional)", height=120,
-                                           help="An example of what the partner expects back; tests compare against it.")
-            expression = st.text_area("Mapping expression (optional)", height=120,
-                                      help="JMESPath. Leave empty to build it later, e.g. with the AI agent from a mapping document.")
-            if st.form_submit_button("Onboard partner", type="primary"):
-                if len(name.strip()) < 2:
-                    st.error("Enter the partner name.")
-                    return
-                body = {"name": name.strip(), "code": code.strip() or None, "description": description or None,
-                        "contact": contact or None, "input_format": input_format, "output_format": output_format,
-                        "queue_mode": queue_mode, "sample_input": sample_input or None,
-                        "expected_output": expected_output or None, "expression": expression or None}
-                try:
-                    p = api("POST", "/api/partners", json=body)
-                except ApiError as e:
-                    st.error(str(e))
-                    return
-                common.partners.clear()
-                st.session_state.select_partner = p["code"]
-                st.toast(f"Onboarded {p['name']} on {queue_label(p).lower()} queues ({p['topic_in']})", icon="✅")
-                st.rerun()
 
 
 def _details_tab(p):
@@ -208,35 +180,6 @@ def _documents_tab(p):
                 common.partners.clear()
                 st.rerun()
 
-
-def _queue_tab(p):
-    code = p["code"]
-    st.markdown(f"**Current:** {queue_label(p)} queues")
-    st.dataframe(pd.DataFrame([{"Role": "Input", "Topic": p["topic_in"]}, {"Role": "Output", "Topic": p["topic_out"]},
-                               {"Role": "Failures (DLQ)", "Topic": p["topic_dlq"]}]),
-                 hide_index=True, width="stretch")
-    target = "shared" if p["queue_mode"] == "dedicated" else "dedicated"
-    st.markdown(f"**Move to {target} queues**  \n{QUEUE_HELP[target].replace('<code>', code)}")
-    st.caption("Messages already queued finish on the current queue; new messages use the new one.")
-    if st.button(f"Move {p['name']} to {target} queues", key=f"move_{code}"):
-        try:
-            api("POST", f"/api/partners/{code}/queue", data={"queue_mode": target})
-        except ApiError as e:
-            st.error(str(e))
-        else:
-            common.partners.clear()
-            st.toast(f"{p['name']} now uses {target} queues", icon="🔀")
-            st.rerun()
-
-    base = p["topic_in"].rsplit(".", 1)[0]
-    rows = [q for q in api("GET", "/api/queues") if q["topic"].rsplit(".", 1)[0] == base]
-    if rows:
-        st.markdown("**Queue activity**")
-        st.dataframe(pd.DataFrame(rows)[["topic", "partitions", "messages", "backlog"]], hide_index=True,
-                     width="stretch", column_config={"topic": "Topic", "partitions": "Partitions",
-                                                     "messages": "Messages", "backlog": "Waiting"})
-        if p["queue_mode"] == "shared":
-            st.caption("Shared queues carry traffic for every shared partner and ad-hoc tests.")
 
 
 def _update(code, fields, message):

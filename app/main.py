@@ -2,18 +2,20 @@
 import logging
 import os
 import re
+import secrets
 import uuid
+from collections import deque
 from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from . import agent, db, mapping_doc, pipeline
+from . import adapters, agent, connectors, db, mapping_doc, pipeline
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -24,7 +26,9 @@ STATIC = Path(__file__).parent / "static"
 async def lifespan(_app):
     await db.init()
     await pipeline.start()
+    await connectors.start()
     yield
+    await connectors.stop()
     await pipeline.stop()
     await db.close()
 
@@ -124,13 +128,11 @@ async def submit_transform(req: TransformRequest):
         p = await db.get_partner(req.partner_code)
         if not p:
             raise HTTPException(404, f"Partner '{req.partner_code}' not found.")
-        if not p["active"]:
-            raise HTTPException(409, f"Partner '{p['name']}' is inactive.")
-        if not p["expression"]:
-            raise HTTPException(409, f"Partner '{p['name']}' has no mapping yet - set one on the Partners page.")
-        msg = {"mapping_name": p["code"], "input_format": p["input_format"], "output_format": p["output_format"],
-               "expression": p["expression"], "topic_in": p["topic_in"], "topic_out": p["topic_out"],
-               "topic_dlq": p["topic_dlq"], "partner_code": p["code"]}
+        try:
+            txn_id, result = await connectors.ingest(p, req.payload, "UI")
+        except connectors.IngestError as e:
+            raise HTTPException(e.status, str(e)) from e
+        return result or await db.get_transaction(txn_id)
     else:
         if not (req.input_format and req.output_format and req.expression):
             raise HTTPException(422, "Give a partner_code, or input_format, output_format and expression.")
@@ -139,7 +141,7 @@ async def submit_transform(req: TransformRequest):
                "topic_dlq": pipeline.TOPIC_DLQ, "partner_code": None}
     txn_id = str(uuid.uuid4())
     await db.create_transaction(txn_id, msg["mapping_name"], msg["input_format"], msg["output_format"],
-                                msg["expression"], req.payload, msg["partner_code"], msg["topic_in"])
+                                msg["expression"], req.payload, msg["partner_code"], msg["topic_in"], "UI")
     result = await pipeline.submit(txn_id, {"id": txn_id, "payload": req.payload, **msg})
     return result or await db.get_transaction(txn_id)
 
@@ -157,6 +159,10 @@ class PartnerIn(BaseModel):
     expected_output: str | None = None
     expression: str | None = None
     queue_mode: Literal["shared", "dedicated"] = "shared"
+    inbound_connection: str | None = None
+    inbound_source: str | None = None
+    outbound_connection: str | None = None
+    outbound_target: str | None = None
 
 
 class PartnerUpdate(BaseModel):
@@ -203,10 +209,16 @@ async def onboard_partner(req: PartnerIn):
     if len(code) < 2:
         raise HTTPException(422, "Partner code must have at least 2 letters or digits.")
     topics = await _topics_for(code, req.queue_mode)
-    fields = req.model_dump(exclude={"code"})
+    fields = req.model_dump(exclude={"code", "inbound_connection", "inbound_source", "outbound_connection",
+                                     "outbound_target"})
     fields["mapping_source"] = "manual" if req.expression else None
+    fields["api_key"] = _new_api_key()
+    await _check_adapters(req.inbound_connection, req.inbound_source, req.outbound_connection)
+    fields.update(inbound_connection=req.inbound_connection or None, inbound_source=req.inbound_source or None,
+                  outbound_connection=req.outbound_connection or None, outbound_target=req.outbound_target or None)
     if not await db.create_partner(code, **fields, **topics):
         raise HTTPException(409, f"A partner with code '{code}' already exists.")
+    await connectors.sync()
     return await db.get_partner(code)
 
 
@@ -224,6 +236,7 @@ async def update_partner(code: str, req: PartnerUpdate):
     if "expression" in fields:
         fields["mapping_source"] = "manual"
     await db.update_partner(code, **fields)
+    await connectors.sync()  # 'active' may have changed
     return await db.get_partner(code)
 
 
@@ -243,6 +256,7 @@ async def delete_partner(code: str):
     topics are left in place (delete them in Kafka if no longer needed)."""
     await _partner_or_404(code)
     await db.delete_partner(code)
+    await connectors.sync()  # stop its inbound listener
 
 
 @app.post("/api/partners/{code}/test")
@@ -332,6 +346,222 @@ async def partner_agent(code: str, req: PartnerAgentRequest):
         context += f"\nThe partner expects output like this example:\n{p['expected_output']}"
     return await agent.run(f"{context}\n\n{instructions}".strip(), p["sample_input"], p["input_format"],
                            combined, partner_code=code)
+
+
+def _new_api_key() -> str:
+    return "ph_" + secrets.token_urlsafe(24)
+
+
+async def _check_adapters(inbound_connection, inbound_source, outbound_connection):
+    if inbound_connection:
+        c = await db.get_connection(inbound_connection)
+        if not c:
+            raise HTTPException(422, f"Connection '{inbound_connection}' not found.")
+        if not adapters.TYPES[c["type"]]["inbound"]:
+            raise HTTPException(422, f"{adapters.TYPES[c['type']]['label']} connections can't receive inbound messages.")
+        if not (inbound_source or "").strip():
+            raise HTTPException(422, "Give the queue or topic to listen on.")
+    if outbound_connection and not await db.get_connection(outbound_connection):
+        raise HTTPException(422, f"Connection '{outbound_connection}' not found.")
+
+
+class PartnerAdapters(BaseModel):
+    inbound_connection: str | None = None
+    inbound_source: str | None = None
+    outbound_connection: str | None = None
+    outbound_target: str | None = None
+
+
+@app.put("/api/partners/{code}/adapters")
+async def set_partner_adapters(code: str, req: PartnerAdapters):
+    """Choose where a partner's messages come from (besides its HTTP endpoint) and where results go."""
+    await _partner_or_404(code)
+    await _check_adapters(req.inbound_connection, req.inbound_source, req.outbound_connection)
+    await db.update_partner(code, inbound_connection=req.inbound_connection or None,
+                            inbound_source=(req.inbound_source or "").strip() or None,
+                            outbound_connection=req.outbound_connection or None,
+                            outbound_target=(req.outbound_target or "").strip() or None)
+    await connectors.sync()
+    return await db.get_partner(code)
+
+
+@app.post("/api/partners/{code}/api-key")
+async def rotate_partner_api_key(code: str):
+    await _partner_or_404(code)
+    await db.update_partner(code, api_key=_new_api_key())
+    return {"api_key": (await db.get_partner(code))["api_key"]}
+
+
+# ---------- connections (adapters) ----------
+
+class ConnectionIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka"]
+    config: dict = Field(default_factory=dict)
+    secret: str | None = None  # write-only; None on update keeps the stored one
+
+
+def _clean_config(type_: str, config: dict) -> dict:
+    out = {}
+    for f in adapters.TYPES[type_]["fields"]:
+        if f["kind"] == "secret":
+            continue
+        value = config.get(f["key"], f["default"])
+        if f["kind"] == "int":
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as e:
+                raise HTTPException(422, f"{f['label']} must be a number.") from e
+        elif f["kind"] == "bool":
+            value = bool(value)
+        out[f["key"]] = value
+    return out
+
+
+@app.get("/api/connection-types")
+async def connection_types():
+    return {k: {**v, "available": adapters.ibmmq_available() if k == "ibmmq" else True}
+            for k, v in adapters.TYPES.items()}
+
+
+@app.get("/api/connections")
+async def list_connections():
+    return await db.list_connections()
+
+
+@app.post("/api/connections", status_code=201)
+async def create_connection(req: ConnectionIn):
+    conn_id = _slug(req.name)
+    if len(conn_id) < 2:
+        raise HTTPException(422, "Give the connection a name with letters or digits.")
+    if not await db.create_connection(conn_id, req.name, req.type, _clean_config(req.type, req.config), req.secret):
+        raise HTTPException(409, f"A connection called '{conn_id}' already exists.")
+    ok, detail = await connectors.test_connection(conn_id)
+    return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
+
+
+@app.put("/api/connections/{conn_id}")
+async def update_connection(conn_id: str, req: ConnectionIn):
+    existing = await db.get_connection(conn_id)
+    if not existing:
+        raise HTTPException(404, "Connection not found.")
+    if req.type != existing["type"]:
+        raise HTTPException(422, "A connection's type can't change - create a new connection instead.")
+    await db.update_connection(conn_id, req.name, _clean_config(req.type, req.config), req.secret)
+    ok, detail = await connectors.test_connection(conn_id)
+    await connectors.sync()
+    return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
+
+
+@app.post("/api/connections/{conn_id}/test")
+async def test_connection(conn_id: str):
+    if not await db.get_connection(conn_id):
+        raise HTTPException(404, "Connection not found.")
+    ok, detail = await connectors.test_connection(conn_id)
+    return {"ok": ok, "detail": detail}
+
+
+class SendTest(BaseModel):
+    target: str = ""
+    body: str = '{"hello": "from Payload Hub"}'
+    content_type: str = "application/json"
+
+
+@app.post("/api/connections/{conn_id}/send")
+async def send_test_message(conn_id: str, req: SendTest):
+    """Send one message through a connection, e.g. to put a test message on a partner's inbound queue."""
+    if not await db.get_connection(conn_id):
+        raise HTTPException(404, "Connection not found.")
+    try:
+        adapter = await connectors.adapter_for(conn_id)
+        detail = await adapter.send(req.target, req.body.encode(), {"X-Sent-By": "payload-hub"}, req.content_type)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "detail": str(e) or type(e).__name__}
+    return {"ok": True, "detail": detail}
+
+
+@app.delete("/api/connections/{conn_id}", status_code=204)
+async def delete_connection(conn_id: str):
+    conns = {c["id"]: c for c in await db.list_connections()}
+    if conn_id not in conns:
+        raise HTTPException(404, "Connection not found.")
+    if conns[conn_id]["used_by"]:
+        raise HTTPException(409, "Still used by partner(s): " + ", ".join(conns[conn_id]["used_by"]))
+    await db.delete_connection(conn_id)
+
+
+@app.get("/api/adapters/status")
+async def adapters_status():
+    return connectors.listener_status()
+
+
+# ---------- partner HTTP endpoints ----------
+
+async def _authorised_partner(code: str, api_key: str | None):
+    p = await db.get_partner(code)
+    if not p or not api_key or not secrets.compare_digest(api_key, p["api_key"] or ""):
+        raise HTTPException(401, "Unknown partner or wrong API key.", headers={"WWW-Authenticate": "X-API-Key"})
+    return p
+
+
+@app.post("/inbound/{code}", tags=["partner endpoints"])
+async def inbound(code: str, request: Request, wait: bool = True,
+                  x_api_key: str | None = Header(default=None)):
+    """Partner HTTP endpoint. Send the raw payload (JSON or XML) as the body with header X-API-Key.
+    wait=true (default) returns the transformed output; wait=false returns 202 with a transaction id."""
+    p = await _authorised_partner(code, x_api_key or request.query_params.get("api_key"))
+    body = (await request.body()).decode("utf-8", errors="replace")
+    if not body.strip():
+        raise HTTPException(422, "Empty body - send the payload as the request body.")
+    try:
+        txn_id, result = await connectors.ingest(p, body, "HTTP", wait=15 if wait else None)
+    except connectors.IngestError as e:
+        raise HTTPException(e.status, str(e)) from e
+    headers = {"X-Transaction-Id": txn_id}
+    if result and result["status"] == "COMPLETED":
+        media = "application/xml" if p["output_format"] == "xml" else "application/json"
+        return Response(result["output_payload"], media_type=media, headers={**headers, "X-Status": "COMPLETED"})
+    if result and result["status"] == "FAILED":
+        return JSONResponse({"transaction_id": txn_id, "status": "FAILED", "error": result["error"]},
+                            status_code=422, headers=headers)
+    return JSONResponse({"transaction_id": txn_id, "status": "ACCEPTED",
+                         "status_url": f"/inbound/{code}/transactions/{txn_id}"}, status_code=202, headers=headers)
+
+
+@app.get("/inbound/{code}/transactions/{txn_id}", tags=["partner endpoints"])
+async def inbound_status(code: str, txn_id: uuid.UUID, request: Request,
+                         x_api_key: str | None = Header(default=None)):
+    await _authorised_partner(code, x_api_key or request.query_params.get("api_key"))
+    t = await db.get_transaction(txn_id)
+    if not t or t["partner_code"] != code:
+        raise HTTPException(404, "Transaction not found.")
+    return {k: t[k] for k in ("id", "status", "delivery_status", "output_payload", "error", "created_at")}
+
+
+# ---------- built-in test receiver (a webhook target for demos) ----------
+
+_received: deque = deque(maxlen=100)
+
+
+@app.api_route("/test-receiver/{name:path}", methods=["POST", "PUT"], tags=["test receiver"])
+async def test_receiver(name: str, request: Request):
+    body = (await request.body()).decode("utf-8", errors="replace")
+    _received.appendleft({"at": _now_iso(), "name": name, "method": request.method,
+                          "headers": {k: v for k, v in request.headers.items()
+                                      if k.lower().startswith(("x-", "content-type"))},
+                          "body": body})
+    return {"received": True}
+
+
+@app.get("/api/test-receiver")
+async def test_receiver_messages(limit: int = 50):
+    return list(_received)[:limit]
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 @app.get("/api/queues")

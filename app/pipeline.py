@@ -42,6 +42,7 @@ _tasks: list[asyncio.Task] = []
 _waiters: dict[str, asyncio.Future] = {}
 _started_at: dict[str, float] = {}
 _queue_cache: tuple[float, list] = (0.0, [])
+on_completed: list = []  # async callbacks(msg) run after a transaction completes, e.g. outbound delivery
 
 
 def partner_topics(code: str) -> tuple[str, str, str]:
@@ -169,6 +170,8 @@ async def _result_sink(consumer: AIOKafkaConsumer):
             msg = rec.value
             await _finish(msg, "COMPLETED", output_payload=msg["output"],
                           detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
+            for callback in on_completed:
+                asyncio.create_task(callback(msg))
     finally:
         await consumer.stop()
 

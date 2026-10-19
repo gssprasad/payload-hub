@@ -138,7 +138,7 @@ def _start_backend():
     return server
 
 
-from ui import agent, common, monitoring, partners, send, transactions  # noqa: E402
+from ui import agent, common, connections, monitoring, partners, send, transactions  # noqa: E402
 
 if EMBED_BACKEND:
     if problem := _setup_problem():
@@ -154,6 +154,7 @@ if EMBED_BACKEND:
         st.button("Retry")
         st.stop()
     common.API = f"http://127.0.0.1:{EMBED_PORT}"
+    common.EMBEDDED = True
 else:
     common.API = os.getenv("PAYLOAD_HUB_API", "http://localhost:8000")
 
@@ -170,6 +171,7 @@ def _health():
 
 nav = st.navigation([
     st.Page(partners.page, title="Partners", icon="🤝", url_path="partners", default=True),
+    st.Page(connections.page, title="Connections", icon="🔌", url_path="connections"),
     st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
     st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
     st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),

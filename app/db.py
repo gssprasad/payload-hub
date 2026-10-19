@@ -97,11 +97,37 @@ CREATE TABLE IF NOT EXISTS partner_documents (
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS partner_code text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS topic text;
 CREATE INDEX IF NOT EXISTS transactions_partner_idx ON transactions (partner_code, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS connections (
+    id               text PRIMARY KEY,
+    name             text NOT NULL,
+    type             text NOT NULL,
+    config           jsonb NOT NULL DEFAULT '{}',
+    secret           text,
+    last_test_at     timestamptz,
+    last_test_ok     boolean,
+    last_test_detail text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS api_key text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS inbound_connection text REFERENCES connections(id);
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS inbound_source text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS outbound_connection text REFERENCES connections(id);
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS outbound_target text;
+UPDATE partners SET api_key = 'ph_' || md5(random()::text || code) WHERE api_key IS NULL;
+
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS delivery_status text;
 """
 
 PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_format", "sample_input",
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
-                  "topic_dlq", "active")
+                  "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
+                  "outbound_target")
+CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
+                     "last_test_at, last_test_ok, last_test_detail, created_at, updated_at"
 
 pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kwargs={"row_factory": dict_row})
 
@@ -117,15 +143,15 @@ async def close():
 
 
 async def create_transaction(txn_id, mapping_name, input_format, output_format, expression, payload,
-                             partner_code=None, topic=None):
+                             partner_code=None, topic=None, source=None):
     async with pool.connection() as conn:
         await conn.execute(
             """INSERT INTO transactions (id, status, mapping_name, input_format, output_format, expression, input_payload,
-                                         partner_code, topic)
-               VALUES (%s, 'RECEIVED', %s, %s, %s, %s, %s, %s, %s)""",
-            (txn_id, mapping_name, input_format, output_format, expression, payload, partner_code, topic),
+                                         partner_code, topic, source)
+               VALUES (%s, 'RECEIVED', %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (txn_id, mapping_name, input_format, output_format, expression, payload, partner_code, topic, source),
         )
-        source = f"partner {partner_code}" if partner_code else "UI/API"
+        source = f"{source or 'UI'}" + (f" for partner {partner_code}" if partner_code else "")
         await conn.execute(
             "INSERT INTO transaction_events (txn_id, stage, detail) VALUES (%s, 'RECEIVED', %s)",
             (txn_id, f"{len(payload)} bytes of {input_format.upper()} from {source}"),
@@ -179,8 +205,8 @@ async def list_transactions(limit=50, status=None, q=None, since=None, until=Non
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            f"""SELECT id, created_at, status, partner_code, topic, mapping_name, input_format, output_format, error,
-                       transform_ms, total_ms, count(*) OVER () AS matches
+            f"""SELECT id, created_at, status, partner_code, topic, source, delivery_status, mapping_name, input_format,
+                       output_format, error, transform_ms, total_ms, count(*) OVER () AS matches
                 FROM transactions {where} ORDER BY created_at DESC LIMIT %s""",
             (*args, limit),
         )
@@ -290,6 +316,8 @@ async def partner_stats():
                       count(t.id) FILTER (WHERE t.status = 'FAILED') AS failed,
                       count(t.id) FILTER (WHERE t.status NOT IN ('COMPLETED', 'FAILED')) AS in_flight,
                       round(avg(t.total_ms) FILTER (WHERE t.status = 'COMPLETED')::numeric, 1) AS avg_ms,
+                      count(t.id) FILTER (WHERE t.delivery_status = 'DELIVERED') AS delivered,
+                      count(t.id) FILTER (WHERE t.delivery_status = 'DELIVERY_FAILED') AS delivery_failed,
                       max(t.created_at) AS last_seen
                FROM partners p
                FULL OUTER JOIN transactions t ON t.partner_code = p.code
@@ -303,7 +331,7 @@ async def list_partners():
     async with pool.connection() as conn:
         cur = await conn.execute(
             """SELECT p.code, p.name, p.description, p.input_format, p.output_format, p.queue_mode, p.topic_in,
-                      p.active, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
+                      p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
                       p.created_at, p.updated_at,
                       (SELECT count(*) FROM partner_documents d WHERE d.partner_code = p.code) AS documents,
                       (SELECT count(*) FROM transactions t WHERE t.partner_code = p.code) AS transactions
@@ -387,6 +415,73 @@ async def get_agent_run(run_id):
             (run_id,),
         )
         return await cur.fetchone()
+
+
+async def list_connections():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""SELECT {CONNECTION_COLUMNS},
+                       (SELECT coalesce(json_agg(code ORDER BY code), '[]') FROM partners p
+                        WHERE p.inbound_connection = c.id OR p.outbound_connection = c.id) AS used_by
+                FROM connections c ORDER BY name"""
+        )
+        return await cur.fetchall()
+
+
+async def get_connection(conn_id, with_secret=False):
+    cols = "*" if with_secret else CONNECTION_COLUMNS
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"SELECT {cols} FROM connections WHERE id = %s", (conn_id,))
+        return await cur.fetchone()
+
+
+async def create_connection(conn_id, name, type_, config, secret):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO connections (id, name, type, config, secret) VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (id) DO NOTHING RETURNING id""",
+            (conn_id, name, type_, Jsonb(config), secret),
+        )
+        return (await cur.fetchone()) is not None
+
+
+async def update_connection(conn_id, name, config, secret=None):
+    """secret=None keeps the stored secret."""
+    async with pool.connection() as conn:
+        if secret is None:
+            await conn.execute("UPDATE connections SET name = %s, config = %s, updated_at = now() WHERE id = %s",
+                               (name, Jsonb(config), conn_id))
+        else:
+            await conn.execute(
+                "UPDATE connections SET name = %s, config = %s, secret = %s, updated_at = now() WHERE id = %s",
+                (name, Jsonb(config), secret, conn_id))
+
+
+async def record_connection_test(conn_id, ok, detail):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE connections SET last_test_at = now(), last_test_ok = %s, last_test_detail = %s WHERE id = %s",
+            (ok, detail, conn_id))
+
+
+async def delete_connection(conn_id):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM connections WHERE id = %s", (conn_id,))
+
+
+async def partners_with_inbound_adapters():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT code, name, inbound_connection, inbound_source FROM partners
+               WHERE active AND inbound_connection IS NOT NULL AND coalesce(inbound_source, '') <> ''"""
+        )
+        return await cur.fetchall()
+
+
+async def set_delivery(txn_id, status):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE transactions SET delivery_status = %s, updated_at = now() WHERE id = %s",
+                           (status, txn_id))
 
 
 async def ping():

@@ -47,14 +47,29 @@ def _dashboard(scope, partner_names):
         by["success"] = by.apply(lambda r: (r["completed"] / (r["completed"] + r["failed"]) * 100)
                                  if (r["completed"] + r["failed"]) else None, axis=1)
         by["last_seen"] = pd.to_datetime(by["last_seen"]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
-        st.dataframe(by[["partner", "queue", "total", "completed", "failed", "in_flight", "success", "avg_ms", "last_seen"]],
+        st.dataframe(by[["partner", "queue", "total", "completed", "failed", "in_flight", "success", "avg_ms",
+                         "delivered", "delivery_failed", "last_seen"]],
                      hide_index=True, width="stretch",
                      column_config={"partner": "Partner", "queue": "Queue", "total": "Total", "completed": "Completed",
                                     "failed": "Failed", "in_flight": "In flight",
                                     "success": st.column_config.ProgressColumn("Success rate", format="%.0f%%",
                                                                                min_value=0, max_value=100),
                                     "avg_ms": st.column_config.NumberColumn("Avg (ms)", format="%.1f"),
+                                    "delivered": "Delivered", "delivery_failed": "Delivery failed",
                                     "last_seen": "Last transaction"})
+
+    st.markdown("**Adapters**")
+    listeners = api("GET", "/api/adapters/status")
+    conns = api("GET", "/api/connections")
+    rows = [{"Adapter": f"📥 {code} ← {l['connection']}:{l['source']}", "Status": {"running": "🟢 running",
+             "error": "🔴 error"}.get(l["state"], l["state"]), "Detail": l["detail"]} for code, l in listeners.items()]
+    rows += [{"Adapter": f"🔌 {c['name']} ({c['type']})",
+              "Status": "⚪ not tested" if c["last_test_ok"] is None else "🟢 connected" if c["last_test_ok"] else "🔴 failing",
+              "Detail": c["last_test_detail"] or ""} for c in conns]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption("No connections or inbound listeners yet.")
 
     st.markdown("**Kafka queues**")
     q = pd.DataFrame(api("GET", "/api/queues"))
