@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+aiokafka
+psycopg[binary,pool]
+jmespath
+xmltodict
+prometheus-client
+anthropic>=1,<2
+openpyxl
+python-multipart
+streamlit

@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend (FastAPI + Kafka pipeline)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--port", "8000"],
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "Streamlit UI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "streamlit_app.py", "--server.port", "8501"],
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    }
+  ],
+  "compounds": [
+    { "name": "Backend + Streamlit", "configurations": ["Backend (FastAPI + Kafka pipeline)", "Streamlit UI"] }
+  ]
+}

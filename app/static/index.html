@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payload Hub</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea; --text: #1d2330; --muted: #667085;
+  --accent: #3b5bdb; --accent-soft: #e8edff; --ok: #1f8a4c; --ok-soft: #e3f5ea;
+  --bad: #c2362f; --bad-soft: #fdecea; --warn: #b26b00; --warn-soft: #fff3dc;
+  --code-bg: #f3f4f7; --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1e26; --border: #2b313d; --text: #e6e9ef; --muted: #98a2b3;
+    --accent: #7b93ff; --accent-soft: #232b45; --ok: #4cc283; --ok-soft: #173326;
+    --bad: #ff7b72; --bad-soft: #3a1d1c; --warn: #f0b44c; --warn-soft: #362a12; --code-bg: #141820;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; }
+header .sub { color: var(--muted); font-size: 13px; }
+.health { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--code-bg); color: var(--muted); white-space: nowrap; }
+.pill.up { background: var(--ok-soft); color: var(--ok); }
+.pill.down { background: var(--bad-soft); color: var(--bad); }
+main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 40px; display: grid; gap: 18px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; min-width: 0; }
+.panel h2 { font-size: 14px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+.panel h2 .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } main { padding: 16px; } header { padding: 12px 16px; } }
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+textarea, select, input { width: 100%; font: inherit; color: var(--text); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+textarea.prose { font-family: inherit; font-size: 14px; }
+.row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 120px; }
+button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
+button.secondary { background: var(--accent-soft); color: var(--accent); }
+button:disabled { opacity: .55; cursor: progress; }
+pre.out { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; min-height: 220px; max-height: 420px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+.status { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 6px; background: var(--code-bg); color: var(--muted); }
+.status.COMPLETED, .status.SAVED { background: var(--ok-soft); color: var(--ok); }
+.status.FAILED, .status.NOT_SAVED { background: var(--bad-soft); color: var(--bad); }
+.status.QUEUED, .status.TRANSFORMING, .status.TRANSFORMED, .status.RECEIVED, .status.RUNNING { background: var(--warn-soft); color: var(--warn); }
+.meta { color: var(--muted); font-size: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 14px; }
+@media (max-width: 900px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+.tile { background: var(--code-bg); border-radius: 8px; padding: 10px 12px; }
+.tile .k { font-size: 12px; color: var(--muted); }
+.tile .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.chart { display: flex; align-items: end; gap: 3px; height: 70px; padding-top: 4px; }
+.chart .bar { flex: 1; display: flex; flex-direction: column-reverse; min-width: 0; height: 100%; }
+.chart .ok { background: var(--ok); border-radius: 2px 2px 0 0; }
+.chart .bad { background: var(--bad); }
+.chart-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--code-bg); }
+td.err { white-space: normal; color: var(--bad); max-width: 320px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.steps { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 6px; }
+.steps li { font-size: 12.5px; background: var(--code-bg); border-radius: 6px; padding: 6px 9px; }
+.steps li .tag { font-weight: 600; margin-right: 6px; }
+.steps li.fail .tag { color: var(--bad); }
+.steps li.pass .tag { color: var(--ok); }
+.explain { margin-top: 10px; padding: 10px 12px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 8px 8px 0; white-space: pre-wrap; }
+dialog { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); color: var(--text); width: min(900px, calc(100vw - 32px)); max-height: 86vh; padding: 0; }
+dialog::backdrop { background: rgb(0 0 0 / .4); }
+dialog .head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+dialog .body { padding: 16px; display: grid; gap: 12px; }
+.timeline { list-style: none; padding: 0; margin: 0; }
+.timeline li { display: grid; grid-template-columns: 110px 120px 1fr; gap: 8px; padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 12.5px; }
+@media (max-width: 600px) { .timeline li { grid-template-columns: 1fr; } }
+.toolbar { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.toolbar select { width: auto; padding: 4px 8px; font-size: 12px; }
+.search { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.search #searchQ { flex: 1 1 320px; width: auto; }
+.search select, .search input[type=datetime-local] { width: auto; padding: 7px 8px; }
+.search label.inline { display: flex; align-items: center; gap: 6px; margin: 0; }
+mark { background: var(--warn-soft); color: inherit; border-radius: 3px; padding: 0 2px; }
+.doc-drop { border: 1.5px dashed var(--border); border-radius: 8px; padding: 12px; margin-bottom: 4px; }
+.doc-drop.drag { border-color: var(--accent); background: var(--accent-soft); }
+.doc-drop button { padding: 5px 12px; margin-left: 6px; }
+.doc-error { color: var(--bad); margin-top: 8px; font-size: 13px; }
+.sheet-tabs { display: flex; gap: 6px; margin: 10px 0 6px; flex-wrap: wrap; }
+.sheet-tabs button { padding: 3px 10px; font-size: 12px; font-weight: 500; background: var(--code-bg); color: var(--muted); }
+.sheet-tabs button.on { background: var(--accent-soft); color: var(--accent); }
+.doc-preview { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+.doc-preview td, .doc-preview th { white-space: normal; min-width: 90px; max-width: 320px; font-size: 12.5px; vertical-align: top; }
+.doc-preview tr:first-child td { font-weight: 600; background: var(--code-bg); position: sticky; top: 0; }
+.doc-preview td.n { color: var(--muted); min-width: 0; width: 1%; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Payload Hub</h1>
+    <div class="sub">Kafka payload transformation · PostgreSQL transaction log · AI mapping agent</div>
+  </div>
+  <div class="health" id="health"><span class="pill">checking…</span></div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Mapping agent <span class="hint">Attach a mapping document and/or describe what you want. The agent inspects the input below, writes the mapping, tests it, and saves it.</span></h2>
+    <div class="doc-drop" id="docDrop">
+      <input type="file" id="docFile" accept=".xlsx,.xlsm,.csv" hidden>
+      <div id="docEmpty"><strong>Mapping document</strong> <span class="meta">(optional) · drop an Excel (.xlsx) or CSV file here, or</span>
+        <button class="secondary" type="button" id="docPick">Choose file</button>
+        <a class="meta" href="/samples/mapping-template.xlsx" style="margin-left:8px">Download example template</a></div>
+      <div id="docLoaded" hidden>
+        <div class="row" style="align-items:center"><div style="flex:1"><strong id="docName"></strong> <span class="meta" id="docInfo"></span></div>
+          <button class="secondary" type="button" id="docRemove">Remove</button></div>
+        <div class="sheet-tabs" id="docTabs"></div>
+        <div class="table-wrap doc-preview"><table id="docTable"></table></div>
+      </div>
+      <div class="doc-error" id="docError" hidden></div>
+    </div>
+    <label for="agentRequest">Instructions</label>
+    <textarea id="agentRequest" class="prose" rows="3" placeholder="e.g. Turn this order into a shipment as XML: shipment id = SHP- plus the order id, recipient full name, and one package per item with sku and quantity. With a mapping document attached, you can leave this empty or add extra rules."></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="askAgent">Ask agent</button>
+      <span class="meta" id="agentMeta"></span>
+    </div>
+    <div id="agentResult"></div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel">
+      <h2>Input</h2>
+      <div class="row">
+        <div><label for="mapping">Mapping</label><select id="mapping"></select></div>
+        <div><label for="inFmt">Input format</label><select id="inFmt"><option>json</option><option>xml</option></select></div>
+        <div><label for="outFmt">Output format</label><select id="outFmt"><option>json</option><option>xml</option></select></div>
+      </div>
+      <label for="input">Payload</label>
+      <textarea id="input" rows="14" spellcheck="false"></textarea>
+      <label for="expr">Mapping expression (JMESPath)</label>
+      <textarea id="expr" rows="8" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:12px">
+        <button id="run">Transform via Kafka</button>
+        <span class="meta">payload.in → transformer → payload.out → PostgreSQL</span>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Output <span id="outStatus"></span><span class="hint" id="outMeta"></span></h2>
+      <pre class="out" id="output">Run a transformation to see the result.</pre>
+      <ul class="timeline" id="outTimeline" style="margin-top:12px"></ul>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Monitoring <span class="hint">refreshes every 3 s · Prometheus metrics at <a href="/metrics" target="_blank">/metrics</a></span></h2>
+    <div class="tiles" id="tiles"></div>
+    <div class="meta">Transactions per minute, last 30 minutes (green = completed, red = failed)</div>
+    <div class="chart" id="chart"></div>
+    <div class="chart-axis" id="chartAxis"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Transaction log <span class="hint" id="txnCount"></span></h2>
+    <form class="search" id="searchForm">
+      <input id="searchQ" type="search" placeholder="Search transaction ID, mapping, or any value in input / output / error (e.g. 1042, INV-1042, Asha)">
+      <select id="statusFilter"><option value="">All statuses</option><option>COMPLETED</option><option>FAILED</option><option>QUEUED</option><option>TRANSFORMING</option><option>TRANSFORMED</option></select>
+      <label class="inline">From <input id="since" type="datetime-local"></label>
+      <label class="inline">To <input id="until" type="datetime-local"></label>
+      <button type="submit">Search</button>
+      <button type="button" class="secondary" id="searchClear">Clear</button>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Transaction</th><th>Mapping</th><th>Formats</th><th>Status</th><th>Transform</th><th>End-to-end</th><th>Error</th></tr></thead>
+        <tbody id="txns"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Agent runs</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Request / document</th><th>Status</th><th>Mapping</th><th>Tool calls</th><th>Tokens in / out</th><th>Duration</th></tr></thead>
+        <tbody id="agentRuns"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<dialog id="detail">
+  <div class="head"><strong id="dTitle"></strong><span id="dStatus"></span><button class="secondary" style="margin-left:auto" onclick="detail.close()">Close</button></div>
+  <div class="body" id="dBody"></div>
+</dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let samples = {};
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const ms = (v) => (v == null ? "–" : `${Number(v).toFixed(v < 10 ? 1 : 0)} ms`);
+const time = (t) => new Date(t).toLocaleTimeString();
+const pill = (s) => `<span class="status ${esc(s)}">${esc(s)}</span>`;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok && r.status !== 503) throw new Error(body.detail ? JSON.stringify(body.detail) : r.statusText);
+  return body;
+}
+
+async function loadSamples(select) {
+  samples = await api("/api/samples");
+  $("mapping").innerHTML = Object.entries(samples).map(([k, s]) =>
+    `<option value="${esc(k)}">${s.saved_by_agent ? "🤖 " : ""}${esc(s.label)}</option>`).join("") +
+    `<option value="custom">Custom expression</option>`;
+  if (select) { $("mapping").value = select; applySample(false); }
+}
+
+function applySample(withInput = true) {
+  const s = samples[$("mapping").value];
+  if (!s) return;
+  $("inFmt").value = s.input_format; $("outFmt").value = s.output_format; $("expr").value = s.expression;
+  if (withInput && s.input) $("input").value = s.input;
+}
+$("mapping").onchange = () => applySample(true);
+$("expr").oninput = () => { if (samples[$("mapping").value]?.expression !== $("expr").value) $("mapping").value = "custom"; };
+
+function renderTimeline(el, events) {
+  el.innerHTML = (events || []).map((e) =>
+    `<li><span class="meta">${new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3, hour12: false })}</span>${pill(e.stage)}<span>${esc(e.detail)}</span></li>`).join("");
+}
+
+$("run").onclick = async () => {
+  $("run").disabled = true; $("output").textContent = "Publishing to Kafka…"; $("outStatus").innerHTML = pill("RUNNING"); $("outMeta").textContent = "";
+  try {
+    const t = await api("/api/transform", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ payload: $("input").value, input_format: $("inFmt").value, output_format: $("outFmt").value,
+                             expression: $("expr").value, mapping_name: $("mapping").value }),
+    });
+    $("outStatus").innerHTML = pill(t.status);
+    $("output").textContent = t.output_payload ?? t.error ?? "Still processing - see the transaction log.";
+    $("outMeta").textContent = `transform ${ms(t.transform_ms)} · end-to-end ${ms(t.total_ms)} · ${t.id.slice(0, 8)}`;
+    renderTimeline($("outTimeline"), t.events);
+  } catch (e) {
+    $("outStatus").innerHTML = pill("FAILED"); $("output").textContent = e.message;
+  } finally { $("run").disabled = false; refresh(); }
+};
+
+let mappingDoc = null;
+
+function showDocSheet(i) {
+  const sheet = mappingDoc.sheets[i];
+  [...$("docTabs").children].forEach((b, j) => b.classList.toggle("on", i === j));
+  $("docTable").innerHTML = sheet.rows.slice(0, 200).map((r, n) =>
+    `<tr><td class="n">${n + 1}</td>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("") +
+    (sheet.rows.length > 200 ? `<tr><td></td><td colspan="${sheet.rows[0].length}" class="meta">…${sheet.rows.length - 200} more rows (all sent to the agent)</td></tr>` : "");
+}
+
+async function uploadDoc(file) {
+  $("docError").hidden = true;
+  const form = new FormData(); form.append("file", file);
+  try {
+    const r = await fetch("/api/mapping-doc", { method: "POST", body: form });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || r.statusText);
+    mappingDoc = body;
+    $("docName").textContent = `📄 ${body.filename}`;
+    $("docInfo").textContent = body.sheets.map((s) => `${s.name}: ${s.rows.length} rows`).join(" · ");
+    $("docTabs").innerHTML = body.sheets.map((s, i) => `<button type="button" data-i="${i}">${esc(s.name)}</button>`).join("");
+    $("docTabs").hidden = body.sheets.length < 2;
+    $("docEmpty").hidden = true; $("docLoaded").hidden = false;
+    showDocSheet(0);
+  } catch (e) {
+    $("docError").textContent = e.message; $("docError").hidden = false;
+  }
+}
+function clearDoc() { mappingDoc = null; $("docFile").value = ""; $("docEmpty").hidden = false; $("docLoaded").hidden = true; $("docError").hidden = true; }
+
+$("docPick").onclick = () => $("docFile").click();
+$("docFile").onchange = () => $("docFile").files[0] && uploadDoc($("docFile").files[0]);
+$("docRemove").onclick = clearDoc;
+$("docTabs").onclick = (e) => { if (e.target.dataset.i) showDocSheet(Number(e.target.dataset.i)); };
+["dragenter", "dragover"].forEach((ev) => $("docDrop").addEventListener(ev, (e) => { e.preventDefault(); $("docDrop").classList.add("drag"); }));
+["dragleave", "drop"].forEach((ev) => $("docDrop").addEventListener(ev, (e) => { e.preventDefault(); $("docDrop").classList.remove("drag"); }));
+$("docDrop").addEventListener("drop", (e) => e.dataTransfer.files[0] && uploadDoc(e.dataTransfer.files[0]));
+
+$("askAgent").onclick = async () => {
+  const request = $("agentRequest").value.trim();
+  if (!request && !mappingDoc) { $("agentRequest").focus(); $("agentMeta").textContent = "Attach a mapping document or describe the transformation."; return; }
+  $("askAgent").disabled = true;
+  $("agentMeta").textContent = "Agent is inspecting the input, writing and testing a mapping… (usually 15–60 s)";
+  $("agentResult").innerHTML = "";
+  try {
+    const r = await api("/api/agent", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request, payload: $("input").value, input_format: $("inFmt").value,
+                             mapping_doc: mappingDoc && { filename: mappingDoc.filename, text: mappingDoc.text } }),
+    });
+    $("agentMeta").innerHTML = `${pill(r.status)} ${r.steps.length} tool calls · ${(r.duration_ms / 1000).toFixed(1)} s · ${r.usage.input_tokens.toLocaleString()} in / ${r.usage.output_tokens.toLocaleString()} out tokens`;
+    const steps = r.steps.map((s) => {
+      const what = s.tool === "test_mapping" ? (s.ok ? "output OK" : esc(s.result)) :
+                   s.tool === "save_mapping" ? (s.ok ? `saved “${esc(s.name)}”` : esc(s.result)) :
+                   `parsed as ${esc(s.input_format)}${s.ok ? "" : ": " + esc(s.result)}`;
+      return `<li class="${s.ok ? "pass" : "fail"}"><span class="tag">${esc(s.tool)}</span>${what}</li>`;
+    }).join("");
+    $("agentResult").innerHTML = `${r.explanation ? `<div class="explain">${esc(r.explanation)}</div>` : ""}<ul class="steps">${steps}</ul>`;
+    if (r.mapping) {
+      await loadSamples(r.mapping.name);
+      $("output").textContent = r.mapping.preview;
+      $("outStatus").innerHTML = pill("PREVIEW");
+      $("outMeta").textContent = "agent preview - click “Transform via Kafka” to run it through the pipeline";
+      $("outTimeline").innerHTML = "";
+    }
+  } catch (e) {
+    $("agentMeta").innerHTML = `${pill("FAILED")} ${esc(e.message)}`;
+  } finally { $("askAgent").disabled = false; refresh(); }
+};
+
+async function showDetail(id) {
+  const t = await api(`/api/transactions/${id}`);
+  $("dTitle").textContent = `Transaction ${t.id}`;
+  $("dStatus").innerHTML = pill(t.status);
+  $("dBody").innerHTML = `
+    <div class="meta">${esc(t.mapping_name)} · ${esc(t.input_format)} → ${esc(t.output_format)} · created ${new Date(t.created_at).toLocaleString()} · transform ${ms(t.transform_ms)} · end-to-end ${ms(t.total_ms)}</div>
+    <div><strong>Pipeline events</strong><ul class="timeline" id="dTimeline"></ul></div>
+    ${t.error ? `<div><strong>Error</strong><pre class="out" style="min-height:0">${esc(t.error)}</pre></div>` : ""}
+    <div class="grid2"><div><strong>Input</strong><pre class="out">${esc(t.input_payload)}</pre></div>
+    <div><strong>Output</strong><pre class="out">${esc(t.output_payload ?? "–")}</pre></div></div>
+    <div><strong>Mapping expression</strong><pre class="out" style="min-height:0">${esc(t.expression)}</pre></div>`;
+  renderTimeline($("dTimeline"), t.events);
+  $("detail").showModal();
+}
+
+async function refresh() {
+  try {
+    const [h, s, txns, runs] = await Promise.all([
+      api("/health"), api("/api/stats"),
+      api(`/api/transactions?${txnQuery()}`),
+      api("/api/agent/runs?limit=10"),
+    ]);
+    const hp = (k, v) => `<span class="pill ${v === "up" || v === "running" ? "up" : "down"}">${k}: ${esc(v)}</span>`;
+    $("health").innerHTML = hp("PostgreSQL", h.database) + hp("Kafka", h.kafka) +
+      Object.entries(h.consumers || {}).map(([k, v]) => hp(k, v)).join("");
+
+    const rate = s.total ? `${((s.completed / Math.max(1, s.completed + s.failed)) * 100).toFixed(1)}%` : "–";
+    const tile = (k, v) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+    $("tiles").innerHTML = tile("Total", s.total) + tile("Completed", s.completed) + tile("Failed", s.failed) +
+      tile("Success rate", rate) + tile("Avg end-to-end", ms(s.avg_ms)) + tile("p95 end-to-end", ms(s.p95_ms));
+    const max = Math.max(1, ...s.per_minute.map((m) => m.completed + m.failed));
+    $("chart").innerHTML = s.per_minute.map((m) =>
+      `<div class="bar" title="${m.minute}: ${m.completed} completed, ${m.failed} failed">
+        <div class="ok" style="height:${(m.completed / max) * 100}%"></div><div class="bad" style="height:${(m.failed / max) * 100}%"></div></div>`).join("");
+    $("chartAxis").innerHTML = `<span>${s.per_minute[0]?.minute ?? ""}</span><span>${s.per_minute.at(-1)?.minute ?? ""}</span>`;
+
+    const searching = txnQuery() !== "limit=100";
+    const total = txns[0]?.matches ?? 0;
+    $("txnCount").textContent = searching ? `${total} match${total === 1 ? "" : "es"}${total > txns.length ? ` · showing latest ${txns.length}` : ""}` : "";
+    $("txns").innerHTML = txns.map((t) => `<tr data-id="${t.id}">
+      <td>${new Date(t.created_at).toLocaleString([], { dateStyle: "short", timeStyle: "medium" })}</td><td class="mono" title="${t.id}">${t.id.slice(0, 8)}</td><td>${esc(t.mapping_name)}</td>
+      <td>${esc(t.input_format)} → ${esc(t.output_format)}</td><td>${pill(t.status)}</td>
+      <td>${ms(t.transform_ms)}</td><td>${ms(t.total_ms)}</td><td class="err">${esc(t.error ?? "")}</td></tr>`).join("") ||
+      `<tr><td colspan="8" class="meta">${searching ? "No transactions match this search." : "No transactions yet."}</td></tr>`;
+    $("agentRuns").innerHTML = runs.map((r) => `<tr title="${esc(r.explanation)}">
+      <td>${time(r.created_at)}</td><td style="white-space:normal;max-width:420px">${r.mapping_doc_name ? `📄 ${esc(r.mapping_doc_name)}${r.request ? " · " : ""}` : ""}${esc(r.request)}</td><td>${pill(r.status)}</td>
+      <td>${esc(r.mapping_name ?? "–")}</td><td>${r.tool_calls}</td><td>${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}</td>
+      <td>${(r.duration_ms / 1000).toFixed(1)} s</td></tr>`).join("") || `<tr><td colspan="7" class="meta">No agent runs yet.</td></tr>`;
+  } catch (e) {
+    $("health").innerHTML = `<span class="pill down">server unreachable</span>`;
+  }
+}
+$("txns").onclick = (e) => { const tr = e.target.closest("tr[data-id]"); if (tr) showDetail(tr.dataset.id); };
+function txnQuery() {
+  const p = new URLSearchParams({ limit: 100 });
+  const q = $("searchQ").value.trim();
+  if (q) p.set("q", q);
+  if ($("statusFilter").value) p.set("status", $("statusFilter").value);
+  if ($("since").value) p.set("since", new Date($("since").value).toISOString());
+  if ($("until").value) p.set("until", new Date($("until").value).toISOString());
+  return p.toString();
+}
+$("searchForm").onsubmit = (e) => { e.preventDefault(); refresh(); };
+$("statusFilter").onchange = refresh;
+$("searchClear").onclick = () => { $("searchQ").value = ""; $("statusFilter").value = ""; $("since").value = ""; $("until").value = ""; refresh(); };
+
+loadSamples().then(() => applySample(true));
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
