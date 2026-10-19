@@ -1,5 +1,5 @@
 [client]
-toolbarMode = "viewer"
+toolbarMode = "auto"  # full menu (Settings, Rerun, Clear cache...) locally; trimmed on deployed apps
 
 [browser]
 gatherUsageStats = false

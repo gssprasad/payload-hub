@@ -100,6 +100,10 @@ Administrators add users on the **Users** page and give each one any of:
 | Delete | Removing partners, documents and connections |
 | Admin  | Managing users |
 
+The menu (left sidebar) appears after signing in. You stay signed in across browser refreshes:
+the session token is kept in the page URL (`?session=...`), so don't share that URL. Signing out
+ends the session.
+
 Permissions are enforced by the API itself (`/api/...` needs a session token), not just hidden in
 the UI. Passwords are stored as PBKDF2-SHA256 hashes. Sessions last 12 hours and end at once
 when a user signs out, changes password or is disabled. Partner endpoints (`/inbound/...`) keep

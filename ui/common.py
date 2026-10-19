@@ -32,6 +32,7 @@ def can(permission: str) -> bool:
 def sign_out(message: str | None = None):
     for k in ("auth_token", "auth_user"):
         st.session_state.pop(k, None)
+    st.query_params.pop("session", None)
     if message:
         st.session_state.login_message = message
 

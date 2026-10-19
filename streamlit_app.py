@@ -143,7 +143,24 @@ else:
     common.API = os.getenv("PAYLOAD_HUB_API", "http://localhost:8000")
 
 
+def _restore_session():
+    """Stay signed in across browser refreshes: the session token is kept in the page URL (?session=...)."""
+    token = st.query_params.get("session")
+    if not token or common.token():
+        return
+    st.session_state.auth_token = token
+    try:
+        st.session_state.auth_user = common.api("GET", "/api/auth/me")
+    except common.ApiError:
+        common.sign_out()
+        st.query_params.pop("session", None)
+
+
 def _login_page():
+    with st.sidebar:
+        st.markdown("### 🔀 Payload Hub")
+        st.info("Sign in to see the menu: Partners, Connections, AI Agent, Send & Test, Transactions, "
+                "Monitoring and Users.")
     st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
     _, middle, _ = st.columns([1, 1.2, 1])
     with middle:
@@ -161,6 +178,7 @@ def _login_page():
                     st.error(str(e))
                 else:
                     st.session_state.auth_token, st.session_state.auth_user = r["token"], r["user"]
+                    st.query_params["session"] = r["token"]
                     st.rerun()
         if EMBEDDED_DEFAULT_ADMIN:
             st.caption("⚠️ Using the built-in Administrator account? Change its default password after signing in "
@@ -169,8 +187,11 @@ def _login_page():
 
 
 EMBEDDED_DEFAULT_ADMIN = EMBED_BACKEND and not os.getenv("ADMIN_PASSWORD")
+_restore_session()
 if not common.token():
+    st.query_params.pop("session", None)
     _login_page()
+st.query_params["session"] = common.token()  # keep it in the URL after page changes, so a refresh stays signed in
 
 
 def _account():
