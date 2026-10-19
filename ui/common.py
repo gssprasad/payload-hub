@@ -14,13 +14,16 @@ class ApiError(Exception):
     """The backend rejected a request; the message is safe to show to the user."""
 
 
-def api(method: str, path: str, **kwargs):
-    """Call the backend; stop the page with a readable message if it is unreachable."""
+def api(method: str, path: str, fatal: bool = True, **kwargs):
+    """Call the backend. If it is unreachable, stop the page with a readable message
+    (or return None when fatal=False, e.g. for the sidebar health check)."""
     try:
         r = requests.request(method, f"{API}{path}", timeout=kwargs.pop("timeout", 30), **kwargs)
     except requests.ConnectionError:
-        st.error(f"Can't reach the Payload Hub backend at {API}. Start it with "
-                 "`.venv/bin/uvicorn app.main:app --port 8000`.")
+        if not fatal:
+            return None
+        st.error(f"Can't reach the Payload Hub backend at {API}. Locally, start it with "
+                 "`.venv/bin/uvicorn app.main:app --port 8000`. On Streamlit Cloud, check the app's secrets.")
         st.stop()
     if r.status_code == 204:
         return None
