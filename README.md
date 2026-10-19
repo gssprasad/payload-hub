@@ -191,9 +191,17 @@ Streamlit Cloud runs only `streamlit_app.py`, so the pipeline runs inside it
    certificate. Topics are created automatically on first start.
 2. **PostgreSQL (Neon, free plan)**: create a project and copy its connection string.
 3. **GitHub**: push this repository (a private repository is fine).
-4. **Streamlit Cloud** (share.streamlit.io): **Create app** > select the repository, branch
+4. **Secrets**: run the helper in your terminal. It asks for the Neon and Aiven details (hiding
+   passwords), reads `ca.pem`, tests both connections, writes `.streamlit/secrets.toml`
+   (git-ignored) and copies it to the clipboard:
+
+   ```bash
+   .venv/bin/python scripts/setup_cloud_secrets.py
+   ```
+
+5. **Streamlit Cloud** (share.streamlit.io): **Create app** > select the repository, branch
    `main`, main file `streamlit_app.py`. Under **Advanced settings**, pick Python 3.12 or newer
-   and paste your secrets, using `.streamlit/secrets.toml.example` as the template.
-5. Open the app URL and sign in with `APP_PASSWORD`.
+   and paste the secrets. For an app that already exists: **Manage app > ⋮ > Settings > Secrets**.
+6. Open the app URL and sign in with `APP_PASSWORD`.
 
 Streamlit Cloud puts idle apps to sleep; open the link shortly before a demo so it is awake.
