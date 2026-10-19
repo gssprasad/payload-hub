@@ -247,7 +247,7 @@ with st.sidebar:
     st.markdown("**Health**")
     _health()
     if not EMBED_BACKEND:
-        st.caption(f"[Prometheus metrics]({common.API}/metrics) · [HTML UI]({common.API}/)")
+        st.caption(f"[API docs]({common.API}/docs) · [Prometheus metrics]({common.API}/metrics) · [Classic page]({common.API}/classic)")
     st.divider()
     _account()
 

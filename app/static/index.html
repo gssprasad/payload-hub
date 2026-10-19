@@ -104,7 +104,7 @@ mark { background: var(--warn-soft); color: inherit; border-radius: 3px; padding
 <header>
   <div>
     <h1>Payload Hub</h1>
-    <div class="sub">Kafka payload transformation · PostgreSQL transaction log · AI mapping agent</div>
+    <div class="sub">Classic quick-test page · the full app (partners, connections, users…) is the Streamlit app</div>
   </div>
   <div class="health" id="health"><span class="pill">checking…</span></div>
 </header>
@@ -408,7 +408,8 @@ async function refresh() {
       <td>${esc(r.mapping_name ?? "–")}</td><td>${r.tool_calls}</td><td>${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}</td>
       <td>${(r.duration_ms / 1000).toFixed(1)} s</td></tr>`).join("") || `<tr><td colspan="7" class="meta">No agent runs yet.</td></tr>`;
   } catch (e) {
-    $("health").innerHTML = `<span class="pill down">server unreachable</span>`;
+    if (e.message !== "Sign in required")
+      $("health").innerHTML = `<span class="pill down">server unreachable</span>`;
   }
 }
 $("txns").onclick = (e) => { const tr = e.target.closest("tr[data-id]"); if (tr) showDetail(tr.dataset.id); };

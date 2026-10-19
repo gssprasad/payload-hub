@@ -167,9 +167,54 @@ class TransformRequest(BaseModel):
     mapping_name: str = "custom"
 
 
-@app.get("/")
+APP_URL = os.getenv("PAYLOAD_HUB_APP_URL", "http://localhost:8501")
+
+LANDING = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Payload Hub</title>
+<style>
+:root {{ --bg:#f6f7f9; --panel:#fff; --border:#e2e5ea; --text:#1d2330; --muted:#667085; --accent:#ff4b4b; --link:#3b5bdb; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#12151b; --panel:#1a1e26; --border:#2b313d; --text:#e6e9ef;
+  --muted:#98a2b3; --link:#7b93ff; }} }}
+body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+main {{ max-width:640px; margin:10vh auto; padding:0 16px; }}
+.card {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:28px; }}
+h1 {{ margin:0 0 4px; font-size:26px; }} .muted {{ color:var(--muted); }}
+.btn {{ display:inline-block; margin:18px 0 8px; background:var(--accent); color:#fff; text-decoration:none;
+  font-weight:600; padding:11px 20px; border-radius:8px; }}
+ul {{ padding-left:18px; }} a {{ color:var(--link); }} code {{ font-size:13px; }}
+.ok {{ color:#1f8a4c; font-weight:600; }} .bad {{ color:#c2362f; font-weight:600; }}
+</style></head><body><main><div class="card">
+<h1>🔀 Payload Hub</h1>
+<div class="muted">Backend and API server · status: <span class="{status_class}">{status}</span></div>
+<a class="btn" href="{app_url}">Open Payload Hub →</a>
+<div class="muted">The full application (partners, connections, AI agent, transactions, monitoring, users) runs at
+<a href="{app_url}">{app_url}</a>. This port serves the API behind it.</div>
+<h3>On this server</h3>
+<ul>
+<li><a href="/docs">API documentation</a> (try the API in the browser)</li>
+<li><a href="/health">Health check</a> · <a href="/metrics">Prometheus metrics</a></li>
+<li>Partner endpoints: <code>POST /inbound/&lt;partner-code&gt;</code> with header <code>X-API-Key</code></li>
+<li><a href="/classic">Classic quick-test page</a> (the original single-page tester; sign-in required)</li>
+</ul></div></main></body></html>"""
+
+
+@app.get("/", response_class=Response)
 async def index():
-    """The original single-page UI; it now needs a signed-in session (it shows a sign-in box)."""
+    """Start page for the backend port: points people to the full app and to the API tools."""
+    healthy = True
+    try:
+        await db.ping()
+        await pipeline.producer.client.fetch_all_metadata()
+    except Exception:  # noqa: BLE001
+        healthy = False
+    html = LANDING.format(app_url=APP_URL, status="running" if healthy else "degraded - see /health",
+                          status_class="ok" if healthy else "bad")
+    return Response(html, media_type="text/html")
+
+
+@app.get("/classic")
+async def classic():
+    """The original single-page UI; it needs a signed-in session (it shows a sign-in box)."""
     return FileResponse(STATIC / "index.html")
 
 

@@ -36,7 +36,9 @@ Then the backend, from this folder:
 .venv/bin/uvicorn app.main:app --port 8000
 ```
 
-Open http://localhost:8000 for the built-in web UI.
+Port 8000 is the backend: http://localhost:8000 is a start page with a link to the full app,
+the API documentation (`/docs`), `/health`, `/metrics`, and the original single-page tester at
+`/classic`. The full application is the Streamlit app on port 8501 (below).
 
 ### Streamlit UI (optional)
 
