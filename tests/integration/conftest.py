@@ -85,10 +85,27 @@ def base_url():
         if not thread.is_alive() or time.monotonic() > deadline:
             pytest.fail("the app didn't start - see the log above")
         time.sleep(0.1)
-    yield f"http://127.0.0.1:{port}"
+    url = f"http://127.0.0.1:{port}"
+    _wait_for_pipeline(url)
+    yield url
     server.should_exit = True
     thread.join(timeout=30)
     _drop_test_topics()
+
+
+def _wait_for_pipeline(url: str, timeout: float = 120):
+    """On a fresh Kafka the consumer groups take a while to form; wait until a message really goes through."""
+    client = login(url, *ADMIN)
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        r = client.post("/api/transform", json={"payload": '{"ping": 1}', "input_format": "json",
+                                                "output_format": "json", "expression": "ping"}, timeout=60)
+        last = r.text
+        if r.status_code == 200 and r.json().get("status") == "COMPLETED":
+            return
+        time.sleep(2)
+    pytest.fail(f"the Kafka pipeline didn't process a message within {timeout} s: {last}")
 
 
 def login(base_url, username, password) -> httpx.Client:

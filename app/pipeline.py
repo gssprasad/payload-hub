@@ -150,12 +150,13 @@ async def _transformer(consumer: AIOKafkaConsumer):
                 output = transform(msg["payload"], msg["input_format"], msg["expression"], msg["output_format"])
                 elapsed = (time.perf_counter() - t0) * 1000
                 TRANSFORM_SECONDS.observe(elapsed / 1000)
-                await producer.send_and_wait(topic_out, {**msg, "output": output, "transform_ms": elapsed}, key=rec.key)
+                # record first: once published, the result sink may mark it COMPLETED at any moment
                 await db.record_event(
                     txn_id, "TRANSFORMED",
                     f"{len(output)} bytes of {msg['output_format'].upper()} in {elapsed:.1f} ms -> {topic_out}",
                     status="TRANSFORMED", transform_ms=elapsed,
                 )
+                await producer.send_and_wait(topic_out, {**msg, "output": output, "transform_ms": elapsed}, key=rec.key)
             except TransformError as e:
                 elapsed = (time.perf_counter() - t0) * 1000
                 await producer.send_and_wait(topic_dlq, {**msg, "error": str(e)}, key=rec.key)
