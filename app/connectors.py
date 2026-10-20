@@ -42,13 +42,22 @@ async def adapter_for(conn_id: str) -> adapters.Adapter:
     conn = await db.get_connection(conn_id, with_secret=True)
     if not conn:
         raise adapters.AdapterError(f"Connection '{conn_id}' no longer exists.")
-    stamp = str(conn["updated_at"])
+    stamp = str(conn["updated_at"])  # also bumped when its named secret changes
     cached = _adapters.get(conn_id)
     if cached and cached[0] == stamp:
         return cached[1]
     if cached:
         await cached[1].close()
-    adapter = adapters.make(conn)
+    from . import vault
+
+    if conn.get("secret_alias"):
+        secret = await vault.secret_value(conn["secret_alias"])
+        if secret is None:
+            raise adapters.AdapterError(f"The stored secret '{conn['secret_alias']}' can't be read - re-enter it on "
+                                        "the Secrets page.")
+    else:
+        secret = vault.unseal(conn.get("secret"))
+    adapter = adapters.make({**conn, "secret": secret})
     _adapters[conn_id] = (stamp, adapter)
     return adapter
 

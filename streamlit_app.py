@@ -124,6 +124,7 @@ def _start_backend():
 
 from ui import (agent, common, connections, data, monitoring, overview, partners, ports, schedulers, send,  # noqa: E402
                 transactions, users, workflows)
+from ui import secrets as secrets_page  # noqa: E402
 
 common.style()
 
@@ -200,10 +201,10 @@ def _account():
     u = common.user()
     perms = [p for p, ok in (("read", u.get("can_read")), ("write", u.get("can_write")),
                              ("delete", u.get("can_delete")), ("admin", u.get("is_admin"))) if ok]
-    st.markdown(f"**👤 {u.get('username')}**")
-    st.caption(" · ".join(perms) or "no permissions")
-    with st.expander("My account"):
+    with st.popover(f"👤 {u.get('username')}", width="stretch"):
+        st.caption("Permissions: " + (" · ".join(perms) or "none"))
         with st.form("change_password", clear_on_submit=True):
+            st.markdown("**Change password**")
             current = st.text_input("Current password", type="password")
             new = st.text_input("New password", type="password", help="At least 6 characters.")
             if st.form_submit_button("Change password"):
@@ -214,12 +215,12 @@ def _account():
                 else:
                     common.sign_out("Password changed - please sign in with the new one.")
                     st.rerun()
-    if st.button("Sign out", width="stretch"):
-        try:
-            common.api("POST", "/api/auth/logout")
-        finally:
-            common.sign_out("You've signed out.")
-        st.rerun()
+        if st.button("Sign out", width="stretch"):
+            try:
+                common.api("POST", "/api/auth/logout")
+            finally:
+                common.sign_out("You've signed out.")
+            st.rerun()
 
 
 @st.fragment(run_every=10)
@@ -229,35 +230,39 @@ def _health():
         st.caption(f"🔴 Backend unreachable at {common.API}")
         return
     items = [("PostgreSQL", h["database"]), ("Kafka", h["kafka"]), *h.get("consumers", {}).items()]
-    st.caption("  \n".join(f"{'🟢' if v in ('up', 'running') else '🔴'} {k}: {v}" for k, v in items))
+    down = [k for k, v in items if v not in ("up", "running")]
+    st.caption("🟢 All systems up" if not down else "🔴 " + ", ".join(f"{k} down" for k in down))
 
 
-pages = [
-    st.Page(overview.page, title="Overview", icon="📈", url_path="overview", default=True),
-    st.Page(partners.page, title="Partners", icon="🤝", url_path="partners"),
-    st.Page(connections.page, title="Adapters & Connections", icon="🔌", url_path="connections"),
-    st.Page(ports.page, title="Ports", icon="📡", url_path="ports"),
-    st.Page(workflows.page, title="Workflows", icon="⚙️", url_path="workflows"),
-    st.Page(schedulers.page, title="Schedulers", icon="⏰", url_path="schedulers"),
-    st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
-    st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
-    st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),
-    st.Page(data.page, title="Data", icon="🗄️", url_path="data"),
-    st.Page(monitoring.page, title="Monitoring", icon="📊", url_path="monitoring"),
-]
+def _page(fn, title, icon, path, **kw):
+    return st.Page(fn, title=title, icon=icon, url_path=path, **kw)
+
+
+sections = {
+    "": [_page(overview.page, "Overview", "📈", "overview", default=True)],
+    "Integrate": [_page(partners.page, "Partners", "🤝", "partners"),
+                  _page(workflows.page, "Workflows", "⚙️", "workflows"),
+                  _page(schedulers.page, "Schedulers", "⏰", "schedulers")],
+    "Connect": [_page(ports.page, "Ports", "📡", "ports"),
+                _page(connections.page, "Connections", "🔌", "connections")],
+    "Operate": [_page(transactions.page, "Transactions", "🔎", "transactions"),
+                _page(monitoring.page, "Monitoring", "📊", "monitoring")],
+    "Tools": [_page(send.page, "Send & Test", "▶️", "send"),
+              _page(agent.page, "AI Agent", "🤖", "agent"),
+              _page(data.page, "Data", "🗄️", "data")],
+}
 if common.can("admin"):
-    pages.append(st.Page(users.page, title="Users", icon="👥", url_path="users"))
+    sections["Administer"] = [_page(users.page, "Users", "👥", "users"),
+                              _page(secrets_page.page, "Secrets", "🔐", "secrets")]
+pages = [pg for group in sections.values() for pg in group]
 common.PAGES = {pg.url_path: pg for pg in pages}
-nav = st.navigation(pages)
+nav = st.navigation(sections, expanded=True)
 
 with st.sidebar:
     st.markdown("### 🔀 Payload Hub")
-    st.caption("Integration hub · Kafka · MQ · HTTP")
-    st.markdown("**Health**")
     _health()
-    if not EMBED_BACKEND:
-        st.caption(f"[API docs]({common.API}/docs) · [Prometheus metrics]({common.API}/metrics) · [Classic page]({common.API}/classic)")
-    st.divider()
     _account()
+    if not EMBED_BACKEND:
+        st.caption(f"[API docs]({common.API}/docs) · [Metrics]({common.API}/metrics)")
 
 nav.run()

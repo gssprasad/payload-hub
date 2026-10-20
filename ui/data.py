@@ -26,8 +26,7 @@ def _base(target: str) -> str:
 
 
 def page():
-    common.hero("🗄️ Data", "Create tables for your integration data, see what partners stored, and query or "
-                          "change it with SQL - in the built-in data area or any connected database.")
+    common.hero("🗄️ Data", "Tables for your integration data, and SQL on any connected database.")
     status = api("GET", "/api/data/status")
     dbs = {c["id"]: c for c in api("GET", "/api/connections") if c["type"] == "database"}
     options = [BUILTIN, *dbs] + ([SYSTEM] if common.can("admin") else [])

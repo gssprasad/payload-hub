@@ -29,6 +29,7 @@ STATIC = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(_app):
     await db.init()
+    await vault.migrate()
     await auth.ensure_admin()
     await datastore.init()
     await pipeline.start()
@@ -65,7 +66,24 @@ async def require_login(request: Request, call_next):
         return JSONResponse({"detail": f"Your account doesn't have {permission} permission."}, status_code=403)
     request.state.user = user
     request.state.token = token
-    return await call_next(request)
+    response = await call_next(request)
+    if permission != "read" and request.method in ("POST", "PUT", "DELETE") and response.status_code < 400 \
+            and not NOT_AUDITED.match(path):
+        parts = path.split("/")[2:]  # /api/<type>/<id>/<sub>
+        action = {"POST": "created", "PUT": "changed", "DELETE": "deleted"}[request.method]
+        if len(parts) > 2:
+            action = f"{action} {'/'.join(parts[2:])}"
+        try:
+            await db.audit(user["username"], action, parts[0].rstrip("s") if parts else "?",
+                           parts[1] if len(parts) > 1 else None, f"{request.method} {path}")
+        except Exception:  # noqa: BLE001 - never fail a request because of the audit log
+            logging.getLogger("audit").exception("audit write failed")
+    return response
+
+
+# Calls that change nothing worth auditing (runs, sends, tests, polls) or that write their own audit entries.
+NOT_AUDITED = re.compile(r"^/api/(auth/|transform$|secrets|agent|workflows/[^/]+/run$|workflow-runs/|schedules/[^/]+/run$|"
+                         r"ports/[^/]+/poll$|connections/[^/]+/(test|send|query|file)$|partners/[^/]+/test$)")
 
 
 class LoginIn(BaseModel):
@@ -1151,12 +1169,89 @@ async def overview():
 
 
 @app.get("/api/connections/{conn_id}/secret")
-async def connection_secret(conn_id: str):
-    """Administrators only: the stored password/secret of a connection, for the partner profile."""
+async def connection_secret(conn_id: str, request: Request):
+    """Administrators only: a connection's own password, for the partner profile (recorded in the audit log).
+    Named secrets are never shown - only their alias."""
     c = await db.get_connection(conn_id, with_secret=True)
     if not c:
         raise HTTPException(404, "Connection not found.")
-    return {"secret": c.get("secret") or ""}
+    if c.get("secret_alias"):
+        return {"secret": None, "alias": c["secret_alias"]}
+    await db.audit(request.state.user["username"], "revealed password", "connection", conn_id)
+    return {"secret": vault.unseal(c.get("secret")) or ""}
+
+
+# ---------- secrets (administrators) ----------
+
+ALIAS = re.compile(r"^[A-Za-z0-9_.-]{2,80}$")
+
+
+async def _check_alias(alias: str | None):
+    if alias and not await db.get_secret(alias):
+        raise HTTPException(422, f"There's no stored secret called '{alias}'.")
+
+
+class SecretIn(BaseModel):
+    alias: str = Field(min_length=2, max_length=80)
+    kind: Literal["password", "api_key", "token", "certificate", "other"] = "password"
+    description: str | None = None
+    value: str | None = None  # write-only; None on update keeps the stored value
+
+
+@app.get("/api/secret-aliases")
+async def secret_aliases():
+    """Names and kinds only, so anyone who edits connections can pick a stored secret."""
+    return [{"alias": x["alias"], "kind": x["kind"]} for x in await db.list_secrets()]
+
+
+@app.get("/api/secrets")
+async def list_secrets():
+    return {"secrets": await db.list_secrets(), "key": vault.key_info(), "check": await vault.check()}
+
+
+@app.post("/api/secrets", status_code=201)
+async def create_secret(req: SecretIn, request: Request):
+    if not ALIAS.match(req.alias):
+        raise HTTPException(422, "An alias uses letters, digits, '.', '_' or '-' (2-80 characters).")
+    if not req.value:
+        raise HTTPException(422, "Enter the secret value.")
+    user = request.state.user["username"]
+    if not await db.create_secret(req.alias, req.kind, req.description, vault.encrypt(req.value), user):
+        raise HTTPException(409, f"A secret called '{req.alias}' already exists.")
+    await db.audit(user, "created", "secret", req.alias, req.kind)
+    return await db.get_secret(req.alias)
+
+
+@app.put("/api/secrets/{alias}")
+async def update_secret(alias: str, req: SecretIn, request: Request):
+    if not await db.get_secret(alias):
+        raise HTTPException(404, "Secret not found.")
+    user = request.state.user["username"]
+    await db.update_secret(alias, req.kind, req.description, vault.encrypt(req.value) if req.value else None, user)
+    await db.audit(user, "changed value" if req.value else "changed details", "secret", alias)
+    return await db.get_secret(alias)
+
+
+@app.delete("/api/secrets/{alias}", status_code=204)
+async def delete_secret(alias: str, request: Request):
+    used = next((x["used_by"] for x in await db.list_secrets() if x["alias"] == alias), [])
+    if used:
+        raise HTTPException(409, f"Still used by {', '.join(used)} - switch those connections to another secret first.")
+    await db.delete_secret(alias)
+    await db.audit(request.state.user["username"], "deleted", "secret", alias)
+
+
+@app.post("/api/secrets/master-key/rotate")
+async def rotate_master_key(request: Request):
+    try:
+        return await vault.rotate_master_key(request.state.user["username"])
+    except vault.VaultError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+@app.get("/api/audit")
+async def audit_log(limit: int = 200, object_type: str | None = None):
+    return await db.list_audit(min(limit, 1000), object_type)
 
 
 # ---------- Payload Hub's own tables, read-only (administrators) ----------
@@ -1313,6 +1408,7 @@ class ConnectionIn(BaseModel):
     type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka", "database", "ftp"]
     config: dict = Field(default_factory=dict)
     secret: str | None = None  # write-only; None on update keeps the stored one
+    secret_alias: str | None = None  # use a named secret from the Secrets page instead of `secret`
     owner_partner: str | None = None  # None = common endpoint, shared by all partners
 
 
@@ -1351,21 +1447,30 @@ async def create_connection(req: ConnectionIn):
         raise HTTPException(422, "Give the connection a name with letters or digits.")
     if req.owner_partner:
         await _partner_or_404(req.owner_partner)
-    if not await db.create_connection(conn_id, req.name, req.type, _clean_config(req.type, req.config), req.secret,
-                                      req.owner_partner or None):
+    await _check_alias(req.secret_alias)
+    if not await db.create_connection(conn_id, req.name, req.type, _clean_config(req.type, req.config),
+                                      None if req.secret_alias else vault.seal(req.secret), req.owner_partner or None,
+                                      req.secret_alias or None):
         raise HTTPException(409, f"A connection called '{conn_id}' already exists.")
     ok, detail = await connectors.test_connection(conn_id)
     return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
 
 
 @app.put("/api/connections/{conn_id}")
-async def update_connection(conn_id: str, req: ConnectionIn):
+async def update_connection(conn_id: str, req: ConnectionIn, request: Request):
     existing = await db.get_connection(conn_id)
     if not existing:
         raise HTTPException(404, "Connection not found.")
     if req.type != existing["type"]:
         raise HTTPException(422, "A connection's type can't change - create a new connection instead.")
-    await db.update_connection(conn_id, req.name, _clean_config(req.type, req.config), req.secret)
+    await _check_alias(req.secret_alias)
+    await db.update_connection(conn_id, req.name, _clean_config(req.type, req.config),
+                               None if req.secret_alias else vault.seal(req.secret) if req.secret else None)
+    if (req.secret_alias or None) != existing.get("secret_alias"):
+        await db.set_connection_secret_alias(conn_id, req.secret_alias or None)
+    if req.secret or (req.secret_alias or None) != existing.get("secret_alias"):
+        await db.audit(request.state.user["username"], "changed password", "connection", conn_id,
+                       f"uses stored secret '{req.secret_alias}'" if req.secret_alias else "own password")
     ok, detail = await connectors.test_connection(conn_id)
     await connectors.sync()
     return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
@@ -1621,20 +1726,57 @@ async def delete_schedule(sid: str):
 
 class PortIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
-    type: Literal["file", "listener"]
+    type: Literal["http", "file", "listener"]
     enabled: bool = True
     config: dict = Field(default_factory=dict)
-    target_type: Literal["partner", "workflow"]
-    target_id: str
+    target_type: Literal["partner", "workflow", "endpoints"] = "endpoints"
+    target_id: str = ""
 
 
-async def _clean_port(req: PortIn) -> dict:
+async def _clean_port(req: PortIn, pid: str | None = None) -> dict:
     try:
-        config = await ports.validate(req.model_dump())
+        config = await ports.validate({**req.model_dump(), "id": pid})
     except ports.PortError as e:
         raise HTTPException(422, str(e)) from e
+    http = req.type == "http"
     return {"name": req.name.strip(), "type": req.type, "enabled": req.enabled, "config": config,
-            "target_type": req.target_type, "target_id": req.target_id}
+            "target_type": "endpoints" if http else req.target_type, "target_id": "" if http else req.target_id}
+
+
+def _listener_app(port: dict, stats: dict) -> FastAPI:
+    """What an extra HTTP port serves: the partner endpoints (subject to its access mode) and /health,
+    behind its IP access rules and request size limit."""
+    import ipaddress
+
+    cfg = port["config"]
+    nets = [ipaddress.ip_network(n) for n in cfg.get("ip_list") or []]
+    selected = set(cfg.get("partners") or []) if cfg.get("access_mode") == "selected" else None
+    sub = FastAPI(title=f"Payload Hub port {port['name']}", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @sub.middleware("http")
+    async def guard(request: Request, call_next):
+        stats["requests"] += 1
+        ip = ipaddress.ip_address(request.client.host) if request.client else None
+        listed = ip is not None and any(ip in n for n in nets)
+        if (cfg.get("ip_mode") == "allow" and not listed) or (cfg.get("ip_mode") == "deny" and listed):
+            stats["rejected"] += 1
+            return JSONResponse({"detail": "Access from your address isn't allowed on this port."}, status_code=403)
+        parts = request.url.path.split("/")
+        if selected is not None and len(parts) > 2 and parts[1] == "inbound" and parts[2] not in selected:
+            stats["rejected"] += 1
+            return JSONResponse({"detail": "Not found."}, status_code=404)
+        if int(request.headers.get("content-length") or 0) > int(cfg.get("max_body_kb") or 10240) * 1024:
+            stats["rejected"] += 1
+            return JSONResponse({"detail": "The request is too large for this port."}, status_code=413)
+        return await call_next(request)
+
+    sub.add_api_route("/inbound/{code}", inbound, methods=["POST"])
+    sub.add_api_route("/inbound/{code}/transactions/{txn_id}", inbound_status, methods=["GET"])
+    sub.add_api_route("/health", lambda: {"status": "up", "port": port["name"]}, methods=["GET"])
+    return sub
+
+
+ports.http_app_factory = _listener_app
 
 
 def _port_view(p: dict) -> dict:
@@ -1652,7 +1794,7 @@ async def create_port(req: PortIn):
     pid = _slug(req.name)
     if len(pid) < 2:
         raise HTTPException(422, "Give the port a name with letters or digits.")
-    if not await db.create_port(pid, **await _clean_port(req)):
+    if not await db.create_port(pid, **await _clean_port(req, pid)):
         raise HTTPException(409, f"A port called '{pid}' already exists.")
     await ports.sync()
     return _port_view(await db.get_port(pid))
@@ -1662,7 +1804,7 @@ async def create_port(req: PortIn):
 async def update_port(pid: str, req: PortIn):
     if not await db.get_port(pid):
         raise HTTPException(404, "Port not found.")
-    await db.update_port(pid, **await _clean_port(req))
+    await db.update_port(pid, **await _clean_port(req, pid))
     await ports.sync()
     return _port_view(await db.get_port(pid))
 
@@ -1704,7 +1846,7 @@ async def ports_overview(request: Request):
     base = str(request.base_url).rstrip("/")
     partners_ = await db.list_partners()
     conns = {c["id"]: c for c in await db.list_connections()}
-    rows = [{"kind": "http", "name": "REST API", "address": base, "target": f"{len(partners_)} partner endpoints "
+    rows = [{"kind": "http", "name": "Primary port", "address": base, "target": f"{len(partners_)} partner endpoints "
              f"(POST /inbound/<code>), the admin API and the test receiver", "state": "running", "managed": "built-in"},
             {"kind": "ui", "name": "Web console", "address": APP_URL, "target": "this app", "state": "running",
              "managed": "built-in"}]
@@ -1723,10 +1865,17 @@ async def ports_overview(request: Request):
     for p in await db.list_ports():
         v = _port_view(p)
         cfg = p["config"]
-        address = cfg.get("monitor_dir") if p["type"] == "file" else \
-            f"{conns.get(cfg.get('connection'), {}).get('name', cfg.get('connection'))} → {cfg.get('source')}"
-        rows.append({"kind": "file" if p["type"] == "file" else conns.get(cfg.get("connection"), {}).get("type", "?"),
-                     "name": p["name"], "address": address, "target": f"{p['target_type']} {p['target_id']}",
+        if p["type"] == "http":
+            address = f"{cfg['protocol']}://{cfg['bind']}:{cfg['port']}"
+            target = "all partner endpoints" if cfg["access_mode"] == "all" else \
+                f"endpoints of {', '.join(cfg['partners'])}"
+            kind = cfg["protocol"]
+        else:
+            address = cfg.get("monitor_dir") if p["type"] == "file" else \
+                f"{conns.get(cfg.get('connection'), {}).get('name', cfg.get('connection'))} → {cfg.get('source')}"
+            target = f"{p['target_type']} {p['target_id']}"
+            kind = "file" if p["type"] == "file" else conns.get(cfg.get("connection"), {}).get("type", "?")
+        rows.append({"kind": kind, "name": p["name"], "address": address, "target": target,
                      "state": v["status"]["state"] if p["enabled"] else "disabled", "managed": "port", "id": p["id"]})
     return rows
 

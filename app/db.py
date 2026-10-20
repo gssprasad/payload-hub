@@ -222,6 +222,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at timestamptz NOT NULL
 );
 
+-- Named secrets (encrypted with the master key) that connections can use instead of their own password.
+CREATE TABLE IF NOT EXISTS secrets (
+    alias        text PRIMARY KEY,
+    kind         text NOT NULL DEFAULT 'password',
+    description  text,
+    value_enc    text NOT NULL,
+    version      integer NOT NULL DEFAULT 1,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    created_by   text,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    updated_by   text
+);
+ALTER TABLE connections ADD COLUMN IF NOT EXISTS secret_alias text REFERENCES secrets(alias) ON UPDATE CASCADE;
+
+-- Who changed what (secrets, keys, connection passwords, ports, users). Never holds secret values.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           bigserial PRIMARY KEY,
+    at           timestamptz NOT NULL DEFAULT now(),
+    username     text,
+    action       text NOT NULL,
+    object_type  text NOT NULL,
+    object_id    text,
+    detail       text
+);
+CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log (at DESC);
+
 -- Scheduler: tasks that run a workflow, send a message to a partner or call an API on a schedule.
 CREATE TABLE IF NOT EXISTS schedules (
     id           text PRIMARY KEY,
@@ -292,7 +318,7 @@ PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_form
                   "response_expression", "store_enabled", "store_table", "store_source", "store_row_path",
                   "store_columns", "store_connection", "reply_method", "send_format", "csv_delimiter")
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
-                     "last_test_at, last_test_ok, last_test_detail, owner_partner, created_at, updated_at"
+                     "last_test_at, last_test_ok, last_test_detail, owner_partner, secret_alias, created_at, updated_at"
 
 pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kwargs={"row_factory": dict_row})
 
@@ -606,12 +632,13 @@ async def get_connection(conn_id, with_secret=False):
         return await cur.fetchone()
 
 
-async def create_connection(conn_id, name, type_, config, secret, owner_partner=None):
+async def create_connection(conn_id, name, type_, config, secret, owner_partner=None, secret_alias=None):
+    """secret must already be sealed (vault.seal)."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            """INSERT INTO connections (id, name, type, config, secret, owner_partner) VALUES (%s, %s, %s, %s, %s, %s)
-               ON CONFLICT (id) DO NOTHING RETURNING id""",
-            (conn_id, name, type_, Jsonb(config), secret, owner_partner),
+            """INSERT INTO connections (id, name, type, config, secret, owner_partner, secret_alias)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING RETURNING id""",
+            (conn_id, name, type_, Jsonb(config), secret, owner_partner, secret_alias),
         )
         return (await cur.fetchone()) is not None
 
@@ -622,8 +649,19 @@ async def set_connection_owner(conn_id, owner_partner):
                            (owner_partner, conn_id))
 
 
+async def set_connection_secret_alias(conn_id, alias):
+    """Use a named secret (clears the connection's own password), or stop using one (alias None)."""
+    async with pool.connection() as conn:
+        if alias:
+            await conn.execute("UPDATE connections SET secret_alias = %s, secret = NULL, updated_at = now() "
+                               "WHERE id = %s", (alias, conn_id))
+        else:
+            await conn.execute("UPDATE connections SET secret_alias = NULL, updated_at = now() WHERE id = %s",
+                               (conn_id,))
+
+
 async def update_connection(conn_id, name, config, secret=None):
-    """secret=None keeps the stored secret."""
+    """secret=None keeps the stored secret; a new secret must already be sealed (vault.seal)."""
     async with pool.connection() as conn:
         if secret is None:
             await conn.execute("UPDATE connections SET name = %s, config = %s, updated_at = now() WHERE id = %s",
@@ -765,6 +803,7 @@ async def delete_session(token_hash):
 
 # Columns never shown in the read-only system tables view.
 SYSTEM_HIDDEN = {"users": {"password_hash"}, "sessions": {"token_hash"}, "connections": {"secret"},
+                 "secrets": {"value_enc"}, "ai_providers": {"api_key_enc"},
                  "partners": {"api_key"}, "partner_documents": {"content", "text"}}
 
 
@@ -1136,4 +1175,68 @@ async def record_port_event(pid, item, status, detail=None, ref=None):
 async def list_port_events(pid, limit=50):
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT * FROM port_events WHERE port_id = %s ORDER BY at DESC LIMIT %s", (pid, limit))
+        return await cur.fetchall()
+
+
+# ---------- secrets and audit ----------
+
+async def list_secrets():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT alias, kind, description, version, created_at, created_by, updated_at, updated_by,
+                      (SELECT coalesce(json_agg(c.id ORDER BY c.id), '[]') FROM connections c
+                       WHERE c.secret_alias = s.alias) AS used_by
+               FROM secrets s ORDER BY alias""")
+        return await cur.fetchall()
+
+
+async def get_secret(alias, with_value=False):
+    cols = "*" if with_value else "alias, kind, description, version, created_at, created_by, updated_at, updated_by"
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"SELECT {cols} FROM secrets WHERE alias = %s", (alias,))
+        return await cur.fetchone()
+
+
+async def create_secret(alias, kind, description, value_enc, username):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO secrets (alias, kind, description, value_enc, created_by, updated_by)
+               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (alias) DO NOTHING RETURNING alias""",
+            (alias, kind, description, value_enc, username, username))
+        return (await cur.fetchone()) is not None
+
+
+async def update_secret(alias, kind, description, value_enc, username):
+    """value_enc None keeps the value; a new value bumps the version."""
+    async with pool.connection() as conn:
+        if value_enc is None:
+            await conn.execute("""UPDATE secrets SET kind = %s, description = %s, updated_at = now(), updated_by = %s
+                                  WHERE alias = %s""", (kind, description, username, alias))
+        else:
+            await conn.execute(
+                """UPDATE secrets SET kind = %s, description = %s, value_enc = %s, version = version + 1,
+                   updated_at = now(), updated_by = %s WHERE alias = %s""",
+                (kind, description, value_enc, username, alias))
+        # connections using it are rebuilt with the new value
+        await conn.execute("UPDATE connections SET updated_at = now() WHERE secret_alias = %s", (alias,))
+
+
+async def delete_secret(alias):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM secrets WHERE alias = %s", (alias,))
+
+
+async def audit(username, action, object_type, object_id=None, detail=None):
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO audit_log (username, action, object_type, object_id, detail) "
+                           "VALUES (%s, %s, %s, %s, %s)", (username, action, object_type, object_id, detail))
+
+
+async def list_audit(limit=200, object_type=None):
+    async with pool.connection() as conn:
+        if object_type:
+            cur = await conn.execute("SELECT * FROM audit_log WHERE object_type = %s ORDER BY at DESC LIMIT %s",
+                                     (object_type, limit))
+        else:
+            cur = await conn.execute("SELECT * FROM audit_log ORDER BY at DESC LIMIT %s", (limit,))
         return await cur.fetchall()

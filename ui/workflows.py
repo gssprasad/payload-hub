@@ -53,8 +53,7 @@ SAMPLE = "customer-followup"  # the sample that shows a workflow's structure (DB
 
 
 def page():
-    common.hero("⚙️ Workflows", "Design a flow on the canvas: pick connectors from the palette on the right, "
-                                "click a step to set it up.")
+    common.hero("⚙️ Workflows", "Design flows from connectors; click a step to set it up.")
     data = api("GET", "/api/workflows")
     wfs, triggers = data["workflows"], data["triggers"]
     names = {w["id"]: w for w in wfs}

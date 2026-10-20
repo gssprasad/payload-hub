@@ -74,7 +74,7 @@ async def user_for_token(token: str | None):
 
 
 def required_permission(method: str, path: str) -> str:
-    if path.startswith(("/api/users", "/api/system")):
+    if path.startswith(("/api/users", "/api/system", "/api/secrets", "/api/audit")):
         return "admin"
     if path.startswith("/api/connections/") and path.endswith("/secret"):
         return "admin"  # revealing a stored connection password

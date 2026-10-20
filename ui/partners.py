@@ -3,78 +3,50 @@ import pandas as pd
 import streamlit as st
 
 from . import common, flow, onboarding
-from .common import ApiError, api, lang, queue_label
+from .common import ApiError, api, lang
 
 def page():
-    common.hero("🤝 Partners", "Onboard partners, set up each one's mapping, documents, HTTP endpoint, MQ adapters and Kafka queues.")
+    common.hero("🤝 Partners", "Each partner's endpoint, mapping, route to its target system, and activity.")
     partners = common.partners()
-
     if st.session_state.get("onboarding") or not partners:
         with st.container(border=True):
-            st.subheader("➕ Onboard a new partner")
+            head = st.columns([4, 1], vertical_alignment="center")
+            head[0].markdown("**➕ Onboard a new partner**")
+            if partners and head[1].button("Cancel", width="stretch"):
+                st.session_state.onboarding = False
+                st.rerun()
             onboarding.wizard()
-        if not partners:
-            return
-    elif st.button("➕ Onboard a new partner", type="primary", disabled=not common.can("write")):
+        return
+    top = st.columns([3, 1], vertical_alignment="center")
+    active = sum(p["active"] for p in partners)
+    top[0].caption(f"{len(partners)} partners · {active} active · click a partner to open it")
+    if top[1].button("➕ New partner", type="primary", width="stretch", disabled=not common.can("write")):
         st.session_state.onboarding = True
         st.rerun()
-
-    clicked = _partner_table(partners)
-    st.divider()
     codes = [p["code"] for p in partners]
-    requested = st.session_state.pop("select_partner", None) or clicked  # just onboarded, or clicked in the table
-    if requested in codes:
-        st.session_state.manage_partner = requested
-    elif st.session_state.get("manage_partner") not in codes:
-        st.session_state.manage_partner = codes[0]
-    pick, access = st.columns([4, 1], vertical_alignment="bottom")
-    code = pick.selectbox("Manage partner", codes, key="manage_partner",
-                          format_func=lambda c: next(f"{p['name']} ({c})" for p in partners if p["code"] == c))
+    if (just_added := st.session_state.pop("select_partner", None)) in codes:
+        st.session_state["partners_selected"] = just_added
+    code = common.pick_row([_row(p) for p in partners], "partners", codes)
     p = api("GET", f"/api/partners/{code}")
-    if clicked or access.button("📇 Partner profile", width="stretch"):
+    head = st.columns([4, 1], vertical_alignment="bottom")
+    with head[0]:
+        common.detail_title(f"{p['name']} · {p['input_format'].upper()} → {p['output_format'].upper()}")
+    if head[1].button("📇 Profile", width="stretch", help="Everything about this partner on one card: endpoints, "
+                                                         "content types, keys and credentials."):
         api_access_dialog(p)
-    flow_tab_, mapping, documents, details = st.tabs(["Flow & endpoints", "Mapping", "Mapping documents", "Details"])
-    with flow_tab_:
-        flow.flow_tab(p)
-    with mapping:
-        _mapping_tab(p)
-    with documents:
-        _documents_tab(p)
-    with details:
-        _details_tab(p)
+    tabs = st.tabs(["Overview", "Endpoint", "Mapping", "Route", "Storage", "Documents", "Activity", "Details"])
+    views = [flow.overview_tab, flow.endpoint_tab, _mapping_tab, flow.route_tab, flow.storage_tab, _documents_tab,
+             flow.activity_tab, _details_tab]
+    for tab, view in zip(tabs, views):
+        with tab:
+            view(p)
 
 
-def _partner_table(partners):
-    if not partners:
-        return
-    df = pd.DataFrame(partners)
-    df["queue"] = df.apply(lambda r: f"{queue_label(r)} · {r['topic_in'].rsplit('.', 1)[0]}", axis=1)
-    df["formats"] = df["input_format"].str.upper() + " → " + df["output_format"].str.upper()
-    df["mapping"] = df.apply(lambda r: ("🤖 AI" if r["mapping_source"] == "agent" else "✍️ Manual")
-                             if r["has_mapping"] else "— none", axis=1)
-    df["status"] = df["active"].map({True: "Active", False: "Inactive"})
-    has = lambda v: isinstance(v, str) and v != ""  # noqa: E731 - empty cells come back as NaN from pandas
-    df["inbound"] = df.apply(lambda r: "HTTP" + (f" + {r['inbound_connection']}:{r['inbound_source']}"
-                                                 if has(r["inbound_connection"]) else ""), axis=1)
-    df["outbound"] = df.apply(lambda r: f"{r['outbound_connection']}:{r['outbound_target'] if has(r['outbound_target']) else ''}"
-                              if has(r["outbound_connection"]) else "store only", axis=1)
-    df["reply"] = df.apply(lambda r: f"↪ {r['reply_connection']}" if r["reply_mode"] == "forward" and has(r["reply_connection"])
-                           else "transformed", axis=1)
-    st.caption("💡 Click a partner to see its full profile: endpoints, content types, keys, credentials and more.")
-    event = st.dataframe(
-        df[["name", "code", "status", "formats", "inbound", "queue", "reply", "outbound", "mapping", "documents",
-            "transactions"]],
-        hide_index=True, width="stretch", on_select="rerun", selection_mode=["single-row", "single-cell"],
-        key="partner_table",
-        column_config={"name": "Partner", "code": "Code", "status": "Status", "formats": "Formats",
-                       "inbound": "Inbound", "queue": "Kafka queue", "reply": "Response", "outbound": "Outbound",
-                       "mapping": "Mapping", "documents": "Docs", "transactions": "Transactions"})
-    rows = list(event.selection.rows) + [cell[0] for cell in getattr(event.selection, "cells", [])]
-    selected = partners[rows[0]]["code"] if rows else None
-    # open the dialog only when the selection changes, not on every rerun while a row stays selected
-    previous = st.session_state.get("partner_table_last")
-    st.session_state.partner_table_last = selected
-    return selected if selected and selected != previous else None
+def _row(p) -> dict:
+    route = "→ target system" if p.get("reply_mode") == "forward" and p.get("reply_connection") else "reply directly"
+    return {"Partner": p["name"], "Code": p["code"], "Formats": f"{p['input_format'].upper()} → {p['output_format'].upper()}",
+            "Mapping": ("🤖 AI" if p.get("mapping_source") == "agent" else "✍️ manual") if p.get("has_mapping") else "— none",
+            "Route": route, "Transactions": p["transactions"], "Status": "🟢 active" if p["active"] else "⏸️ inactive"}
 
 
 MIME = {"json": "application/json", "xml": "application/xml"}

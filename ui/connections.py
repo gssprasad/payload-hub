@@ -1,4 +1,4 @@
-"""Connections page: adapters to RabbitMQ, ActiveMQ, IBM MQ, HTTP endpoints and Kafka."""
+"""Connections page: brokers, APIs, databases and file servers, as a table with a detail panel."""
 import json
 
 import pandas as pd
@@ -19,28 +19,127 @@ PRESETS = {
 
 
 def page():
-    common.hero("🔌 Adapters & Connections", "Connect message brokers (RabbitMQ, ActiveMQ, IBM MQ, Kafka) and HTTP "
-                "APIs once; partners use them to receive messages, deliver results and forward requests.")
+    common.hero("🔌 Connections", "Brokers, APIs, databases and file servers, set up once.")
     types = api("GET", "/api/connection-types")
     conns = api("GET", "/api/connections")
-
-    _summary(conns, types)
-    _add_connection(types)
-    st.divider()
+    top = st.columns([3, 1], vertical_alignment="center")
+    healthy = sum(1 for c in conns if c["last_test_ok"])
+    failing = sum(1 for c in conns if c["last_test_ok"] is False)
+    top[0].caption(f"{len(conns)} connections · 🟢 {healthy} connected" + (f" · 🔴 {failing} failing" if failing else ""))
+    if top[1].button("➕ New connection", type="primary", width="stretch", disabled=not common.can("write")):
+        _new_connection_dialog(types)
     if not conns:
-        st.info("No connections yet - add one above.")
-    for c in conns:
-        _connection_card(c, types)
-    st.divider()
-    _test_receiver()
+        st.info("No connections yet.")
+        return
+    cid = common.pick_row(
+        [{"Connection": f"{types.get(c['type'], {}).get('icon', '🔌')} {c['name']}", "Type": types.get(c["type"], {})
+          .get("label", c["type"]), "Address": _endpoint(c), "Status": _status_badge(c),
+          "Scope": f"👤 {c['owner_partner']}" if c.get("owner_partner") else "🌍 common",
+          "Used by": ", ".join(c["used_by"]) or "—"} for c in conns],
+        "connections", [c["id"] for c in conns])
+    _detail(next(c for c in conns if c["id"] == cid), types)
+    with st.expander("📥 Test receiver inbox"):
+        _test_receiver()
 
 
-def _summary(conns, types):
-    cols = st.columns(4)
-    cols[0].metric("Connections", len(conns))
-    cols[1].metric("Healthy", sum(1 for c in conns if c["last_test_ok"]))
-    cols[2].metric("Failing", sum(1 for c in conns if c["last_test_ok"] is False))
-    cols[3].metric("In use", sum(1 for c in conns if c["used_by"]))
+def _detail(c, types):
+    spec = types.get(c["type"], {"label": c["type"], "icon": "🔌", "fields": [], "target": "Target"})
+    common.detail_title(f"{spec['icon']} {c['name']}")
+    tabs = ["Overview", "Settings"]
+    if spec.get("outbound"):
+        tabs.append("Send a test")
+    browse = c["type"] in ("ftp", "kafka")
+    if browse:
+        tabs.append("Files" if c["type"] == "ftp" else "Topics")
+    shown = st.tabs(tabs)
+    with shown[0]:
+        _overview(c, spec)
+    with shown[1]:
+        _settings(c, spec)
+    if spec.get("outbound"):
+        with shown[2]:
+            _send(c, spec)
+    if browse:
+        with shown[-1]:
+            (_file_browser if c["type"] == "ftp" else _topic_browser)(c)
+
+
+def _overview(c, spec):
+    rows = [("Status", _status_badge(c) + (f" · tested {pd.to_datetime(c['last_test_at']).tz_convert(None):%Y-%m-%d %H:%M}"
+                                           if c["last_test_at"] else "")),
+            ("Type", spec["label"]), ("Address", _endpoint(c)),
+            ("Password", f"🔐 stored secret <code>{c['secret_alias']}</code>" if c.get("secret_alias")
+             else ("set (encrypted)" if c.get("has_secret") else "—")),
+            ("Scope", f"dedicated to partner {c['owner_partner']}" if c.get("owner_partner") else "common - any partner"),
+            ("Used by", ", ".join(c["used_by"]) or "—")]
+    if spec.get("outbound"):
+        cfg = c["config"]
+        statuses = f", on HTTP {cfg.get('retry_on_status', '408,425,429,500,502,503,504')}" if c["type"] == "http" else ""
+        rows.append(("Retries", f"{cfg.get('retry_attempts', 3)} attempts, first after {cfg.get('retry_backoff', 2)} s, "
+                                f"doubling up to {cfg.get('retry_backoff_max', 30)} s{statuses}"))
+    import html
+
+    st.html('<div class="ph-kv">' + "".join(f"<b>{k}</b><span>{v if k == 'Password' else html.escape(str(v))}</span>"
+                                            for k, v in rows) + "</div>")
+    if c["last_test_detail"]:
+        (st.caption if c["last_test_ok"] else st.error)(c["last_test_detail"])
+    b = st.columns([1, 2, 3])
+    if b[0].button("🔌 Test", key=f"test_{c['id']}", width="stretch"):
+        r = api("POST", f"/api/connections/{c['id']}/test")
+        (st.toast if r["ok"] else st.error)(r["detail"])
+        st.rerun()
+    if c["type"] == "database" and "data" in common.PAGES:
+        b[1].page_link(common.PAGES["data"], label="Open its tables", icon="🗄️")
+
+
+def _secret_choice(c, key):
+    """A stored secret instead of typing the password; '' = the connection's own password."""
+    aliases = [""] + [a["alias"] for a in api("GET", "/api/secret-aliases")]
+    current = (c or {}).get("secret_alias") or ""
+    return st.selectbox("Password from", aliases, aliases.index(current) if current in aliases else 0, key=key,
+                        format_func=lambda a: f"🔐 stored secret: {a}" if a else "✍️ typed below (encrypted)",
+                        help="Stored secrets are managed by administrators on the Secrets page.")
+
+
+def _settings(c, spec):
+    if not common.can("write"):
+        st.caption("You need write permission to change connections.")
+        return
+    has_secret = any(f["kind"] == "secret" for f in spec["fields"])
+    with st.form(f"edit_{c['id']}"):
+        name = st.text_input("Name", c["name"], key=f"edit_name_{c['id']}")
+        alias = _secret_choice(c, f"edit_alias_{c['id']}") if has_secret else ""
+        config, secret = _fields_form(c["type"], spec, c["config"], f"edit_{c['id']}", editing=True)
+        save, delete = st.columns(2)
+        if save.form_submit_button("Save and test", type="primary"):
+            try:
+                r = api("PUT", f"/api/connections/{c['id']}", json={"name": name, "type": c["type"], "config": config,
+                                                                    "secret": secret, "secret_alias": alias or None})
+            except ApiError as e:
+                st.error(str(e))
+            else:
+                (st.toast if r["test_ok"] else st.error)(r["test_detail"])
+                st.rerun()
+        if delete.form_submit_button("🗑️ Delete connection", disabled=not common.can("delete")):
+            try:
+                api("DELETE", f"/api/connections/{c['id']}")
+            except ApiError as e:
+                st.error(str(e))
+            else:
+                common.partners.clear()
+                st.session_state.pop("connections_selected", None)
+                st.rerun()
+
+
+def _send(c, spec):
+    with st.form(f"send_{c['id']}"):
+        target = st.text_input(spec["target"], key=f"send_target_{c['id']}", placeholder="e.g. a partner's inbound queue")
+        body = st.text_area("Message body", '{"hello": "from Payload Hub"}', height=120, key=f"send_body_{c['id']}")
+        ctype = st.selectbox("Content type", ["application/json", "application/xml", "text/plain"],
+                             key=f"send_ct_{c['id']}")
+        if st.form_submit_button("Send message", disabled=not common.can("write")):
+            r = api("POST", f"/api/connections/{c['id']}/send", json={"target": target, "body": body, "content_type": ctype})
+            (st.success if r["ok"] else st.error)(r["detail"])
 
 
 def _status_badge(c) -> str:
@@ -92,117 +191,51 @@ def _render_fields(fields, values, key_prefix, editing, config):
     return secret
 
 
-def _add_connection(types):
-    with st.expander("➕ Add a connection", expanded=False):
-        options = list(types)
-        type_key = st.selectbox("Type", options, key="new_conn_type",
-                                format_func=lambda t: f"{types[t]['icon']} {types[t]['label']}"
-                                + ("" if types[t]["available"] else "  - client not installed"))
-        spec = types[type_key]
-        directions = " and ".join(d for d, ok in (("inbound", spec["inbound"]), ("outbound", spec["outbound"])) if ok)
-        st.caption(f"Can be used for {directions} messages.")
-        if not spec["available"]:
-            st.warning("IBM MQ needs IBM's MQ client libraries on the machine running Payload Hub: install the IBM MQ "
-                       "redistributable client (or MQ for Developers) from IBM, then `pip install ibmmq`. You can save "
-                       "the connection now; it will connect once the client is installed.")
-        fixed, values = {}, {}
-        if type_key == "ftp":
-            proto = st.selectbox("Protocol", ["sftp", "ftp", "ftps"], key="new_ftp_protocol",
-                                 format_func={"sftp": "SFTP (over SSH)", "ftp": "FTP", "ftps": "FTPS (FTP over TLS)"}.get)
-            fixed = {"protocol": proto}
-            values = {"port": 22 if proto == "sftp" else 21}
-        if type_key == "database":
-            engine = st.selectbox("Database type", list(DB_PORTS), key="new_db_engine",
-                                  format_func={"postgresql": "PostgreSQL", "mysql": "MySQL / MariaDB",
-                                               "sqlserver": "Microsoft SQL Server", "oracle": "Oracle",
-                                               "sqlite": "SQLite (file)"}.get)
-            fixed = {"engine": engine}
-            values = {"port": DB_PORTS[engine]}
-            if engine == "sqlite":
-                st.caption("For SQLite, only the file path matters (Database / service name / SQLite file).")
-        form_key = f"new_conn_{type_key}" + (f"_{next(iter(fixed.values()))}" if fixed else "")
-        with st.form(form_key, clear_on_submit=False):
-            name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{form_key}")
-            config, secret = _fields_form(type_key, spec, values, f"new_{form_key}", fixed=fixed)
-            if st.form_submit_button("Save and test", type="primary", disabled=not common.can("write")):
-                try:
-                    c = api("POST", "/api/connections",
-                            json={"name": name, "type": type_key, "config": config, "secret": secret})
-                except ApiError as e:
-                    st.error(str(e))
-                    return
-                (st.success if c["test_ok"] else st.warning)(f"Saved **{c['name']}** - {c['test_detail']}")
-                st.rerun()
-
-
-def _connection_card(c, types):
-    spec = types.get(c["type"], {"label": c["type"], "icon": "🔌", "fields": [], "target": "Target"})
-    with st.container(border=True):
-        top = st.columns([4, 2, 3])
-        top[0].markdown(f"#### {spec['icon']} {c['name']}")
-        top[0].caption(f"`{c['id']}` · {spec['label']} · {_endpoint(c)}")
-        top[1].markdown(f"**{_status_badge(c)}**")
-        if c["last_test_at"]:
-            top[1].caption(f"tested {pd.to_datetime(c['last_test_at']).tz_convert(None):%Y-%m-%d %H:%M:%S}")
-        top[2].markdown(("👤 **Dedicated to** " + c["owner_partner"]) if c.get("owner_partner") else "🌍 **Common**")
-        top[2].markdown("**Used by:** " + (", ".join(c["used_by"]) if c["used_by"] else "—"))
-        if c["last_test_detail"]:
-            (st.caption if c["last_test_ok"] else st.error)(c["last_test_detail"])
-        if spec.get("outbound"):
-            cfg = c["config"]
-            statuses = f" · retries on HTTP {cfg.get('retry_on_status', '408,425,429,500,502,503,504')}" \
-                if c["type"] == "http" else ""
-            st.caption(f"🔁 {cfg.get('retry_attempts', 3)} attempts · first retry after {cfg.get('retry_backoff', 2)} s, "
-                       f"doubling up to {cfg.get('retry_backoff_max', 30)} s{statuses}")
-
-        b = st.columns([1, 1, 1, 3])
-        if b[0].button("Test", key=f"test_{c['id']}"):
-            r = api("POST", f"/api/connections/{c['id']}/test")
-            (st.toast if r["ok"] else st.error)(r["detail"])
+@st.dialog("New connection", width="large")
+def _new_connection_dialog(types):
+    options = list(types)
+    type_key = st.selectbox("Type", options, key="new_conn_type",
+                            format_func=lambda t: f"{types[t]['icon']} {types[t]['label']}"
+                            + ("" if types[t]["available"] else "  - client not installed"))
+    spec = types[type_key]
+    directions = " and ".join(d for d, ok in (("inbound", spec["inbound"]), ("outbound", spec["outbound"])) if ok)
+    st.caption(f"Can be used for {directions} messages.")
+    if not spec["available"]:
+        st.warning("IBM MQ needs IBM's MQ client libraries on the machine running Payload Hub: install the IBM MQ "
+                   "redistributable client (or MQ for Developers) from IBM, then `pip install ibmmq`. You can save "
+                   "the connection now; it will connect once the client is installed.")
+    fixed, values = {}, {}
+    if type_key == "ftp":
+        proto = st.selectbox("Protocol", ["sftp", "ftp", "ftps"], key="new_ftp_protocol",
+                             format_func={"sftp": "SFTP (over SSH)", "ftp": "FTP", "ftps": "FTPS (FTP over TLS)"}.get)
+        fixed = {"protocol": proto}
+        values = {"port": 22 if proto == "sftp" else 21}
+    if type_key == "database":
+        engine = st.selectbox("Database type", list(DB_PORTS), key="new_db_engine",
+                              format_func={"postgresql": "PostgreSQL", "mysql": "MySQL / MariaDB",
+                                           "sqlserver": "Microsoft SQL Server", "oracle": "Oracle",
+                                           "sqlite": "SQLite (file)"}.get)
+        fixed = {"engine": engine}
+        values = {"port": DB_PORTS[engine]}
+        if engine == "sqlite":
+            st.caption("For SQLite, only the file path matters (Database / service name / SQLite file).")
+    form_key = f"new_conn_{type_key}" + (f"_{next(iter(fixed.values()))}" if fixed else "")
+    with st.form(form_key, clear_on_submit=False):
+        name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{form_key}")
+        alias = _secret_choice(None, f"new_alias_{form_key}") \
+            if any(f["kind"] == "secret" for f in spec["fields"]) else ""
+        config, secret = _fields_form(type_key, spec, values, f"new_{form_key}", fixed=fixed)
+        if st.form_submit_button("Save and test", type="primary", disabled=not common.can("write")):
+            try:
+                c = api("POST", "/api/connections",
+                        json={"name": name, "type": type_key, "config": config, "secret": secret,
+                              "secret_alias": alias or None})
+            except ApiError as e:
+                st.error(str(e))
+                return
+            (st.toast if c["test_ok"] else st.warning)(f"Saved {c['name']} - {c['test_detail']}")
+            st.session_state["connections_selected"] = c["id"]
             st.rerun()
-        show_send = b[1].toggle("Send", key=f"send_toggle_{c['id']}", disabled=not common.can("write"), help="Send a test message through this connection")
-        show_edit = b[2].toggle("Edit", key=f"edit_toggle_{c['id']}", disabled=not common.can("write"))
-        if c["type"] == "ftp" and b[3].toggle("📂 Files", key=f"files_toggle_{c['id']}"):
-            _file_browser(c)
-        if c["type"] == "kafka" and b[3].toggle("📜 Topics", key=f"topics_toggle_{c['id']}"):
-            _topic_browser(c)
-        if c["type"] == "database" and "data" in common.PAGES:
-            b[3].page_link(common.PAGES["data"], label="Open tables on the Data page", icon="🗄️")
-
-        if show_send:
-            with st.form(f"send_{c['id']}"):
-                target = st.text_input(spec["target"], key=f"send_target_{c['id']}",
-                                       placeholder="e.g. a partner's inbound queue")
-                body = st.text_area("Message body", '{"hello": "from Payload Hub"}', height=120, key=f"send_body_{c['id']}")
-                ctype = st.selectbox("Content type", ["application/json", "application/xml", "text/plain"],
-                                     key=f"send_ct_{c['id']}")
-                if st.form_submit_button("Send message", disabled=not common.can("write")):
-                    r = api("POST", f"/api/connections/{c['id']}/send",
-                            json={"target": target, "body": body, "content_type": ctype})
-                    (st.success if r["ok"] else st.error)(r["detail"])
-
-        if show_edit:
-            with st.form(f"edit_{c['id']}"):
-                name = st.text_input("Name", c["name"], key=f"edit_name_{c['id']}")
-                config, secret = _fields_form(c["type"], spec, c["config"], f"edit_{c['id']}", editing=True)
-                save, delete = st.columns(2)
-                if save.form_submit_button("Save and test", type="primary"):
-                    try:
-                        r = api("PUT", f"/api/connections/{c['id']}",
-                                json={"name": name, "type": c["type"], "config": config, "secret": secret})
-                    except ApiError as e:
-                        st.error(str(e))
-                    else:
-                        (st.toast if r["test_ok"] else st.error)(r["test_detail"])
-                        st.rerun()
-                if delete.form_submit_button("Delete connection", disabled=not common.can("delete")):
-                    try:
-                        api("DELETE", f"/api/connections/{c['id']}")
-                    except ApiError as e:
-                        st.error(str(e))
-                    else:
-                        common.partners.clear()
-                        st.rerun()
 
 
 def _topic_browser(c):
@@ -288,7 +321,6 @@ def _endpoint(c) -> str:
 
 
 def _test_receiver():
-    st.subheader("📥 Test receiver inbox")
     st.caption(f"A built-in webhook for demos: point an HTTP connection at `{common.API}/test-receiver` and use the "
                "partner code as the target path. The last 100 messages it received are shown here.")
     msgs = api("GET", "/api/test-receiver", params={"limit": 20})

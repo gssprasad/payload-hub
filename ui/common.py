@@ -131,15 +131,14 @@ def show_agent_steps(steps: list[dict]):
 
 
 _CSS = """<style>
-/* Page header */
-.ph-hero {padding: 1.15rem 1.4rem; border-radius: 1rem; margin: 0 0 .6rem 0; color: #fff;
-  background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #0891b2 100%);
-  box-shadow: 0 10px 30px -12px rgba(79, 70, 229, .55);}
-.ph-hero h1 {margin: 0; padding: 0; color: #fff; font-size: 1.65rem; font-weight: 700; letter-spacing: -.01em;}
-.ph-hero p {margin: .25rem 0 0 0; color: rgba(255,255,255,.85); font-size: .92rem;}
+/* Page header: a plain title and one quiet line */
+.ph-hero {margin: 0 0 .9rem 0; padding: 0 0 .7rem 0; border-bottom: 1px solid rgba(128,128,128,.18);}
+.ph-hero h1 {margin: 0; padding: 0; font-size: 1.55rem; font-weight: 650; letter-spacing: -.015em;}
+.ph-hero p {margin: .15rem 0 0 0; opacity: .62; font-size: .9rem;}
+.block-container {padding-top: 2.2rem !important; max-width: 1200px;}
 /* Metric cards */
-[data-testid="stMetric"] {background: rgba(99,102,241,.06); border: 1px solid rgba(99,102,241,.16);
-  border-radius: .9rem; padding: .8rem 1rem;}
+[data-testid="stMetric"] {background: rgba(99,102,241,.05); border: 1px solid rgba(99,102,241,.13);
+  border-radius: .8rem; padding: .6rem .9rem;}
 [data-testid="stMetricLabel"] p {font-size: .74rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75;}
 [data-testid="stMetricValue"] {font-size: 1.45rem !important;}
 [data-testid="stMetricValue"] > div {overflow: visible !important; text-overflow: clip !important;}
@@ -154,6 +153,8 @@ _CSS = """<style>
   transition: transform .08s ease, box-shadow .15s ease;}
 .stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {transform: translateY(-1px);
   box-shadow: 0 6px 16px -8px rgba(79,70,229,.6);}
+/* Detail panel under a table */
+.ph-detail {margin: .6rem 0 .2rem 0; font-size: 1.15rem; font-weight: 650;}
 /* Sidebar navigation */
 [data-testid="stSidebarNav"] a {border-radius: .6rem; font-weight: 500;}
 /* API access card */
@@ -170,7 +171,7 @@ def style():
 
 
 def hero(title: str, subtitle: str = ""):
-    """Gradient page header. title may start with an emoji."""
+    """Page header: the title and one quiet line. title may start with an emoji."""
     import html
 
     sub = f"<p>{html.escape(subtitle)}</p>" if subtitle else ""
@@ -243,3 +244,25 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
                      "Address": connection_address(sc, p["store_table"]) if sc else f"userdata.{p['store_table']}",
                      "Details": f"from the {p.get('store_source') or 'output'} payload"})
     return rows
+
+
+def pick_row(rows: list[dict], key: str, ids: list, column_config: dict | None = None, height: int | None = None):
+    """A compact table where clicking a row selects it; returns the selected id (kept across reruns).
+    The first row is selected until the user picks another."""
+    if not rows:
+        return None
+    event = st.dataframe(rows, hide_index=True, width="stretch", on_select="rerun", key=f"{key}_table",
+                         selection_mode=["single-row", "single-cell"], column_config=column_config,
+                         **({"height": height} if height else {}))
+    picked = list(event.selection.rows) + [c[0] for c in getattr(event.selection, "cells", [])]
+    if picked:
+        st.session_state[f"{key}_selected"] = ids[picked[0]]
+    if st.session_state.get(f"{key}_selected") not in ids:
+        st.session_state[f"{key}_selected"] = ids[0]
+    return st.session_state[f"{key}_selected"]
+
+
+def detail_title(text: str):
+    import html
+
+    st.html(f'<div class="ph-detail">{html.escape(text)}</div>')

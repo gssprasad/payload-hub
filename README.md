@@ -161,7 +161,10 @@ using partner API keys; `/health` and `/metrics` stay open for monitoring tools.
 
 ## Partners
 
-The Streamlit app's pages: **Overview** (landing page), **Partners**, **Adapters & Connections**, **Workflows**, **AI Agent**, **Send & Test**,
+The Streamlit app's menu: **Overview**; *Integrate*: Partners, Workflows, Schedulers; *Connect*: Ports,
+Connections; *Operate*: Transactions, Monitoring; *Tools*: Send & Test, AI Agent, Data; *Administer*:
+Users, Secrets. List pages share one layout: a compact table - click a row for its details in tabs. Older
+summary of the pages: **Overview** (landing page), **Partners**, **Connections**, **Workflows**, **AI Agent**, **Send & Test**,
 **Transactions**, **Data**, **Monitoring** and (administrators) **Users**.
 
 **Onboarding.** On the Partners page, *Onboard a new partner* opens a step-by-step wizard: basics,
@@ -316,11 +319,27 @@ invoices* (paused) does it hourly for every order with status NEW.
 
 ## Ports (how data comes in)
 
-The **📡 Ports** page lists every way data enters the platform, with its status: the REST API (partner
-endpoints `POST /inbound/<code>`), the web console, partner listeners (MQ, Kafka, FTP/SFTP, database),
-workflow database triggers, and the ports defined on the page. Administrators add ports there; each one
-**feeds a partner** (the content is its input payload) or **starts a workflow** (the content is the run's
-`trigger`).
+The **📡 Ports** page lists every way data enters the platform, with its status: the primary port (the
+REST API and partner endpoints `POST /inbound/<code>`), the web console, partner listeners (MQ, Kafka,
+FTP/SFTP, database), workflow database triggers, and the ports added on the page. Click a port for its
+overview, settings and activity. Only administrators add or change ports.
+
+**HTTP / HTTPS port** - partner endpoints on their own port number, like a webMethods port:
+
+| Setting | Meaning |
+|---------|---------|
+| Port number, listen on | e.g. 8081 on all networks (0.0.0.0) or this machine only (127.0.0.1) |
+| Protocol | HTTP, or HTTPS with a certificate and private key file (PEM); the key password can be a stored secret |
+| Access mode | all partner endpoints, or only selected partners (others get 404) |
+| IP access | allow everyone, allow only listed addresses/networks, or deny listed ones (CIDR, e.g. `10.0.0.0/8`) |
+| Largest request | bigger requests get 413 |
+
+Such a port serves only `POST /inbound/<code>`, `GET /inbound/<code>/transactions/<id>` and `/health` -
+never the admin API - so it can be opened to partners while the primary port stays internal. Requests and
+rejections are counted on the port. A port number already in use is reported on the port.
+
+File polling and listener ports **feed a partner** (the content is its input payload) or **start a
+workflow** (the content is the run's `trigger`).
 
 **File polling port** - watches a folder on the server running Payload Hub:
 
@@ -332,6 +351,7 @@ workflow database triggers, and the ports defined on the page. Administrators ad
 | Poll every / minimum file age | files changed in the last N seconds are left alone (still being written) |
 | Files per poll / maximum size | limits per poll; bigger files go to the error folder |
 | After success | move to the completion folder (timestamped) or delete |
+| Clean up after | delete completed files older than N days (0 = keep) |
 
 Each file is first moved to the work folder (so it is picked up once), handed to the target, then moved to
 the completion folder - or to the error folder with a `<file>.error.txt` note saying why. JSON, XML and
@@ -365,6 +385,26 @@ daylight-saving changes. Tasks can be paused, resumed, edited and **run now** (w
 schedule); each run is kept in the task's history with its result and the transaction or workflow run it
 produced. If the server was down at a task's time, it runs once when the server is back. Workflow schedules
 set on a workflow's *Trigger* tab are listed on the page too.
+
+## Secrets
+
+Every stored credential is encrypted with the **master key**: connection passwords, AI provider keys and
+named secrets (plain-text passwords from older versions are encrypted automatically at start-up). The
+**🔐 Secrets** page (administrators) has three tabs:
+
+- **Secrets** - named credentials (password, API key, token, certificate) with an alias, like webMethods'
+  Passman. Values are write-only: never shown again, only replaced (each change bumps the version). A
+  connection can take its password *from a stored secret* instead of its own, so one change reaches every
+  connection that uses it. A secret in use can't be deleted.
+- **Master key** - where the key comes from (`PAYLOAD_HUB_SECRET_KEY` or `data/secret.key`), its fingerprint,
+  how many credentials it protects and whether any can't be decrypted. **Rotate** creates a new key and
+  re-encrypts everything in one database transaction; the old key is kept as `secret.key.<time>.bak`.
+- **Audit log** - who changed what and when: every change made through the API (partners, connections,
+  ports, schedules, workflows, users…), secret changes, password reveals and key rotations. It never
+  records secret values.
+
+Back up `data/secret.key` (or keep `PAYLOAD_HUB_SECRET_KEY` safe): without it, stored credentials can't be
+decrypted and must be entered again.
 
 ## Retry policy for outbound endpoints
 

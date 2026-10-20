@@ -65,37 +65,44 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
     return "\n".join(lines)
 
 
-def flow_tab(p: dict):
+def overview_tab(p: dict):
+    """The partner's flow at a glance: diagram, every endpoint, and its Kafka queues."""
     code = p["code"]
     conns = {c["id"]: c for c in api("GET", "/api/connections")}
     listeners = api("GET", "/api/adapters/status")
     st.graphviz_chart(flow_diagram(p, listeners, conns))
     if (lst := listeners.get(code)) and lst["state"] == "error":
         st.error(f"Inbound listener problem: {lst['detail']}")
-    st.markdown("**Inbound & outbound endpoints**")
     st.dataframe(common.partner_endpoints(p, conns), hide_index=True, width="stretch")
-    if "connections" in common.PAGES:
-        st.page_link(common.PAGES["connections"], label="Manage adapters & connections (brokers, APIs, retry policy)",
-                     icon="🔌")
+    with st.expander("🟧 Kafka queues"):
+        _kafka_queues(p)
 
-    types = api("GET", "/api/connection-types")
-    _route_form(p, conns, types)
-    st.divider()
+
+def route_tab(p: dict):
+    conns = {c["id"]: c for c in api("GET", "/api/connections")}
+    _route_form(p, conns, api("GET", "/api/connection-types"))
+
+
+def endpoint_tab(p: dict):
+    """How data reaches the partner: its HTTP endpoint, plus an optional queue/folder/table listener and an outbound
+    copy."""
+    conns = {c["id"]: c for c in api("GET", "/api/connections")}
     _http_endpoint(p)
     st.divider()
-    _adapters_form(p, conns, listeners)
-    st.divider()
+    _adapters_form(p, conns, api("GET", "/api/adapters/status"))
+
+
+def storage_tab(p: dict):
     _store_form(p)
-    st.divider()
-    _kafka_queues(p)
-    st.divider()
+
+
+def activity_tab(p: dict):
     _recent(p)
 
 
 def _http_endpoint(p):
     code = p["code"]
     url = f"{common.API}/inbound/{code}"
-    st.subheader("🌐 HTTP endpoint")
     if common.EMBEDDED:
         st.info("On Streamlit Cloud the endpoint runs inside the app and isn't reachable from outside - use "
                 "**Try it** below for the demo. On your laptop it's a real URL you can call with curl or Postman.")
@@ -151,7 +158,6 @@ def visible_endpoints(conns: dict, code: str) -> dict:
 
 def _route_form(p, conns, types):
     code = p["code"]
-    st.subheader("🔁 Route: Source → Target system → Source")
     st.caption("The **source system** calls this partner's endpoint → the payload is transformed → sent to the **target system** "
                "(an API, a CSV/JSON/XML file on FTP/SFTP, a database table or a queue) → the target system's answer goes back "
                "to A, translated or as is.")
@@ -312,7 +318,7 @@ def _save_reply(code, body):
 def _adapters_form(p, conns, listeners):
     code = p["code"]
     types = api("GET", "/api/connection-types")
-    st.subheader("🔀 More inbound & outbound adapters")
+    st.markdown("**More ways in and out**")
     mine = visible_endpoints(conns, code)
     in_opts = [""] + [c for c in mine if types[conns[c]["type"]]["inbound"]]
     out_opts = [""] + [c for c in mine if types[conns[c]["type"]]["outbound"]]
@@ -364,7 +370,6 @@ def _adapters_form(p, conns, listeners):
 
 def _store_form(p):
     code = p["code"]
-    st.subheader("🗄️ Store in the database")
     enabled = st.toggle("Store each completed message in a data table", value=bool(p.get("store_enabled")),
                         key=f"store_on_{code}", disabled=not common.can("write"))
     if not enabled:
@@ -436,7 +441,6 @@ def _save_store(code, body):
 
 def _kafka_queues(p):
     code = p["code"]
-    st.subheader("🟧 Kafka queues")
     st.markdown(f"**{queue_label(p)}**: `{p['topic_in']}` → `{p['topic_out']}` · failures `{p['topic_dlq']}`")
     target = "shared" if p["queue_mode"] == "dedicated" else "dedicated"
     if st.button(f"Move to {target} queues", key=f"move_{code}", disabled=not common.can("write"),
@@ -451,7 +455,6 @@ def _kafka_queues(p):
 
 
 def _recent(p):
-    st.subheader("Recent activity")
     txns = api("GET", "/api/transactions", params={"partner": p["code"], "limit": 8})
     if not txns:
         st.caption("No transactions yet.")

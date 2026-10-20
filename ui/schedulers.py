@@ -21,59 +21,61 @@ def _when(value) -> str:
 
 
 def page():
-    common.hero("⏰ Schedulers", "Run workflows, send partner messages or call APIs on a schedule - every few "
-                                "minutes, daily, on a cron expression, or once.")
+    common.hero("⏰ Schedulers", "Run workflows, partner messages or API calls on a schedule.")
     data = api("GET", "/api/schedules")
     tasks = data["tasks"]
-    m = st.columns(4)
-    m[0].metric("Tasks", len(tasks))
-    m[1].metric("Active", sum(t["enabled"] for t in tasks))
-    m[2].metric("Runs", sum(t["run_count"] for t in tasks))
-    m[3].metric("Failed runs", sum(t["fail_count"] for t in tasks))
-    if tasks:
-        st.dataframe([{"Task": t["name"], "When": t["schedule_text"], "Does": t["action_text"],
-                       "Next run": _when(t["next_run_at"]) if t["enabled"] else "⏸️ paused",
-                       "Last run": f"{RESULT.get(t['last_status'], '')} {_when(t['last_run_at'])}" if t["last_run_at"]
-                       else "never", "Runs": t["run_count"]} for t in tasks], hide_index=True, width="stretch")
-    st.caption(f"Times are shown in the server's time zone ({data['local_timezone']}).")
-
     ctx = {"partners": {p["code"]: p["name"] for p in api("GET", "/api/partners")},
            "workflows": {w["id"]: w["name"] for w in api("GET", "/api/workflows")["workflows"]},
            "https": {c["id"]: c["name"] for c in api("GET", "/api/connections") if c["type"] == "http"},
            "tz": data["local_timezone"]}
-    if common.can("write"):
-        with st.expander("➕ New scheduled task", expanded=not tasks):
-            _task_form(None, ctx)
-    for t in tasks:
-        _task_card(t, ctx)
+    top = st.columns([3, 1], vertical_alignment="center")
+    failed = sum(t["last_status"] == "FAILED" for t in tasks)
+    top[0].caption(f"{len(tasks)} tasks · {sum(t['enabled'] for t in tasks)} active"
+                   + (f" · ❌ {failed} failed last time" if failed else "") + f" · times in {data['local_timezone']}")
+    if top[1].button("➕ New task", type="primary", width="stretch", disabled=not common.can("write")):
+        _new_task_dialog(ctx)
+    if tasks:
+        sid = common.pick_row(
+            [{"Task": t["name"], "Runs": t["schedule_text"], "Does": t["action_text"],
+              "Next run": _when(t["next_run_at"]) if t["enabled"] else "⏸️ paused",
+              "Last run": f"{RESULT.get(t['last_status'], '')} {_when(t['last_run_at'])}" if t["last_run_at"] else "never"}
+             for t in tasks], "schedules", [t["id"] for t in tasks])
+        _detail(next(t for t in tasks if t["id"] == sid), ctx)
+    else:
+        st.info("No scheduled tasks yet.")
     if data["workflow_schedules"]:
-        st.subheader("Workflow schedules")
-        st.caption("Set on each workflow's *Trigger* tab.")
-        st.dataframe([{"Workflow": w["name"], "Every": f"{w['every_minutes']} min",
-                       "Per row of a query": "yes" if w["per_row"] else "no",
-                       "Next run": _when(w["next_run_at"]) if w["active"] else "⏸️ paused"}
-                      for w in data["workflow_schedules"]], hide_index=True, width="stretch")
+        with st.expander(f"Workflow schedules ({len(data['workflow_schedules'])}) - set on each workflow's Trigger tab"):
+            st.dataframe([{"Workflow": w["name"], "Every": f"{w['every_minutes']} min",
+                           "Per row of a query": "yes" if w["per_row"] else "no",
+                           "Next run": _when(w["next_run_at"]) if w["active"] else "⏸️ paused"}
+                          for w in data["workflow_schedules"]], hide_index=True, width="stretch")
 
 
-def _task_card(t, ctx):
-    with st.container(border=True):
-        top = st.columns([4, 3, 2], vertical_alignment="center")
-        top[0].markdown(f"#### {t['name']}")
-        top[0].caption(f"{t['action_text']} · {t['schedule_text']}")
-        top[1].markdown(f"**Next:** {_when(t['next_run_at']) if t['enabled'] else '⏸️ paused'}")
-        if t["last_run_at"]:
-            top[1].caption(f"Last: {RESULT.get(t['last_status'], '')} {_when(t['last_run_at'])} - "
-                           f"{(t['last_detail'] or '')[:120]}")
-        top[2].markdown(f"✅ {t['run_count'] - t['fail_count']} · ❌ {t['fail_count']}")
-        if t.get("description"):
-            st.caption(t["description"])
-        b = st.columns([1.4, 1.4, 1.2, 2])
+@st.dialog("New scheduled task", width="large")
+def _new_task_dialog(ctx):
+    _task_form(None, ctx)
+
+
+def _detail(t, ctx):
+    common.detail_title(t["name"])
+    if t.get("description"):
+        st.caption(t["description"])
+    overview, history, settings = st.tabs(["Overview", "History", "Settings"])
+    with overview:
+        st.html('<div class="ph-kv">' + "".join(
+            f"<b>{k}</b><span>{v}</span>" for k, v in [
+                ("Does", t["action_text"]), ("Runs", t["schedule_text"]),
+                ("Next run", _when(t["next_run_at"]) if t["enabled"] else "⏸️ paused"),
+                ("Last run", f"{RESULT.get(t['last_status'], '')} {_when(t['last_run_at'])} - {t['last_detail'] or ''}"
+                 if t["last_run_at"] else "never"),
+                ("Totals", f"✅ {t['run_count'] - t['fail_count']} · ❌ {t['fail_count']}")]) + "</div>")
         write = common.can("write")
+        b = st.columns([1, 1, 1, 2])
         if b[0].button("▶️ Run now", key=f"sch_run_{t['id']}", disabled=not write, width="stretch"):
             with st.spinner("Running…"):
                 r = api("POST", f"/api/schedules/{t['id']}/run", timeout=300)
-            (st.success if r["status"] in ("OK", "ACCEPTED") else st.error)(f"{RESULT.get(r['status'], '')} "
-                                                                           f"{r['status']} · {r['detail']}")
+            (st.success if r["status"] in ("OK", "ACCEPTED") else st.error)(
+                f"{RESULT.get(r['status'], '')} {r['status']} · {r['detail']}")
         if b[1].button("⏸️ Pause" if t["enabled"] else "▶️ Resume", key=f"sch_en_{t['id']}", disabled=not write,
                        width="stretch"):
             try:
@@ -84,19 +86,21 @@ def _task_card(t, ctx):
                 st.rerun()
         if b[2].button("🗑️ Delete", key=f"sch_del_{t['id']}", disabled=not common.can("delete"), width="stretch"):
             api("DELETE", f"/api/schedules/{t['id']}")
+            st.session_state.pop("schedules_selected", None)
             st.rerun()
-        with st.expander("History"):
-            runs = api("GET", f"/api/schedules/{t['id']}/runs", params={"limit": 20})
-            if runs:
-                st.dataframe([{"Started": _when(r["started_at"]), "": RESULT.get(r["status"], ""),
-                               "Result": r["status"], "How": r["trigger"], "ms": r["duration_ms"],
-                               "Detail": r["detail"], "Transaction / run": r["ref"]} for r in runs],
-                             hide_index=True, width="stretch")
-            else:
-                st.caption("Not run yet.")
-        if write:
-            with st.expander("✏️ Edit"):
-                _task_form(t, ctx)
+    with history:
+        runs = api("GET", f"/api/schedules/{t['id']}/runs", params={"limit": 30})
+        if runs:
+            st.dataframe([{"Started": _when(r["started_at"]), "": RESULT.get(r["status"], ""), "Result": r["status"],
+                           "How": r["trigger"], "ms": r["duration_ms"], "Detail": r["detail"],
+                           "Transaction / run": r["ref"]} for r in runs], hide_index=True, width="stretch")
+        else:
+            st.caption("Not run yet.")
+    with settings:
+        if common.can("write"):
+            _task_form(t, ctx)
+        else:
+            st.caption("You need write permission to change tasks.")
 
 
 def _task_form(t, ctx):
@@ -123,8 +127,14 @@ def _task_form(t, ctx):
             except ApiError as e:
                 st.error(str(e))
                 return
-            st.toast("Task saved", icon="⏰")
+            st.session_state["schedules_selected"] = _slug(name) if not t else t["id"]
             st.rerun()
+
+
+def _slug(text: str) -> str:
+    import re
+
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40]
 
 
 def _pick(label, options: dict, current):

@@ -9,7 +9,7 @@ from .common import STATUSES, api, lang, show_events, status_label
 
 
 def page():
-    common.hero("🔎 Transactions", "Find any message by ID, partner or content, and see every step it went through.")
+    common.hero("🔎 Transactions", "Find any message and see every step it went through.")
     partner_names = {p["code"]: p["name"] for p in common.partners()}
     with st.form("search"):
         c1, c2, c3 = st.columns([3, 1.4, 1])

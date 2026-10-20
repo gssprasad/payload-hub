@@ -102,4 +102,4 @@ def test_ports_overview_lists_everything(admin):
     rows = admin.get("/api/ports-overview").json()
     kinds = {r["managed"] for r in rows}
     assert {"built-in", "port"} <= kinds
-    assert any(r["name"] == "REST API" and r["state"] == "running" for r in rows)
+    assert any(r["name"] == "Primary port" and r["state"] == "running" for r in rows)

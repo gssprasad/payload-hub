@@ -8,7 +8,7 @@ from .common import ApiError, api, lang, show_agent_result, show_agent_steps, st
 
 
 def page():
-    common.hero("🤖 AI Agent", "The agent reads your mapping document and instructions, inspects a sample payload, writes the mapping, tests it with the real transformer, and saves it.")
+    common.hero("🤖 AI Agent", "Let an AI model write and test a partner's mapping.")
 
     info = api("GET", "/api/ai/providers")
     providers = {p["id"]: p for p in info["providers"]}
