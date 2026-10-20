@@ -19,7 +19,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import jmespath
 from jinja2 import StrictUndefined
@@ -390,21 +390,29 @@ async def rerun(run_id: str) -> dict:
 # ---------- triggers ----------
 
 async def sync():
-    """Start or stop database-trigger listeners to match the workflows."""
+    """Start or stop database-trigger listeners to match the workflows (each trigger runs on one instance)."""
+    from . import cluster
+
     wanted = {w["id"]: w for w in await db.list_workflows()
               if w["active"] and w["trigger_type"] == "database"}
     for wf_id in list(_listeners):
+        entry = _listeners[wf_id]
         key = (wanted.get(wf_id) or {}).get("trigger_config")
-        if key != _listeners[wf_id]["key"]:
-            entry = _listeners.pop(wf_id)
+        standby = entry["state"] == "standby"
+        if key != entry["key"] or standby or (entry.get("listener") and not cluster.holds(f"trigger:{wf_id}")):
+            _listeners.pop(wf_id)
             if entry.get("listener"):
                 await entry["listener"].stop()
+                await cluster.release(f"trigger:{wf_id}")
     for wf_id, w in wanted.items():
         if wf_id in _listeners:
             continue
         cfg = w["trigger_config"] or {}
         entry = {"key": cfg, "listener": None, "state": "starting", "detail": ""}
         _listeners[wf_id] = entry
+        if not await cluster.own(f"trigger:{wf_id}"):
+            entry.update(state="standby", detail="watched by another instance")
+            continue
         try:
             database = await _database(cfg.get("connection"))
 
@@ -417,16 +425,17 @@ async def sync():
             entry.update(state="running", detail=entry["listener"].describe)
         except Exception as e:  # noqa: BLE001
             entry.update(state="error", detail=str(e) or type(e).__name__)
+            await cluster.release(f"trigger:{wf_id}")
 
 
 async def _schedule_loop():
+    rounds = 0
     while True:
         await asyncio.sleep(20)
+        rounds += 1
         try:
-            for wf in await db.due_workflows():
+            for wf in await db.claim_due_workflows():  # claimed atomically: one instance runs each due workflow
                 cfg = wf["trigger_config"] or {}
-                minutes = max(1, int(cfg.get("interval_minutes") or 60))
-                await db.update_workflow(wf["id"], next_run_at=datetime.now(timezone.utc) + timedelta(minutes=minutes))
                 if cfg.get("query"):
                     database = await _database(cfg.get("connection"))
                     rows = (await database.execute(cfg["query"], {}, write=False))["rows"]
@@ -434,6 +443,8 @@ async def _schedule_loop():
                         asyncio.create_task(run(wf, row, "schedule"))
                 else:
                     asyncio.create_task(run(wf, {}, "schedule"))
+            if rounds % 3 == 0:
+                await sync()  # take over triggers another instance gave up
         except Exception:  # noqa: BLE001
             log.exception("workflow scheduler")
 

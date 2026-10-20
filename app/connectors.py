@@ -13,12 +13,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from . import adapters, db, pipeline
+from . import adapters, cluster, db, pipeline
 from .transform import TransformError, convert_response, to_csv
 
 log = logging.getLogger("connectors")
 
-SUPERVISE_SECONDS = 15
+SUPERVISE_SECONDS = float(__import__("os").getenv("PAYLOAD_HUB_SUPERVISE_SECONDS", "15"))
+POLLING = ("database", "ftp")  # pollers must run on exactly one instance; queue consumers share the work
 SYNC_SOURCES = ("HTTP", "UI")  # callers waiting for a reply; others (MQ, Kafka) get the forward done in the background
 
 _adapters: dict[str, tuple[str, adapters.Adapter]] = {}  # connection id -> (updated_at, adapter)
@@ -231,7 +232,8 @@ async def sync():
             entry = _listeners[code]
             p = wanted.get(code)
             key = (p["inbound_connection"], p["inbound_source"]) if p else None
-            if key != entry["key"] or not _alive(entry):
+            lost = entry.get("singleton") and not cluster.holds(entry["singleton"])
+            if key != entry["key"] or not _alive(entry) or lost:
                 await _stop(code)
         for code, p in wanted.items():
             if code not in _listeners:
@@ -250,6 +252,12 @@ async def _start(p):
     code, conn_id, source = p["code"], p["inbound_connection"], p["inbound_source"]
     entry = {"key": (conn_id, source), "listener": None, "state": "starting", "detail": "", "since": _now()}
     _listeners[code] = entry
+    conn = await db.get_connection(conn_id)
+    if conn and conn["type"] in POLLING:
+        entry["singleton"] = f"listener:{code}"
+        if not await cluster.own(entry["singleton"]):
+            entry.update(state="standby", detail="polled by another instance")
+            return
 
     async def handler(body: bytes, meta: dict):
         partner = await db.get_partner(code)
@@ -277,6 +285,8 @@ async def _start(p):
 
 async def _stop(code):
     entry = _listeners.pop(code, None)
+    if entry and entry.get("singleton") and entry.get("listener"):
+        await cluster.release(entry["singleton"])
     if entry and entry.get("listener"):
         try:
             await entry["listener"].stop()

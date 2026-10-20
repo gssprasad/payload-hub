@@ -82,6 +82,22 @@ secrets): Secrets page → *Audit log*, and each partner's *Activity* tab shows 
 - Rotate it from Secrets → *Master key* (file-based keys): everything is re-encrypted in one transaction and the old
   key is kept as `secret.key.<time>.bak`. Take a backup right after rotating - older backups need the old key.
 
+## Running more than one instance
+
+Start several backends against the same PostgreSQL database and Kafka cluster (behind a load balancer for HTTP):
+
+- **Partner calls** can land on any instance: whichever instance finishes the transaction tells the others
+  (PostgreSQL `NOTIFY`), so the waiting caller always gets its answer.
+- **Queue consumers** (Kafka, RabbitMQ, ActiveMQ, IBM MQ) and **HTTP ports** run on every instance and share the work.
+- **Pollers** (folders, FTP/SFTP, database tables), **workflow database triggers** and the **alert watcher** run on
+  exactly one instance - the one holding its database lock. The Ports page shows the others as *standby*.
+- **Schedules** (scheduled tasks and workflow schedules) are claimed by one instance per run.
+- **Failover**: when an instance dies, its database connection drops and its locks are freed; another instance
+  takes the pollers over within `PAYLOAD_HUB_SUPERVISE_SECONDS` (default 15-30 s). Messages already in Kafka are
+  handed to the remaining instances once Kafka notices (its consumer session timeout, about 10 s); nothing is lost.
+  Files a poller was working on when it died are put back and processed again by the new owner.
+- Migrations run once (under a lock) whichever instance starts first.
+
 ## Health checks
 
 - `GET /health` - 200 when the database, Kafka and the pipeline workers are up, 503 otherwise (for load balancers

@@ -19,8 +19,8 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import (adapters, agent, ai, alerts, auth, backup, connectors, cron, datastore, db, mapping_doc, migrate,
-               pipeline, ports, scheduler, vault, workflows)
+from . import (adapters, agent, ai, alerts, auth, backup, cluster, connectors, cron, datastore, db, mapping_doc,
+               migrate, pipeline, ports, scheduler, vault, workflows)
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,6 +31,8 @@ STATIC = Path(__file__).parent / "static"
 async def lifespan(_app):
     await db.init()
     await vault.migrate()
+    cluster.on_txn_done = pipeline.resolve_waiter
+    await cluster.start()
     await auth.ensure_admin()
     await datastore.init()
     await pipeline.start()
@@ -46,6 +48,7 @@ async def lifespan(_app):
     await workflows.stop()
     await connectors.stop()
     await pipeline.stop()
+    await cluster.stop()
     await db.close()
 
 
@@ -133,14 +136,27 @@ class LoginIn(BaseModel):
     password: str
 
 
-TRUSTED_PROXIES = {a.strip() for a in os.getenv("PAYLOAD_HUB_TRUSTED_PROXIES", "127.0.0.1,::1").split(",") if a.strip()}
+def _networks(text: str):
+    import ipaddress
+
+    return [ipaddress.ip_network(a.strip(), strict=False) for a in text.split(",") if a.strip()]
+
+
+# Callers allowed to pass on the browser's address (the web console): addresses or networks, e.g. 172.16.0.0/12
+TRUSTED_PROXIES = _networks(os.getenv("PAYLOAD_HUB_TRUSTED_PROXIES", "127.0.0.1,::1"))
 
 
 def client_address(request: Request) -> str | None:
     """The browser's address. The web console passes it on in X-Client-Address; only trusted callers may do that."""
+    import ipaddress
+
     direct = request.client.host if request.client else None
     forwarded = request.headers.get("x-client-address")
-    return forwarded if forwarded and direct in TRUSTED_PROXIES else direct
+    try:
+        trusted = direct is not None and any(ipaddress.ip_address(direct) in n for n in TRUSTED_PROXIES)
+    except ValueError:
+        trusted = False
+    return forwarded if forwarded and trusted else direct
 
 
 @app.post("/api/auth/login")

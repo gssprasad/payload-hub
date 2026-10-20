@@ -36,7 +36,7 @@ FILE_DEFAULTS = {"filter": "*", "interval_seconds": 10, "min_age_seconds": 5, "m
 HTTP_DEFAULTS = {"bind": "0.0.0.0", "protocol": "http", "access_mode": "all", "partners": [], "ip_mode": "all",
                  "ip_list": [], "max_body_kb": 10240, "cert_file": "", "key_file": "", "key_password_alias": ""}
 http_app_factory = None  # set by main.py: builds the small app an HTTP port serves
-SUPERVISE_SECONDS = 30
+SUPERVISE_SECONDS = float(os.getenv("PAYLOAD_HUB_SUPERVISE_SECONDS", "30"))
 _running: dict[str, dict] = {}
 _lock = asyncio.Lock()
 _supervisor: asyncio.Task | None = None
@@ -277,10 +277,30 @@ async def _process_file(port: dict, entry: os.DirEntry):
     await db.record_port_event(port["id"], name, status, detail, ref)
 
 
+def _recover(cfg: dict) -> list[str]:
+    """Files left in the work folder (the poller stopped or crashed while handling them) go back to be picked up
+    again - only the owning instance runs this, so nobody else is working on them."""
+    back = []
+    with os.scandir(cfg["work_dir"]) as it:
+        for e in it:
+            if e.is_file():
+                original = e.name.split("_", 1)[1] if "_" in e.name and e.name[:8].isdigit() else e.name
+                target = os.path.join(cfg["monitor_dir"], original)
+                if not os.path.exists(target):
+                    os.replace(e.path, target)
+                    back.append(original)
+    return back
+
+
 async def _file_loop(port: dict, wake: asyncio.Event, entry: dict):
     cfg = port["config"]
     for key in ("work_dir", "completion_dir", "error_dir"):
         await asyncio.to_thread(os.makedirs, cfg[key], exist_ok=True)
+    if os.path.isdir(cfg["monitor_dir"]):
+        recovered = await asyncio.to_thread(_recover, cfg)
+        if recovered:
+            log.warning("port %s: put %d unfinished file(s) back to be processed again: %s", port["id"],
+                        len(recovered), ", ".join(recovered))
     while True:
         try:
             if not os.path.isdir(cfg["monitor_dir"]):
@@ -292,12 +312,12 @@ async def _file_loop(port: dict, wake: asyncio.Event, entry: dict):
                 await asyncio.to_thread(_cleanup, cfg)
             entry.update(state="running", detail=f"watching {cfg['monitor_dir']} ({cfg['filter']}) every "
                                                  f"{cfg['interval_seconds']} s")
-            await db.update_port(port["id"], last_poll_at=datetime.now(timezone.utc))
+            await db.port_polled(port["id"])
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - shown on the Ports page, polling continues
             entry.update(state="error", detail=str(e) or type(e).__name__)
-            await db.update_port(port["id"], last_poll_at=datetime.now(timezone.utc), last_error=entry["detail"])
+            await db.port_polled(port["id"], entry["detail"])
         wake.clear()
         try:
             await asyncio.wait_for(wake.wait(), cfg["interval_seconds"])
@@ -364,12 +384,21 @@ async def _start_http(port: dict, entry: dict):
 
 
 async def _start(port: dict):
+    from . import cluster
+
     entry = {"key": port["updated_at"], "state": "starting", "detail": "", "task": None, "listener": None,
              "wake": asyncio.Event()}
     _running[port["id"]] = entry
     if port["type"] == "http":
-        await _start_http(port, entry)
+        await _start_http(port, entry)  # every instance serves its HTTP ports
         return
+    singleton = port["type"] == "file" or (await db.get_connection(port["config"].get("connection", "")) or {}).get(
+        "type") in ("database", "ftp")
+    if singleton:
+        entry["singleton"] = f"port:{port['id']}"
+        if not await cluster.own(entry["singleton"]):
+            entry.update(state="standby", detail="handled by another instance")
+            return
     if port["type"] == "file":
         entry["task"] = asyncio.create_task(_file_loop(port, entry["wake"], entry), name=f"port-{port['id']}")
         return
@@ -391,9 +420,13 @@ async def _start(port: dict):
 
 
 async def _stop(pid: str):
+    from . import cluster
+
     entry = _running.pop(pid, None)
     if not entry:
         return
+    if entry.get("singleton") and entry["state"] != "standby":
+        await cluster.release(entry["singleton"])
     if entry.get("server"):
         entry["server"].should_exit = True
         try:
@@ -412,13 +445,17 @@ async def _stop(pid: str):
 
 async def sync():
     """Start, restart or stop ports so they match their definitions."""
+    from . import cluster
+
     async with _lock:
         wanted = {p["id"]: p for p in await db.list_ports() if p["enabled"]}
         for pid in list(_running):
             entry, p = _running[pid], wanted.get(pid)
             dead = entry.get("task") is not None and entry["task"].done()
             failed_listener = entry["state"] == "error" and entry.get("listener") is None and entry.get("task") is None
-            if not p or p["updated_at"] != entry["key"] or dead or failed_listener:  # failed listeners are retried
+            standby = entry["state"] == "standby"  # try again to take it over
+            lost = entry.get("singleton") and not standby and not cluster.holds(entry["singleton"])
+            if not p or p["updated_at"] != entry["key"] or dead or failed_listener or standby or lost:
                 await _stop(pid)
         for pid, p in wanted.items():
             if pid not in _running:

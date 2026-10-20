@@ -204,6 +204,19 @@ async def _finish(msg, status, detail, **fields):
     fut = _waiters.get(txn_id)
     if fut and not fut.done():
         fut.set_result(await db.get_transaction(txn_id))
+    elif status in ("COMPLETED", "FAILED"):
+        from . import cluster
+
+        await cluster.notify_done(txn_id)  # the caller may be waiting on another instance
+
+
+async def resolve_waiter(txn_id: str):
+    """Another instance finished a transaction - answer the caller waiting here, if any."""
+    fut = _waiters.get(txn_id)
+    if fut and not fut.done():
+        txn = await db.get_transaction(txn_id)
+        if txn and txn["status"] in ("COMPLETED", "FAILED") and not fut.done():
+            fut.set_result(txn)
 
 
 async def queue_stats(max_age: float = 5.0) -> list[dict]:

@@ -676,10 +676,16 @@ async def get_file(file_id):
         return await cur.fetchone()
 
 
-async def due_workflows():
+async def claim_due_workflows():
+    """Due scheduled workflows, each moved to its next run time in the same statement - so with several instances
+    only one of them gets it."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT * FROM workflows WHERE active AND trigger_type = 'schedule' AND (next_run_at IS NULL OR next_run_at <= now())")
+            """UPDATE workflows w SET next_run_at = now() + make_interval(
+                   mins => greatest(1, coalesce((w.trigger_config->>'interval_minutes')::int, 60)))
+               WHERE w.id IN (SELECT id FROM workflows WHERE active AND trigger_type = 'schedule'
+                              AND (next_run_at IS NULL OR next_run_at <= now()) FOR UPDATE SKIP LOCKED)
+               RETURNING w.*""")
         return await cur.fetchall()
 
 
@@ -893,6 +899,15 @@ async def update_port(pid, **fields):
         sets = ", ".join(f"{k} = %s" for k in fields)
         async with pool.connection() as conn:
             await conn.execute(f"UPDATE ports SET {sets}, updated_at = now() WHERE id = %s", (*fields.values(), pid))
+
+
+async def port_polled(pid, error=None):
+    """Record a poll without touching updated_at (which marks the port's settings as changed)."""
+    async with pool.connection() as conn:
+        if error is None:
+            await conn.execute("UPDATE ports SET last_poll_at = now() WHERE id = %s", (pid,))
+        else:
+            await conn.execute("UPDATE ports SET last_poll_at = now(), last_error = %s WHERE id = %s", (error, pid))
 
 
 async def delete_port(pid):

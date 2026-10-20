@@ -103,3 +103,13 @@ def test_ports_overview_lists_everything(admin):
     kinds = {r["managed"] for r in rows}
     assert {"built-in", "port"} <= kinds
     assert any(r["name"] == "Primary port" and r["state"] == "running" for r in rows)
+
+
+def test_files_left_in_the_work_folder_are_picked_up_again(admin, tmp_path):
+    partner = make_partner(admin, "Port Test Recover")
+    (tmp_path / ".work").mkdir()
+    (tmp_path / ".work" / "20260101T000000000_stranded.json").write_text(json.dumps(ORDER))  # e.g. after a crash
+    port = file_port(admin, "Recover folder", tmp_path, "partner", partner["code"])
+    (event,) = events(admin, port, 1)
+    assert event["item"] == "stranded.json" and event["status"] == "OK"
+    assert os.listdir(tmp_path / ".work") == []

@@ -197,10 +197,13 @@ async def _watch_once():
 
 
 async def _watch():
+    from . import cluster
+
     await asyncio.sleep(5)  # let listeners and ports start
     while True:
         try:
-            await _watch_once()
+            if await cluster.own("alert-watcher"):  # one instance watches, so alerts aren't doubled
+                await _watch_once()
         except Exception:  # noqa: BLE001
             log.exception("alert watcher")
         await asyncio.sleep(WATCH_SECONDS)
