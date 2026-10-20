@@ -833,6 +833,33 @@ async def ftp_write(conn_id: str, req: FileWrite):
     return {"written": path}
 
 
+# ---------- Kafka connections: topics and messages ----------
+
+async def _kafka(conn_id: str) -> adapters.Kafka:
+    c = await db.get_connection(conn_id)
+    if not c:
+        raise HTTPException(404, "Connection not found.")
+    if c["type"] != "kafka":
+        raise HTTPException(422, "That connection isn't Kafka.")
+    return await connectors.adapter_for(conn_id)
+
+
+@app.get("/api/connections/{conn_id}/topics")
+async def kafka_topics(conn_id: str):
+    try:
+        return await (await _kafka(conn_id)).topics()
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+
+
+@app.get("/api/connections/{conn_id}/topics/{topic}/messages")
+async def kafka_messages(conn_id: str, topic: str, limit: int = 20):
+    try:
+        return await (await _kafka(conn_id)).peek(topic, min(max(limit, 1), 200))
+    except adapters.AdapterError as e:
+        raise HTTPException(422 if not e.retryable else 502, str(e)) from e
+
+
 # ---------- table designer (built-in area or any database connection) ----------
 
 class DesignIn(BaseModel):

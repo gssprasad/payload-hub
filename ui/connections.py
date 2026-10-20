@@ -12,7 +12,7 @@ PRESETS = {
     "activemq": "Local ActiveMQ",
     "ibmmq": "IBM MQ (dev queue manager)",
     "http": "Partner webhook",
-    "kafka": "External Kafka",
+    "kafka": "Local Kafka",
     "database": "Partner database",
     "ftp": "Partner file server",
 }
@@ -163,6 +163,10 @@ def _connection_card(c, types):
         show_edit = b[2].toggle("Edit", key=f"edit_toggle_{c['id']}", disabled=not common.can("write"))
         if c["type"] == "ftp" and b[3].toggle("📂 Files", key=f"files_toggle_{c['id']}"):
             _file_browser(c)
+        if c["type"] == "kafka" and b[3].toggle("📜 Topics", key=f"topics_toggle_{c['id']}"):
+            _topic_browser(c)
+        if c["type"] == "database" and "data" in common.PAGES:
+            b[3].page_link(common.PAGES["data"], label="Open tables on the Data page", icon="🗄️")
 
         if show_send:
             with st.form(f"send_{c['id']}"):
@@ -198,6 +202,35 @@ def _connection_card(c, types):
                     else:
                         common.partners.clear()
                         st.rerun()
+
+
+def _topic_browser(c):
+    cid = c["id"]
+    try:
+        topics = api("GET", f"/api/connections/{cid}/topics")
+    except ApiError as e:
+        st.error(str(e))
+        return
+    if not topics:
+        st.caption("No topics yet.")
+        return
+    st.dataframe(topics, hide_index=True, width="stretch",
+                 column_config={"topic": "Topic", "partitions": "Partitions", "messages": "Messages"})
+    t1, t2 = st.columns([3, 1])
+    topic = t1.selectbox("Show latest messages in", [t["topic"] for t in topics], key=f"topic_pick_{cid}")
+    limit = t2.number_input("How many", 1, 200, 10, key=f"topic_limit_{cid}")
+    if st.button("Show messages", key=f"topic_show_{cid}"):
+        msgs = api("GET", f"/api/connections/{cid}/topics/{topic}/messages", params={"limit": limit})
+        if not msgs:
+            st.caption("This topic is empty.")
+        for m in msgs:
+            import datetime as _dt
+
+            when = _dt.datetime.fromtimestamp(m["timestamp"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            with st.expander(f"{when} · partition {m['partition']} · offset {m['offset']}"
+                             + (f" · key {m['key'][:12]}" if m["key"] else "")):
+                body = m["value"]
+                st.code(body, language="xml" if body.lstrip().startswith("<") else "json")
 
 
 def _file_browser(c):

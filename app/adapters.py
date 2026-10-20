@@ -525,6 +525,74 @@ class Kafka(Adapter):
             await admin.close()
         return f"Connected to Kafka {self.config.get('bootstrap')} ({len(topics)} topics)"
 
+    async def topics(self) -> list[dict]:
+        """Topics with partitions and message counts (internal topics hidden)."""
+        from aiokafka import AIOKafkaConsumer, TopicPartition
+        from aiokafka.admin import AIOKafkaAdminClient
+
+        admin = AIOKafkaAdminClient(**self._conn(), request_timeout_ms=15000)
+        probe = AIOKafkaConsumer(**self._conn(), enable_auto_commit=False)
+        try:
+            await asyncio.wait_for(admin.start(), 20)
+            await asyncio.wait_for(probe.start(), 20)
+            names = sorted(t for t in await admin.list_topics() if not t.startswith("__"))
+            described = await admin.describe_topics(names) if names else []
+            parts = [TopicPartition(d["topic"], p["partition"]) for d in described for p in d["partitions"]]
+            ends = await probe.end_offsets(parts) if parts else {}
+            starts = await probe.beginning_offsets(parts) if parts else {}
+            return sorted([{"topic": d["topic"], "partitions": len(d["partitions"]),
+                            "messages": sum(ends[tp] - starts[tp] for tp in parts if tp.topic == d["topic"])}
+                           for d in described], key=lambda t: t["topic"])
+        except Exception as e:  # noqa: BLE001
+            raise AdapterError(f"Kafka {self.config.get('bootstrap')}: {str(e) or type(e).__name__}") from e
+        finally:
+            await probe.stop()
+            await admin.close()
+
+    async def peek(self, topic: str, limit: int = 20) -> list[dict]:
+        """The latest `limit` messages of a topic (read-only: no consumer group, nothing committed)."""
+        from aiokafka import AIOKafkaConsumer, TopicPartition
+
+        from aiokafka.admin import AIOKafkaAdminClient
+
+        admin = AIOKafkaAdminClient(**self._conn(), request_timeout_ms=15000)
+        try:
+            await asyncio.wait_for(admin.start(), 20)
+            if topic not in await admin.list_topics():
+                raise AdapterError(f"Topic '{topic}' not found.", retryable=False)
+            partitions = [p["partition"] for p in (await admin.describe_topics([topic]))[0]["partitions"]]
+        finally:
+            await admin.close()
+        consumer = AIOKafkaConsumer(**self._conn(), enable_auto_commit=False, group_id=None)
+        try:
+            await asyncio.wait_for(consumer.start(), 20)
+            tps = [TopicPartition(topic, p) for p in partitions]
+            consumer.assign(tps)
+            ends = await consumer.end_offsets(tps)
+            starts = await consumer.beginning_offsets(tps)
+            wanted = 0
+            for tp in tps:
+                start = max(starts[tp], ends[tp] - limit)
+                wanted += ends[tp] - start
+                consumer.seek(tp, start)
+            out = []
+            while len(out) < wanted:
+                batch = await consumer.getmany(timeout_ms=2000, max_records=500)
+                if not batch:
+                    break
+                for tp, records in batch.items():
+                    for r in records:
+                        out.append({"partition": r.partition, "offset": r.offset, "timestamp": r.timestamp,
+                                    "key": r.key.decode(errors="replace") if r.key else None,
+                                    "value": (r.value or b"").decode(errors="replace")})
+            return sorted(out, key=lambda m: m["timestamp"], reverse=True)[:limit]
+        except AdapterError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise AdapterError(f"Kafka {self.config.get('bootstrap')}: {str(e) or type(e).__name__}") from e
+        finally:
+            await consumer.stop()
+
     async def send(self, target, body, headers, content_type):
         from aiokafka import AIOKafkaProducer
 
