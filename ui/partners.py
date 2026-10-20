@@ -128,21 +128,21 @@ def api_access_dialog(p):
                                 role="queue / topic / folder / table to read")
 
     with outbound:
-        st.markdown("**🔁 Route: caller → System B → caller**")
+        st.markdown("**🔁 Route: Source → Target system → Source**")
         if p.get("reply_mode") == "forward" and p.get("reply_connection") in conns:
             rc = conns[p["reply_connection"]]
             fmt = {"input": p["input_format"], "json": "json", "xml": "xml", "unchanged": None}[p.get("response_format") or "input"]
             http = rc["type"] == "http"
             sends = "text/csv" if p.get("send_format") == "csv" else MIME[p["output_format"]]
-            _kv([("Mode", "Send the transformed payload to System B and return its "
+            _kv([("Mode", "Send the transformed payload to the target system and return its "
                           + ("response" if http else "delivery receipt")),
-                 ("System B", f"{rc['name']} ({rc['type']}) · "
+                 ("Target system", f"{rc['name']} ({rc['type']}) · "
                               + ("👤 dedicated to this partner" if rc.get("owner_partner") else "🌍 common endpoint")),
                  ("Sends to", f"<code>{((p.get('reply_method') or rc['config'].get('method', 'POST')) + ' ') if http else ''}"
                               f"{common.connection_address(rc, p.get('reply_path'))}</code>"),
                  ("Sends", f"Content-Type <code>{sends}</code>"),
                  ("Returns to caller", f"Content-Type <code>{MIME[fmt]}</code> (translated)" if fmt
-                  else "System B's answer as is"),
+                  else "the target system's answer as is"),
                  ("Response mapping", f"<code>{p['response_expression']}</code>" if p.get("response_expression") else "none")])
             _connection_details(rc, types, p.get("reply_path"), reveal,
                                 role="path" if rc["type"] == "http" else "folder / table / queue / topic")

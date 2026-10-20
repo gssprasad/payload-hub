@@ -658,7 +658,7 @@ async def set_partner_adapters(code: str, req: PartnerAdapters):
 
 class PartnerReply(BaseModel):
     reply_mode: Literal["transformed", "forward"] = "transformed"
-    reply_connection: str | None = None  # System B
+    reply_connection: str | None = None  # the target system
     reply_path: str | None = None  # API path, folder, table, queue or topic
     reply_method: Literal["POST", "PUT", "PATCH", "GET", "DELETE"] | None = None
     send_format: Literal["output", "csv"] = "output"
@@ -669,13 +669,13 @@ class PartnerReply(BaseModel):
 
 @app.put("/api/partners/{code}/reply")
 async def set_partner_reply(code: str, req: PartnerReply):
-    """The System B route: send the transformed payload to System B (API, file, database, queue) and return its
+    """The the target system route: send the transformed payload to the target system (API, file, database, queue) and return its
     answer to the caller - translated or as is. 'transformed' returns the transformed payload directly."""
     await _partner_or_404(code)
     if req.reply_mode == "forward":
         c = await db.get_connection(req.reply_connection or "")
         if not c:
-            raise HTTPException(422, "Choose System B (an outbound connection).")
+            raise HTTPException(422, "Choose the target system (an outbound connection).")
         if not adapters.TYPES[c["type"]]["outbound"]:
             raise HTTPException(422, f"A {c['type']} connection can't receive messages.")
         if c.get("owner_partner") and c["owner_partner"] != code:
@@ -1457,7 +1457,7 @@ async def inbound(code: str, request: Request, wait: bool = True,
             return JSONResponse({"transaction_id": txn_id, "status": "FORWARD_FAILED", "error": reply["error"]},
                                 status_code=502, headers=headers)
         media = {"xml": "application/xml", "json": "application/json"}.get(reply.get("format")) \
-            or reply.get("content_type") or "text/plain"  # 'as is' keeps System B's own content type
+            or reply.get("content_type") or "text/plain"  # 'as is' keeps the target system's own content type
         return Response(reply["body"], status_code=reply["status"], media_type=media,
                         headers={**headers, "X-Status": "RESPONDED", "X-Upstream-Status": str(reply["status"])})
     if result and result["status"] == "COMPLETED":

@@ -215,24 +215,24 @@ it returns 202 and a transaction id to poll at `/inbound/<code>/transactions/<id
 **API access.** Click a partner in the Partners table (or *🔑 API access*) for its endpoint URL,
 API key, request format, what the caller gets back, and a ready-to-run curl command.
 
-**Route: caller → System B → caller.** At the top of a partner's *Flow & endpoints* tab:
-partner A calls this partner's endpoint, the payload is transformed and sent to **System B**,
-and System B's answer goes back to A.
+**Route: Source → Target system → Source.** At the top of a partner's *Flow & endpoints* tab:
+the source system calls this partner's endpoint, the payload is transformed and sent to the
+**target system**, and the target system's answer goes back to the source system.
 
 | Setting | Options |
 |---------|---------|
-| When a caller sends a message | *Reply at once with the transformed payload* (no System B, default), or *Send to System B and reply with its answer* |
-| System B endpoint | 👤 **This partner's endpoints** (dedicated - other partners can't see or use them), 🌍 **Common endpoints** (shared by all partners), or ➕ **New endpoint for this partner**, created right there: API (HTTP), file on FTP/SFTP, database table, RabbitMQ / ActiveMQ / IBM MQ queue, Kafka topic. *Make it common* / *Dedicate to this partner* switches an endpoint's scope |
+| When a caller sends a message | *Reply at once with the transformed payload* (no target system, default), or *Send to the target system and reply with its answer* |
+| Target system endpoint | 👤 **This partner's endpoints** (dedicated - other partners can't see or use them), 🌍 **Common endpoints** (shared by all partners), or ➕ **New endpoint for this partner**, created right there: API (HTTP), file on FTP/SFTP, database table, RabbitMQ / ActiveMQ / IBM MQ queue, Kafka topic. *Make it common* / *Dedicate to this partner* switches an endpoint's scope |
 | Where | API: method and path · file: folder · database: table · queue/topic: its name |
-| System B receives | the transformed payload as is (JSON/XML), or **CSV** (one row per item of the transformed list, nested fields as `customer.name` columns; comma, semicolon, pipe or tab) - e.g. a CSV file dropped in an SFTP folder |
-| The caller gets System B's answer | **translated** into the caller's format (or JSON / XML), optionally reshaped with a JMESPath mapping, or **as is** (System B's own body and content type) |
+| Target system receives | the transformed payload as is (JSON/XML), or **CSV** (one row per item of the transformed list, nested fields as `customer.name` columns; comma, semicolon, pipe or tab) - e.g. a CSV file dropped in an SFTP folder |
+| The source system gets the target system's answer | **translated** into the caller's format (or JSON / XML), optionally reshaped with a JMESPath mapping, or **as is** (the target system's own body and content type) |
 
 An API answers with its own response and HTTP status. A file, table or queue doesn't answer, so
 the caller gets a **delivery receipt** - `{status: DELIVERED, system, type, target, detail, format,
-transactionId}` - which can be translated like any answer. If System B can't be reached (after the
+transactionId}` - which can be translated like any answer. If the target system can't be reached (after the
 endpoint's retries) the caller gets 502.
 
-Messages from MQ or Kafka on this route are sent to System B in the background, and the converted
+Messages from MQ or Kafka on this route are sent to the target system in the background, and the converted
 response is stored on the transaction. Response headers: `X-Transaction-Id`, `X-Status`
 (`COMPLETED` or `RESPONDED`) and `X-Upstream-Status`.
 

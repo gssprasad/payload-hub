@@ -76,7 +76,7 @@ def transform(payload: str, input_format: str, expression: str, output_format: s
 
 
 def to_csv(payload: str, fmt: str, delimiter: str = ",") -> str:
-    """Rows for System B as CSV: a list of objects, the first list inside an object, or one object = one row.
+    """Rows for the target system as CSV: a list of objects, the first list inside an object, or one object = one row.
     Nested objects become dotted column names (customer.name)."""
     import csv
     import io

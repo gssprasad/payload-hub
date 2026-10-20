@@ -76,14 +76,14 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
 # ---------- forward to another API and reply ----------
 
 def _for_system_b(partner: dict, txn: dict) -> tuple[str, str]:
-    """The payload System B receives: the transformed output as is, or converted to CSV."""
+    """The payload the target system receives: the transformed output as is, or converted to CSV."""
     if partner.get("send_format") == "csv":
         return to_csv(txn["output_payload"], txn["output_format"], partner.get("csv_delimiter") or ","), "text/csv"
     return txn["output_payload"], "application/xml" if txn["output_format"] == "xml" else "application/json"
 
 
 async def forward(partner: dict, txn: dict) -> dict:
-    """Send a completed transaction's output to System B (the partner's reply connection) and turn System B's
+    """Send a completed transaction's output to the target system (the partner's reply connection) and turn the target system's
     answer into what the caller gets back. HTTP APIs answer with their own response; files, databases and
     queues answer with a delivery receipt. Returns {"ok", "status", "body", "format", "error"}."""
     txn_id = str(txn["id"])
@@ -128,7 +128,7 @@ async def forward(partner: dict, txn: dict) -> dict:
     if status is None:
         await db.record_event(txn_id, "FORWARD_FAILED", error)
         await db.set_response(txn_id, None, None)
-        return {"ok": False, "status": 502, "error": f"System B unreachable: {error}"}
+        return {"ok": False, "status": 502, "error": f"Target system unreachable: {error}"}
     ms = (time.perf_counter() - started) * 1000
     await db.record_event(txn_id, "FORWARDED", f"{where} → {'HTTP ' + str(status) if is_http else 'delivered'} "
                                                f"in {ms:.0f} ms")
@@ -136,12 +136,12 @@ async def forward(partner: dict, txn: dict) -> dict:
         converted, fmt = convert_response(body, ctype, partner["response_expression"], partner["response_format"],
                                           txn["input_format"])
     except TransformError as e:
-        await db.record_event(txn_id, "RESPONSE_FAILED", f"could not convert System B's response: {e}")
+        await db.record_event(txn_id, "RESPONSE_FAILED", f"could not convert the target system's response: {e}")
         await db.set_response(txn_id, body, status)
-        return {"ok": False, "status": 502, "error": f"Could not convert System B's response: {e}"}
+        return {"ok": False, "status": 502, "error": f"Could not convert the target system's response: {e}"}
     await db.set_response(txn_id, converted, status)
     await db.record_event(txn_id, "RESPONDED", f"{len(converted)} bytes of {fmt.upper()} for the caller "
-                                               f"(System B status {status})")
+                                               f"(target system status {status})")
     return {"ok": status < 400, "status": status, "body": converted, "format": fmt, "content_type": ctype}
 
 

@@ -42,7 +42,7 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
         kind = {"http": "API", "ftp": "file", "database": "table"}.get(c.get("type"), "queue")
         csv = " · CSV" if p.get("send_format") == "csv" else ""
         answer = "response" if c.get("type") == "http" else "receipt"
-        lines.append(node("api", f"🎯 System B: {c.get('name', p['reply_connection'])}\\n{kind} {path.lstrip('/')}{csv}", fill))
+        lines.append(node("api", f"🎯 Target system: {c.get('name', p['reply_connection'])}\\n{kind} {path.lstrip('/')}{csv}", fill))
         lines.append(f'"out" -> "api" [label="send"]; "api" -> "http" [style=dashed, color="#4f46e5", '
                      f'fontcolor="#4f46e5", label="{answer} as {fmt}", constraint=false];')
     else:
@@ -136,7 +136,7 @@ RESPONSE_FORMATS = {
     "input": "Translated into the caller's format",
     "json": "Translated into JSON",
     "xml": "Translated into XML",
-    "unchanged": "As is - exactly what System B answered",
+    "unchanged": "As is - exactly what the target system answered",
 }
 TARGET_LABEL = {"http": "Path (added to the API's base URL)", "ftp": "Folder", "database": "Table",
                 "kafka": "Topic", "rabbitmq": "Queue", "activemq": "Queue", "ibmmq": "Queue"}
@@ -151,16 +151,16 @@ def visible_endpoints(conns: dict, code: str) -> dict:
 
 def _route_form(p, conns, types):
     code = p["code"]
-    st.subheader("🔁 Route: caller → System B → caller")
-    st.caption("A partner (A) calls this partner's endpoint → the payload is transformed → sent to **System B** "
-               "(an API, a CSV/JSON/XML file on FTP/SFTP, a database table or a queue) → System B's answer goes back "
+    st.subheader("🔁 Route: Source → Target system → Source")
+    st.caption("The **source system** calls this partner's endpoint → the payload is transformed → sent to the **target system** "
+               "(an API, a CSV/JSON/XML file on FTP/SFTP, a database table or a queue) → the target system's answer goes back "
                "to A, translated or as is.")
     if pending := st.session_state.pop(f"route_pending_{code}", None):  # a just-created endpoint
         st.session_state[f"route_scope_{code}"] = "own"
         st.session_state[f"route_conn_{code}"] = pending
         st.session_state[f"reply_mode_{code}"] = "forward"
-    modes = {"transformed": "Reply at once with the transformed payload (no System B)",
-             "forward": "Send to System B and reply with its answer"}
+    modes = {"transformed": "Reply at once with the transformed payload (no target system)",
+             "forward": "Send to the target system and reply with its answer"}
     if f"reply_mode_{code}" not in st.session_state:
         st.session_state[f"reply_mode_{code}"] = p.get("reply_mode") or "transformed"
     mode = st.radio("When a caller sends a message", list(modes), format_func=modes.get, key=f"reply_mode_{code}")
@@ -178,7 +178,7 @@ def _route_form(p, conns, types):
         cur = p.get("reply_connection")
         st.session_state[f"route_scope_{code}"] = "own" if cur in own else "common" if cur in shared \
             else "own" if own else "common" if shared else "new"
-    scope = st.radio("System B endpoint", list(SCOPES), horizontal=True, key=f"route_scope_{code}",
+    scope = st.radio("Target system endpoint", list(SCOPES), horizontal=True, key=f"route_scope_{code}",
                      format_func=lambda x: SCOPES[x] + {"own": f" ({len(own)})", "common": f" ({len(shared)})",
                                                         "new": ""}[x])
     if scope == "new":
@@ -192,7 +192,7 @@ def _route_form(p, conns, types):
     key = f"route_conn_{code}"
     if st.session_state.get(key) not in choices:
         st.session_state[key] = p.get("reply_connection") if p.get("reply_connection") in choices else choices[0]
-    conn_id = st.selectbox("System B", choices, key=key, format_func=lambda c: f"{types[outs[c]['type']]['icon']} "
+    conn_id = st.selectbox("Target system", choices, key=key, format_func=lambda c: f"{types[outs[c]['type']]['icon']} "
                            f"{outs[c]['name']} · {common.connection_address(outs[c])}")
     c = outs[conn_id]
     t = c["type"]
@@ -224,7 +224,7 @@ def _route_form(p, conns, types):
         if t == "database":
             formats = {"output": "Rows (JSON fields → columns)"}
         cur_f = p.get("send_format") or "output"
-        send_format = f1.radio("System B receives", list(formats), list(formats).index(cur_f) if cur_f in formats else 0,
+        send_format = f1.radio("Target system receives", list(formats), list(formats).index(cur_f) if cur_f in formats else 0,
                                format_func=formats.get, horizontal=True,
                                help="CSV: one row per item of the transformed list (or one row for an object); "
                                     "nested fields become columns like customer.name.")
@@ -232,15 +232,15 @@ def _route_form(p, conns, types):
         delim = f2.selectbox("CSV separator", list(delims), list(delims).index(p.get("csv_delimiter") or ",")
                              if (p.get("csv_delimiter") or ",") in delims else 0, format_func=delims.get,
                              disabled=t == "database")
-        fmt = st.selectbox("The caller gets System B's answer", list(RESPONSE_FORMATS),
+        fmt = st.selectbox("The source system gets the target system's answer", list(RESPONSE_FORMATS),
                            list(RESPONSE_FORMATS).index(p.get("response_format") or "input"),
                            format_func=lambda f: RESPONSE_FORMATS[f].replace(
                                "the caller's format", f"the caller's format ({p['input_format'].upper()})"))
-        expr = st.text_area("Translate the answer (optional JMESPath mapping on System B's answer)",
+        expr = st.text_area("Translate the answer (optional JMESPath mapping on the target system's answer)",
                             p.get("response_expression") or "", height=90,
                             placeholder="e.g. {confirmation: {reference: reference, state: status}}")
         if t == "http":
-            st.caption("System B's HTTP status is passed back to the caller; if it can't be reached the caller gets 502. "
+            st.caption("The target system's HTTP status is passed back to the caller; if it can't be reached the caller gets 502. "
                        f"Retries follow the endpoint's policy ({common.retry_summary(c)}).")
         else:
             st.caption("A file, table or queue doesn't answer, so the caller gets a **delivery receipt** - "
@@ -264,7 +264,7 @@ def _set_owner(conn_id, owner):
 
 
 def _new_endpoint(p, types):
-    """Create a System B endpoint dedicated to this partner, without leaving the page."""
+    """Create a target system endpoint dedicated to this partner, without leaving the page."""
     from .connections import DB_PORTS, _fields_form
 
     code = p["code"]
@@ -272,7 +272,7 @@ def _new_endpoint(p, types):
              "rabbitmq": "🐇 RabbitMQ queue", "activemq": "📨 ActiveMQ queue", "ibmmq": "🏦 IBM MQ queue",
              "kafka": "🟧 Kafka topic"}
     kinds = {k: v for k, v in kinds.items() if k in types and types[k]["outbound"]}
-    t = st.selectbox("Kind of System B", list(kinds), format_func=kinds.get, key=f"newep_type_{code}")
+    t = st.selectbox("Kind of target system", list(kinds), format_func=kinds.get, key=f"newep_type_{code}")
     fixed, values = {}, {}
     if t == "ftp":
         proto = st.selectbox("Protocol", ["sftp", "ftp", "ftps"], key=f"newep_proto_{code}",

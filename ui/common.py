@@ -225,7 +225,7 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
         c = conns[p["reply_connection"]]
         http = c["type"] == "http"
         method = (p.get("reply_method") or c.get("config", {}).get("method") or "POST") + " " if http else ""
-        rows.append({"Direction": "🎯 System B (sync)",
+        rows.append({"Direction": "🎯 Target system (sync)",
                      "Type": f"{c['type'].upper()} ({c['name']}) · " + ("👤 dedicated" if c.get("owner_partner") else "🌍 common"),
                      "Address": method + connection_address(c, p.get("reply_path")),
                      "Details": ("sends CSV · " if p.get("send_format") == "csv" else "")
