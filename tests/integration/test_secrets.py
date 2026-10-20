@@ -109,3 +109,27 @@ def test_audit_says_what_changed(admin, receiver):
     assert "reply_mode: transformed → forward" in entry["detail"]
     assert f"reply_connection: — → {receiver}" in entry["detail"]
     assert "api_key" not in entry["detail"]
+
+
+def test_partner_api_keys_are_hashed_and_encrypted(admin, base_url):
+    import httpx
+
+    from .test_partner_flow import ORDER, make_partner
+
+    p = make_partner(admin, "Key Test Partner")
+    ((h, enc, hint),) = raw("SELECT api_key_hash, api_key_enc, api_key_hint FROM partners WHERE code = %s", p["code"])
+    assert p["api_key"] not in (h, enc) and enc.startswith("enc:v1:") and hint == f"{p['api_key'][:5]}…{p['api_key'][-4:]}"
+    assert "api_key_enc" not in admin.get(f"/api/partners/{p['code']}").json()
+    # readers see the hint, not the key
+    admin.post("/api/users", json={"username": "key-reader", "password": "reader-pass"})
+    with login(base_url, "key-reader", "reader-pass") as reader:
+        assert reader.get(f"/api/partners/{p['code']}").json()["api_key_hint"] == hint
+        assert reader.get(f"/api/partners/{p['code']}/api-key").status_code == 403
+
+    def call(key):
+        return httpx.post(f"{base_url}/inbound/{p['code']}", json=ORDER, headers={"X-API-Key": key}, timeout=60)
+
+    assert call(p["api_key"]).status_code == 200
+    new = admin.post(f"/api/partners/{p['code']}/api-key").json()["api_key"]
+    assert call(p["api_key"]).status_code == 401 and call(new).status_code == 200
+    assert any(e["action"] == "revealed api key" for e in admin.get("/api/audit", params={"object_type": "partner"}).json())

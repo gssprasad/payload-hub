@@ -118,7 +118,8 @@ def _http_endpoint(p):
     c1, c2 = st.columns([3, 2])
     c1.text_input("Endpoint URL", url, disabled=True, key=f"url_{code}")
     show = c2.toggle("Show API key", key=f"showkey_{code}", disabled=not common.can("write"), help="Needs write permission.")
-    c2.text_input("API key (header X-API-Key)", p["api_key"] if show and common.can("write") else "•" * 20, disabled=True, key=f"key_{code}_{show}")
+    shown = common.partner_key(code) if show and common.can("write") else p.get("api_key_hint") or "•" * 20
+    c2.text_input("API key (header X-API-Key)", shown, disabled=True, key=f"key_{code}_{show}")
     if c2.button("Rotate API key", key=f"rotate_{code}", disabled=not common.can("write"), help="Issue a new key; the old one stops working at once."):
         api("POST", f"/api/partners/{code}/api-key")
         st.toast("New API key issued", icon="🔑")
@@ -136,7 +137,7 @@ def _http_endpoint(p):
         if st.button("Send request", type="primary", key=f"try_send_{code}", disabled=not common.can("write")):
             try:
                 r = requests.post(url, data=payload.encode(), timeout=30, params={"wait": str(wait).lower()},
-                                  headers={"X-API-Key": p["api_key"], "Content-Type": ctype})
+                                  headers={"X-API-Key": common.partner_key(code), "Content-Type": ctype})
             except requests.RequestException as e:
                 st.error(f"Request failed: {e}")
                 return

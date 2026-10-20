@@ -89,7 +89,8 @@ def api_access_dialog(p):
              ("Authentication", "Header <code>X-API-Key</code>"),
              ("Wait for result", "default; returns 200 with the result, 422 on mapping errors"),
              ("Async", f"<code>?wait=false</code> → 202, then <code>GET {url}/transactions/&lt;id&gt;</code>")])
-        key = p["api_key"] if (reveal or (writer and st.toggle("Show API key", key=f"prof_key_{code}"))) else "•" * 24
+        key = common.partner_key(code) if (reveal or (writer and st.toggle("Show API key", key=f"prof_key_{code}"))) \
+            else "•" * 24
         st.code(key, language="text")
         st.code("\n".join([f'curl -X POST "{url}" \\', f'  -H "X-API-Key: {key if key[0] != "•" else "<api key>"}" \\',
                            f'  -H "Content-Type: {MIME[p["input_format"]]}" \\',

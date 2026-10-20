@@ -47,6 +47,8 @@ def test_database_from_an_older_version_is_upgraded(scratch_db):
     with psycopg.connect(scratch_db, autocommit=True) as conn:  # what an older Payload Hub created at start-up
         conn.execute(baseline.SCHEMA)
         conn.execute("INSERT INTO connections (id, name, type) VALUES ('kept', 'Kept', 'http')")
+        conn.execute("INSERT INTO partners (code, name, input_format, output_format, topic_in, topic_out, topic_dlq, queue_mode, "
+                     "api_key) VALUES ('old', 'Old', 'json', 'json', 'a', 'b', 'c', 'shared', 'ph_oldplaintextkey123')")
     pending = migrate.pending()
     assert migrate.current() is None and pending[:2] == ["0001_baseline", "0002_alerts"] and pending[-1] == migrate.head()
     migrate.upgrade()
@@ -54,6 +56,15 @@ def test_database_from_an_older_version_is_upgraded(scratch_db):
     assert {"alert_rules", "alert_channels", "alert_events"} <= tables(scratch_db)
     with psycopg.connect(scratch_db) as conn:
         assert conn.execute("SELECT name FROM connections").fetchall() == [("Kept",)]
+        import hashlib
+
+        from app import vault
+
+        ((h, enc),) = conn.execute("SELECT api_key_hash, api_key_enc FROM partners").fetchall()
+        assert h == hashlib.sha256(b"ph_oldplaintextkey123").hexdigest()
+        assert vault.unseal(enc) == "ph_oldplaintextkey123"
+        cols = {r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'partners'")}
+        assert "api_key" not in cols
 
 
 def test_downgrade_and_upgrade_again(scratch_db):

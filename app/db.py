@@ -16,7 +16,7 @@ USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, cre
 
 PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_format", "sample_input",
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
-                  "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
+                  "topic_dlq", "active", "api_key_hash", "api_key_enc", "api_key_hint", "inbound_connection", "inbound_source", "outbound_connection",
                   "outbound_target", "reply_mode", "reply_connection", "reply_path", "response_format",
                   "response_expression", "store_enabled", "store_table", "store_source", "store_row_path",
                   "store_columns", "store_connection", "reply_method", "send_format", "csv_delimiter")
@@ -543,7 +543,7 @@ async def delete_session(token_hash):
 # Columns never shown in the read-only system tables view.
 SYSTEM_HIDDEN = {"users": {"password_hash"}, "sessions": {"token_hash"}, "connections": {"secret"},
                  "secrets": {"value_enc"}, "ai_providers": {"api_key_enc"},
-                 "partners": {"api_key"}, "partner_documents": {"content", "text"}}
+                 "partners": {"api_key_hash", "api_key_enc"}, "partner_documents": {"content", "text"}}
 
 
 async def system_tables():

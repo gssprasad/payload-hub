@@ -109,6 +109,8 @@ async def check() -> dict:
     unreadable, total = [], 0
     async with db.pool.connection() as conn:
         for sql, label in (("SELECT id AS name, secret AS v FROM connections WHERE secret LIKE 'enc:v1:%%'", "connection"),
+                           ("SELECT code AS name, api_key_enc AS v FROM partners WHERE api_key_enc IS NOT NULL",
+                            "partner API key"),
                            ("SELECT alias AS name, value_enc AS v FROM secrets", "secret"),
                            ("SELECT provider AS name, api_key_enc AS v FROM ai_providers WHERE api_key_enc IS NOT NULL",
                             "AI key")):
@@ -147,6 +149,10 @@ async def rotate_master_key(username: str) -> dict:
         for r in await (await conn.execute("SELECT id, secret FROM connections WHERE secret LIKE 'enc:v1:%%'")).fetchall():
             await conn.execute("UPDATE connections SET secret = %s WHERE id = %s",
                                (PREFIX + again(r["secret"][len(PREFIX):]), r["id"]))
+            count += 1
+        for r in await (await conn.execute("SELECT code, api_key_enc FROM partners WHERE api_key_enc IS NOT NULL")).fetchall():
+            await conn.execute("UPDATE partners SET api_key_enc = %s WHERE code = %s",
+                               (PREFIX + again(r["api_key_enc"][len(PREFIX):]), r["code"]))
             count += 1
         for r in await (await conn.execute("SELECT alias, value_enc FROM secrets")).fetchall():
             await conn.execute("UPDATE secrets SET value_enc = %s WHERE alias = %s", (again(r["value_enc"]), r["alias"]))

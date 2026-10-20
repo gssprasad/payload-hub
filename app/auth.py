@@ -127,6 +127,8 @@ def required_permission(method: str, path: str) -> str:
         return "admin"  # ports read folders on the server
     if path.startswith("/api/auth/"):
         return "signed_in"
+    if method == "GET" and path.startswith("/api/partners/") and path.endswith("/api-key"):
+        return "write"  # the partner's key itself
     if method in ("GET", "HEAD", "OPTIONS"):
         return "read"
     if method == "DELETE":

@@ -50,6 +50,11 @@ def flush_cookie():
               + (location.protocol === "https:" ? "; Secure" : "");</script>""", unsafe_allow_javascript=True)
 
 
+def partner_key(code: str) -> str:
+    """A partner's API key (needs write permission; each look is recorded in the audit log)."""
+    return api("GET", f"/api/partners/{code}/api-key")["api_key"] or ""
+
+
 def client_ip() -> str | None:
     try:
         ip = st.context.ip_address

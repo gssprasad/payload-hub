@@ -87,7 +87,8 @@ def _master_key(key, check):
     if check["unreadable"]:
         st.error("These can't be decrypted with the current key and must be entered again: "
                  + ", ".join(check["unreadable"]))
-    st.caption("Connection passwords, AI provider keys and named secrets are all encrypted with this key.")
+    st.caption("Connection passwords, partner API keys, AI provider keys and named secrets are all encrypted with "
+               "this key.")
     if not key["rotatable"]:
         st.info("The key comes from the PAYLOAD_HUB_SECRET_KEY environment variable - rotate it where that is set.")
         return

@@ -17,7 +17,8 @@ def make_partner(admin, name, output_format="json", queue_mode="shared", express
                                           "expression": expression, "queue_mode": queue_mode,
                                           "sample_input": json.dumps(ORDER)})
     assert r.status_code == 201, r.text
-    return admin.get(f"/api/partners/{r.json()['code']}").json()
+    code = r.json()["code"]
+    return {**admin.get(f"/api/partners/{code}").json(), "api_key": admin.get(f"/api/partners/{code}/api-key").json()["api_key"]}
 
 
 def call(base_url, partner, body=ORDER, key=None):

@@ -93,7 +93,7 @@ async def require_login(request: Request, call_next):
 _SNAPSHOTS = {"partners": lambda i: db.get_partner(i), "connections": lambda i: db.get_connection(i),
               "ports": lambda i: db.get_port(i), "schedules": lambda i: db.get_schedule(i),
               "workflows": lambda i: db.get_workflow(i), "users": lambda i: db.get_user(i)}
-_NOT_DIFFED = {"updated_at", "created_at", "api_key", "password_hash", "secret", "has_secret", "last_poll_at",
+_NOT_DIFFED = {"updated_at", "created_at", "api_key_hash", "api_key_enc", "password_hash", "secret", "has_secret", "last_poll_at",
                "last_item", "last_error", "ok_count", "fail_count", "next_run_at", "last_run_at", "last_status",
                "last_detail", "run_count", "running", "last_test_at", "last_test_ok", "last_test_detail",
                "last_login_at", "used_by"}
@@ -586,7 +586,7 @@ async def onboard_partner(req: PartnerIn):
             raise HTTPException(422, "Forwarding needs an HTTP connection for the target API.")
     fields["reply_connection"] = req.reply_connection if req.reply_mode == "forward" else None
     fields["mapping_source"] = "manual" if req.expression else None
-    fields["api_key"] = _new_api_key()
+    fields.update(_key_fields(_new_api_key()))
     await _check_adapters(req.inbound_connection, req.inbound_source, req.outbound_connection)
     fields.update(inbound_connection=req.inbound_connection or None, inbound_source=req.inbound_source or None,
                   outbound_connection=req.outbound_connection or None, outbound_target=req.outbound_target or None)
@@ -600,7 +600,7 @@ async def onboard_partner(req: PartnerIn):
 async def partner(code: str):
     p = await _partner_or_404(code)
     p["documents"] = await db.list_partner_documents(code)
-    return p
+    return {k: v for k, v in p.items() if k not in ("api_key_hash", "api_key_enc")}
 
 
 @app.put("/api/partners/{code}")
@@ -726,6 +726,14 @@ async def partner_agent(code: str, req: PartnerAgentRequest):
 
 def _new_api_key() -> str:
     return "ph_" + secrets.token_urlsafe(24)
+
+
+def _key_fields(key: str) -> dict:
+    """A partner API key is stored as a hash (to check calls) and encrypted (to show to people who may write)."""
+    import hashlib
+
+    return {"api_key_hash": hashlib.sha256(key.encode()).hexdigest(), "api_key_enc": vault.seal(key),
+            "api_key_hint": f"{key[:5]}…{key[-4:]}"}
 
 
 async def _check_adapters(inbound_connection, inbound_source, outbound_connection):
@@ -1645,8 +1653,17 @@ async def design_alter(target: str, name: str, req: AlterIn, request: Request):
 @app.post("/api/partners/{code}/api-key")
 async def rotate_partner_api_key(code: str):
     await _partner_or_404(code)
-    await db.update_partner(code, api_key=_new_api_key())
-    return {"api_key": (await db.get_partner(code))["api_key"]}
+    key = _new_api_key()
+    await db.update_partner(code, **_key_fields(key))
+    return {"api_key": key}
+
+
+@app.get("/api/partners/{code}/api-key")
+async def partner_api_key(code: str, request: Request):
+    """The partner's API key itself - needs write permission, and is recorded in the audit log."""
+    p = await _partner_or_404(code)
+    await db.audit(request.state.user["username"], "revealed api key", "partner", code)
+    return {"api_key": vault.unseal(p.get("api_key_enc"))}
 
 
 # ---------- connections (adapters) ----------
@@ -1789,8 +1806,11 @@ async def adapters_status():
 # ---------- partner HTTP endpoints ----------
 
 async def _authorised_partner(code: str, api_key: str | None):
+    import hashlib
+
     p = await db.get_partner(code)
-    if not p or not api_key or not secrets.compare_digest(api_key, p["api_key"] or ""):
+    offered = hashlib.sha256((api_key or "").encode()).hexdigest()
+    if not p or not api_key or not secrets.compare_digest(offered, p.get("api_key_hash") or ""):
         raise HTTPException(401, "Unknown partner or wrong API key.", headers={"WWW-Authenticate": "X-API-Key"})
     return p
 
