@@ -8,23 +8,33 @@ from . import common
 from .common import ApiError, api
 
 STEP_TYPES = {
-    "db_query": "🗄️ Database query",
-    "db_update": "✏️ Database update",
+    "db": "🧱 DB connector",
+    "db_query": "🗄️ SQL query",
+    "db_update": "✏️ SQL update",
     "api_call": "🌐 API call",
     "transform": "🔀 Transform",
-    "condition": "❓ Condition",
+    "branch": "🔱 Branch (if / else)",
+    "condition": "❓ Stop unless",
     "pdf": "📄 Create PDF",
     "deliver": "📤 Deliver file",
 }
 STATUS = {"COMPLETED": "✅", "FAILED": "❌", "STOPPED": "⏹️", "RUNNING": "⏳", "OK": "✅", "SKIPPED": "⏭️",
-          "REUSED": "♻️"}
+          "REUSED": "♻️", "FAILED_CONTINUED": "⚠️"}
+NO_RESULT = ("condition", "deliver", "db_update", "branch")
+RETRYABLE = ("db", "db_query", "db_update", "api_call", "pdf", "deliver")
+DB_OPS = {"select_one": "🔎 Get one row", "select_all": "📋 Get rows", "insert": "➕ Insert a row",
+          "update": "✏️ Update rows", "delete": "🗑️ Delete rows"}
+WHERE_OPS = ["=", "!=", ">", ">=", "<", "<=", "like", "in", "is null", "is not null"]
 NEW_STEP = {
+    "db": {"connection": "builtin", "table": "", "operation": "select_one", "columns": [], "where": [], "values": {},
+           "required": True, "limit": 100},
     "db_query": {"connection": "builtin", "mode": "one", "required": True, "sql": "SELECT * FROM my_table WHERE id = :id",
                  "params": {"id": "{{ trigger.id }}"}},
     "db_update": {"connection": "builtin", "sql": "UPDATE my_table SET status = 'DONE' WHERE id = :id",
                   "params": {"id": "{{ trigger.id }}"}},
     "api_call": {"method": "GET", "path": "", "content_type": "application/json", "fail_on_error": True},
     "transform": {"expression": "{total: sum(lines[].amount)}"},
+    "branch": {"expression": "order.total > `1000`", "then": [], "else": []},
     "condition": {"expression": "length(lines) > `0`", "message": "Nothing to do."},
     "pdf": {"filename": "document_{{ trigger.id }}.pdf",
             "template": "<html><body><h1>Document</h1><p>{{ trigger }}</p></body></html>"},
@@ -143,8 +153,9 @@ def _input_hint(wf):
     import re
 
     names = set()
-    for s in wf["steps"]:
-        for text in [s.get("sql", ""), s.get("path", ""), json.dumps(s.get("params", {})), s.get("template", "")]:
+    for s in _walk(wf["steps"]):
+        for text in [s.get("sql", ""), s.get("path", ""), json.dumps(s.get("params", {})), s.get("template", ""),
+                     json.dumps(s.get("where", [])), json.dumps(s.get("values", {})), s.get("body", "")]:
             names.update(re.findall(r"trigger\.([A-Za-z_][A-Za-z0-9_]*)", text or ""))
     runs = api("GET", f"/api/workflows/{wf['id']}/runs", params={"limit": 1})
     last = api("GET", f"/api/workflow-runs/{runs[0]['id']}")["input"] if runs else {}
@@ -157,14 +168,19 @@ def _show_run(run):
     st.markdown(f"#### {icon} {run['status']} · {run['duration_ms']} ms{dry}")
     if run.get("error"):
         (st.warning if run["status"] == "STOPPED" else st.error)(run["error"])
-    st.dataframe([{"": STATUS.get(s["status"], ""), "Step": s["label"], "Status": s["status"],
-                   "Saved as": s.get("save_as") or "", "ms": s.get("ms"), "Error": s.get("error", "")}
+    st.dataframe([{"": STATUS.get(s["status"], ""), "#": s.get("path") or str(s["index"] + 1),
+                   "Step": "    " * s.get("depth", 0) + ("↳ " if s.get("depth") else "") + s["label"],
+                   "Status": s["status"], "Tries": s.get("attempts"), "Saved as": s.get("save_as") or "",
+                   "ms": s.get("ms"), "Error": s.get("error", "")}
                   for s in run["steps_log"]], hide_index=True, width="stretch")
     for s in run["steps_log"]:
-        if s.get("output") is not None:
-            with st.expander(f"{STATUS.get(s['status'], '')} {s['label']} → `{s.get('save_as') or '-'}`"):
-                st.code(s["output"] if isinstance(s["output"], str) else json.dumps(s["output"], indent=1),
-                        language="json")
+        if s.get("output") is not None or s.get("retries"):
+            with st.expander(f"{STATUS.get(s['status'], '')} {s.get('path') or ''} {s['label']} → `{s.get('save_as') or '-'}`"):
+                for r in s.get("retries") or []:
+                    st.caption(f"🔁 {r}")
+                if s.get("output") is not None:
+                    st.code(s["output"] if isinstance(s["output"], str) else json.dumps(s["output"], indent=1),
+                            language="json")
     for f in run.get("files", []):
         content = api("GET", f"/api/workflow-files/{f['id']}")
         st.download_button(f"⬇️ Download {f['filename']} ({f['size'] / 1024:.1f} KB)", content,
@@ -188,7 +204,68 @@ def _show_pdf(content: bytes):
         st.caption("Inline preview unavailable here - use the download button.")
 
 
-# ---------- steps ----------
+# ---------- steps: the visual builder ----------
+
+def _uid() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:8]
+
+
+def _walk(steps):
+    """Every step, including the steps inside branches."""
+    for x in steps or []:
+        yield x
+        if x.get("type") == "branch":
+            yield from _walk(x.get("then"))
+            yield from _walk(x.get("else"))
+
+
+def _with_uids(steps):
+    # each step gets a stable id for its widgets, so moving steps never mixes up their fields
+    out = []
+    for x in steps or []:
+        x = {**x, "_uid": _uid()}
+        if x["type"] == "branch":
+            x["then"], x["else"] = _with_uids(x.get("then")), _with_uids(x.get("else"))
+        out.append(x)
+    return out
+
+
+def _clean(steps):
+    out = []
+    for x in steps:
+        x = {k: v for k, v in x.items() if not k.startswith("_")}
+        if x["type"] == "branch":
+            x["then"], x["else"] = _clean(x.get("then") or []), _clean(x.get("else") or [])
+        out.append(x)
+    return out
+
+
+def _free_name(base: str, all_steps) -> str:
+    used = {x.get("save_as") for x in _walk(all_steps)}
+    name, n = base, 2
+    while name in used:
+        name, n = f"{base}_{n}", n + 1
+    return name
+
+
+def _new_step(t: str, all_steps) -> dict:
+    step = {"type": t, "label": STEP_TYPES[t].split(" ", 1)[1], **json.loads(json.dumps(NEW_STEP[t])),
+            "save_as": None if t in NO_RESULT else _free_name(t, all_steps), "_uid": _uid()}
+    st.session_state[f"open_{step['_uid']}"] = True  # new steps open for editing
+    return step
+
+
+def _copy(step: dict, all_steps) -> dict:
+    new = _with_uids([json.loads(json.dumps(_clean([step])[0]))])[0]
+    for x in _walk([new]):
+        if x.get("save_as"):
+            x["save_as"] = _free_name(x["save_as"], all_steps)
+            all_steps = [*all_steps, x]
+    new["label"] = (new.get("label") or "") + " (copy)"
+    return new
+
 
 def _connections():
     conns = api("GET", "/api/connections")
@@ -198,69 +275,212 @@ def _connections():
     return dbs, https, outs
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _tables(conn: str, session_key: str | None) -> list[dict]:  # cached per signed-in session
+    try:
+        return api("GET", "/api/data/tables" if conn == "builtin" else f"/api/connections/{conn}/tables")
+    except ApiError:
+        return []
+
+
+def _diagram(steps) -> str:
+    """Graphviz flow chart of the steps, with branches drawn as diamonds."""
+    out = ['digraph { rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.3;',
+           'node [shape=box style="rounded,filled" fillcolor="#eef2ff" color="#6366f1" fontname="Helvetica" '
+           'fontsize=11 margin="0.15,0.06"]; edge [color="#94a3b8" fontname="Helvetica" fontsize=10 arrowsize=0.7];',
+           'start [label="▶ trigger" shape=oval fillcolor="#dcfce7" color="#16a34a"];']
+    seq = [0]
+
+    def esc(text):
+        return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+    def edge(a, b, label=None):
+        out.append(f'{a} -> {b}' + (f' [label="{label}"]' if label else '') + ';')
+
+    def chain(items, prev, first_label=None, prefix=""):
+        for i, x in enumerate(items):
+            seq[0] += 1
+            n, num = f"n{seq[0]}", f"{prefix}{i + 1}"
+            extra = []
+            if (x.get("retry_attempts") or 1) > 1:
+                extra.append(f"🔁 {x['retry_attempts']} tries")
+            if x.get("on_error") == "continue":
+                extra.append("↷ continues on error")
+            if x.get("type") == "db":
+                extra.append(f"{DB_OPS.get(x.get('operation'), '')[2:]} · {x.get('table') or '?'}")
+            lines = [f"{num}. {x.get('label') or STEP_TYPES[x['type']]}", *extra]
+            attrs = 'label="' + "\\n".join(esc(line) for line in lines) + '"'
+            if x["type"] == "branch":
+                attrs += ' shape=diamond fillcolor="#fef3c7" color="#d97706"'
+            elif x["type"] == "condition":
+                attrs += ' shape=hexagon fillcolor="#fee2e2" color="#dc2626"'
+            if x.get("disabled"):
+                attrs += ' style="rounded,dashed" fillcolor="#f1f5f9" fontcolor="#94a3b8"'
+            out.append(f"{n} [{attrs}];")
+            for p in prev:
+                edge(p, n, first_label)
+            first_label = None
+            if x["type"] == "branch":
+                seq[0] += 1
+                join = f"j{seq[0]}"
+                out.append(f'{join} [shape=point width=0.08 color="#94a3b8"];')
+                for side, lab in (("then", "yes"), ("else", "no")):
+                    if x.get(side):
+                        for e in chain(x[side], [n], lab, f"{num}{'✓' if side == 'then' else '✗'}."):
+                            edge(e, join)
+                    else:
+                        edge(n, join, lab)
+                prev = [join]
+            else:
+                prev = [n]
+        return prev
+
+    for e in chain(steps, ["start"]):
+        edge(e, "finish")
+    out.append('finish [label="■ done" shape=oval fillcolor="#e2e8f0" color="#64748b"];}')
+    return "\n".join(out)
+
+
 def _steps(wf):
     key = f"wf_steps_{wf['id']}"
     if key not in st.session_state or st.session_state.get(f"{key}_ver") != wf["updated_at"]:
-        import uuid
-
-        # each step gets a stable id for its widgets, so moving steps never mixes up their fields
-        st.session_state[key] = [{**x, "_uid": uuid.uuid4().hex[:8]} for x in json.loads(json.dumps(wf["steps"]))]
+        st.session_state[key] = _with_uids(json.loads(json.dumps(wf["steps"])))
         st.session_state[f"{key}_ver"] = wf["updated_at"]
     steps = st.session_state[key]
-    dbs, https, outs = _connections()
-    st.caption("Values from earlier steps: `{{ trigger.order_id }}` (the starting record) or `{{ order.customer_id }}` "
-               "(a step saved as *order*). SQL uses `:name` placeholders filled from Parameters - values are never "
-               "pasted into the SQL text. Transform and Condition use JMESPath over all results.")
-    for i, s in enumerate(steps):
-        title = f"**{i + 1}. {s.get('label') or STEP_TYPES[s['type']]}** · {STEP_TYPES[s['type']]}" \
-                + (f" → `{s['save_as']}`" if s.get("save_as") else "")
-        with st.expander(title, expanded=False):
-            uid = s["_uid"]
-            _step_form(wf["id"], uid, s, steps, dbs, https, outs)
-            b = st.columns(4)
-            if b[0].button("⬆️ Up", key=f"up_{uid}", disabled=i == 0):
-                steps[i - 1], steps[i] = steps[i], steps[i - 1]
-                st.rerun()
-            if b[1].button("⬇️ Down", key=f"down_{uid}", disabled=i == len(steps) - 1):
-                steps[i + 1], steps[i] = steps[i], steps[i + 1]
-                st.rerun()
-            if b[2].button("🗑️ Remove", key=f"rm_{uid}"):
-                steps.pop(i)
-                st.rerun()
-    a1, a2 = st.columns([2, 1], vertical_alignment="bottom")
-    new_type = a1.selectbox("Add a step", list(STEP_TYPES), format_func=STEP_TYPES.get, key=f"add_type_{wf['id']}")
-    if a2.button("➕ Add step", key=f"add_{wf['id']}", width="stretch"):
-        base = json.loads(json.dumps(NEW_STEP[new_type]))
-        used = {s.get("save_as") for s in steps}
-        name = new_type if new_type not in ("condition", "deliver", "db_update") else None
-        while name and name in used:
-            name += "_2"
-        import uuid
+    ctx = {"wf_id": wf["id"], "all": steps, "conns": _connections(), "write": common.can("write")}
+    saved = _clean(steps) == json.loads(json.dumps(wf["steps"]))
 
-        steps.append({"type": new_type, "label": STEP_TYPES[new_type][2:], "save_as": name, **base,
-                      "_uid": uuid.uuid4().hex[:8]})
-        st.rerun()
+    view = st.segmented_control("View", ["🧩 Builder", "🗺️ Flow diagram", "🧾 JSON"], default="🧩 Builder",
+                                key=f"wf_view_{wf['id']}", label_visibility="collapsed") or "🧩 Builder"
+    if view == "🗺️ Flow diagram":
+        st.graphviz_chart(_diagram(steps), width="content")
+        st.caption("Diamonds are branches (yes / no paths), red hexagons stop the run, dashed steps are switched off.")
+    elif view == "🧾 JSON":
+        st.code(json.dumps(_clean(steps), indent=2), language="json")
+    else:
+        st.caption("Values from earlier steps: `{{ trigger.order_id }}` (the starting record) or `{{ order.customer_id }}` "
+                   "(a step saved as *order*). Branches and Transform use JMESPath over all results, e.g. "
+                   "``order.total > `1000` ``.")
+        if not steps:
+            st.info("No steps yet - pick one from the palette below to start.")
+        _step_list(steps, ctx, "")
+        st.markdown("**➕ Add a step**")
+        _palette(steps, ctx, f"top_{wf['id']}")
+
     st.divider()
-    s1, s2 = st.columns(2)
-    if s1.button("💾 Save workflow", type="primary", disabled=not common.can("write"), key=f"save_{wf['id']}"):
+    s1, s2, s3 = st.columns([1, 1, 2], vertical_alignment="center")
+    if s1.button("💾 Save workflow", type="primary", disabled=not ctx["write"] or saved, key=f"save_{wf['id']}"):
         body = {k: wf[k] for k in ("name", "description", "trigger_type", "trigger_config", "active")}
         try:
-            api("PUT", f"/api/workflows/{wf['id']}",
-                json={**body, "steps": [{k: v for k, v in x.items() if k != "_uid"} for x in steps]})
+            api("PUT", f"/api/workflows/{wf['id']}", json={**body, "steps": _clean(steps)})
         except ApiError as e:
             st.error(str(e))
             return
         st.toast("Workflow saved", icon="💾")
         st.rerun()
-    if s2.button("↩️ Discard changes", key=f"discard_{wf['id']}"):
+    if s2.button("↩️ Discard changes", key=f"discard_{wf['id']}", disabled=saved):
         st.session_state.pop(key, None)
         st.rerun()
+    s3.caption("✅ All changes saved" if saved else "✏️ Unsaved changes")
     with st.expander("Danger zone"):
         if st.checkbox(f"I want to delete the workflow '{wf['name']}' and its run history", key=f"del_ok_{wf['id']}") \
                 and st.button("Delete workflow", key=f"del_{wf['id']}", disabled=not common.can("delete")):
             api("DELETE", f"/api/workflows/{wf['id']}")
             st.session_state.pop("wf_pick", None)
             st.rerun()
+
+
+def _palette(target: list, ctx, key: str, compact: bool = False):
+    """Buttons (or a compact picker inside branches) that append a new step to `target`."""
+    if compact:
+        a1, a2 = st.columns([3, 1], vertical_alignment="bottom")
+        t = a1.selectbox("Add a step here", list(STEP_TYPES), format_func=STEP_TYPES.get, key=f"pal_{key}",
+                         label_visibility="collapsed")
+        if a2.button("➕ Add", key=f"paladd_{key}", width="stretch"):
+            target.append(_new_step(t, ctx["all"]))
+            st.rerun()
+        return
+    cols = st.columns(5)
+    for i, t in enumerate(STEP_TYPES):
+        if cols[i % 5].button(STEP_TYPES[t], key=f"pal_{key}_{t}", width="stretch"):
+            target.append(_new_step(t, ctx["all"]))
+            st.rerun()
+
+
+def _step_list(steps: list, ctx, prefix: str):
+    for i, s in enumerate(steps):
+        _card(steps, i, s, ctx, f"{prefix}{i + 1}")
+
+
+def _card(steps: list, i: int, s: dict, ctx, num: str):
+    uid, t = s["_uid"], s["type"]
+    k = f"{ctx['wf_id']}_{uid}"
+    with st.container(border=True):
+        badges = []
+        if s.get("disabled"):
+            badges.append("⏸️ *switched off*")
+        if (s.get("retry_attempts") or 1) > 1:
+            badges.append(f"🔁 {s['retry_attempts']} tries")
+        if s.get("on_error") == "continue":
+            badges.append("↷ continues on error")
+        if t == "db" and s.get("table"):
+            badges.append(f"`{DB_OPS.get(s.get('operation'), '')[2:]}` on `{s['table']}`")
+        if t == "branch":
+            badges.append(f"if `{s.get('expression', '')}`")
+        h1, h2 = st.columns([6, 1], vertical_alignment="center")
+        h1.markdown(f"**{num}. {s.get('label') or STEP_TYPES[t]}** · {STEP_TYPES[t]}"
+                    + (f" → `{s['save_as']}`" if s.get("save_as") else "")
+                    + ("  \n" + " · ".join(badges) if badges else ""))
+        editing = h2.toggle("Edit", key=f"open_{uid}")
+        if editing:
+            _step_form(ctx, k, s)
+            if t in RETRYABLE:
+                _retry_form(k, s)
+        b = st.columns(5)
+        if b[0].button("⬆️", key=f"up_{uid}", disabled=i == 0, help="Move up", width="stretch"):
+            steps[i - 1], steps[i] = steps[i], steps[i - 1]
+            st.rerun()
+        if b[1].button("⬇️", key=f"down_{uid}", disabled=i == len(steps) - 1, help="Move down", width="stretch"):
+            steps[i + 1], steps[i] = steps[i], steps[i + 1]
+            st.rerun()
+        if b[2].button("⧉", key=f"dup_{uid}", help="Duplicate", width="stretch"):
+            steps.insert(i + 1, _copy(s, ctx["all"]))
+            st.rerun()
+        if b[3].button("▶️" if s.get("disabled") else "⏸️", key=f"off_{uid}", width="stretch",
+                       help="Switch on" if s.get("disabled") else "Switch off (skipped when the workflow runs)"):
+            s["disabled"] = not s.get("disabled")
+            st.rerun()
+        if b[4].button("🗑️", key=f"rm_{uid}", help="Remove", width="stretch"):
+            steps.pop(i)
+            st.rerun()
+        if t == "branch":
+            for side, title in (("then", "✅ **Yes** - when the condition is true"),
+                                ("else", "❌ **No** - otherwise")):
+                s.setdefault(side, [])
+                with st.container(border=True):
+                    st.markdown(title)
+                    if not s[side]:
+                        st.caption("No steps - the run carries on after the branch.")
+                    _step_list(s[side], ctx, f"{num}{'✓' if side == 'then' else '✗'}.")
+                    _palette(s[side], ctx, f"{uid}_{side}", compact=True)
+
+
+def _retry_form(k: str, s: dict):
+    st.markdown("**🔁 If this step fails**")
+    r = st.columns(2, vertical_alignment="bottom") + st.columns(2, vertical_alignment="bottom")
+    s["retry_attempts"] = r[0].number_input("Attempts", 1, 10, int(s.get("retry_attempts") or 1), key=f"ra_{k}",
+                                            help="1 = no retry")
+    retry = s["retry_attempts"] > 1
+    s["retry_delay"] = r[1].number_input("Wait (seconds)", 0, 3600, int(s.get("retry_delay") or 5), key=f"rd_{k}",
+                                         disabled=not retry)
+    s["retry_backoff"] = r[2].toggle("Double the wait each time", s.get("retry_backoff", True), key=f"rb_{k}",
+                                     disabled=not retry)
+    s["on_error"] = r[3].selectbox("Then", ["stop", "continue"], ["stop", "continue"].index(s.get("on_error") or "stop"),
+                                   key=f"oe_{k}", format_func={"stop": "⛔ Stop the run",
+                                                               "continue": "↷ Carry on (result = null)"}.get)
+    if retry:
+        waits = [s["retry_delay"] * (2 ** n if s["retry_backoff"] else 1) for n in range(s["retry_attempts"] - 1)]
+        st.caption("Waits between tries: " + ", ".join(f"{w} s" for w in waits))
 
 
 def _params_text(params: dict) -> str:
@@ -285,15 +505,18 @@ def _pick(label, options: dict, current, key):
     return st.selectbox(label, keys, keys.index(current) if current in keys else 0, format_func=options.get, key=key)
 
 
-def _step_form(wf_id, uid, s, steps, dbs, https, outs):
-    k = f"{wf_id}_{uid}"
+def _step_form(ctx, k, s):
+    dbs, https, outs = ctx["conns"]
+    wf_id, t = ctx["wf_id"], s["type"]
     c1, c2 = st.columns(2)
     s["label"] = c1.text_input("Label", s.get("label", ""), key=f"label_{k}")
-    if s["type"] not in ("condition", "deliver", "db_update"):
-        s["save_as"] = c2.text_input("Save result as", s.get("save_as") or "", key=f"save_as_{k}",
-                                     help="Later steps refer to it as {{ name.field }}")
-    t = s["type"]
-    if t in ("db_query", "db_update"):
+    if t not in NO_RESULT:
+        optional = t == "db" and s.get("operation") in ("insert", "update", "delete")
+        s["save_as"] = c2.text_input("Save result as" + (" (optional)" if optional else ""), s.get("save_as") or "",
+                                     key=f"save_as_{k}", help="Later steps refer to it as {{ name.field }}") or None
+    if t == "db":
+        _db_form(k, s, dbs)
+    elif t in ("db_query", "db_update"):
         s["connection"] = _pick("Database", dbs, s.get("connection"), f"conn_{k}")
         if t == "db_query":
             m1, m2 = st.columns(2)
@@ -305,22 +528,30 @@ def _step_form(wf_id, uid, s, steps, dbs, https, outs):
         s["params"] = _parse_params(st.text_area("Parameters (one per line: name = value)", _params_text(s.get("params")),
                                                  height=70, key=f"params_{k}",
                                                  help="e.g. order_id = {{ trigger.order_id }}"))
+        st.caption("SQL uses `:name` placeholders filled from Parameters - values are never pasted into the SQL text. "
+                   "Prefer the 🧱 DB connector if you don't want to write SQL.")
     elif t == "api_call":
         s["connection"] = _pick("API (HTTP connection)", https, s.get("connection"), f"conn_{k}")
         m1, m2 = st.columns([1, 3])
-        s["method"] = m1.selectbox("Method", ["GET", "POST", "PUT", "PATCH", "DELETE"],
-                                   ["GET", "POST", "PUT", "PATCH", "DELETE"].index(s.get("method") or "GET"), key=f"method_{k}")
+        methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        s["method"] = m1.selectbox("Method", methods, methods.index(s.get("method") or "GET"), key=f"method_{k}")
         s["path"] = m2.text_input("Path", s.get("path", ""), key=f"path_{k}", placeholder="customers/{{ order.customer_id }}")
         if s["method"] != "GET":
             s["body"] = st.text_area("Body (template)", s.get("body", ""), height=90, key=f"body_{k}",
                                      placeholder='{"orderId": "{{ order.order_id }}"}')
-            s["content_type"] = st.selectbox("Content type", ["application/json", "application/xml", "text/plain"],
-                                             key=f"ctype_{k}")
-        s["fail_on_error"] = st.toggle("Fail the run on HTTP 4xx/5xx", s.get("fail_on_error", True), key=f"foe_{k}")
+            types = ["application/json", "application/xml", "text/plain"]
+            s["content_type"] = st.selectbox("Content type", types, types.index(s.get("content_type") or types[0])
+                                             if s.get("content_type") in types else 0, key=f"ctype_{k}")
+        s["fail_on_error"] = st.toggle("Fail the step on HTTP 4xx/5xx", s.get("fail_on_error", True), key=f"foe_{k}")
         st.caption("The result is `{status, data}` - e.g. `{{ " + (s.get("save_as") or "name") + ".data.field }}`. "
-                   "The connection's retry policy applies.")
+                   "The connection's own retry policy applies too.")
     elif t == "transform":
         s["expression"] = st.text_area("JMESPath expression", s.get("expression", ""), height=80, key=f"expr_{k}")
+    elif t == "branch":
+        s["expression"] = st.text_input("Condition (JMESPath) - true takes the Yes path, otherwise No",
+                                        s.get("expression", ""), key=f"expr_{k}",
+                                        help="Examples: order.total > `1000` · customer.country == 'IN' · "
+                                             "length(lines) > `0` · api.status == `200`")
     elif t == "condition":
         s["expression"] = st.text_input("Continue only if (JMESPath)", s.get("expression", ""), key=f"expr_{k}")
         s["message"] = st.text_input("Message when it stops", s.get("message", ""), key=f"msg_{k}")
@@ -330,20 +561,112 @@ def _step_form(wf_id, uid, s, steps, dbs, https, outs):
                                      help="Use {{ step.field }}, {% for l in lines %}…{% endfor %}, and | money.")
         if st.button("👁️ Preview with the last run's data", key=f"preview_{k}"):
             runs = api("GET", f"/api/workflows/{wf_id}/runs", params={"limit": 20})
-            ctx = next((api("GET", f"/api/workflow-runs/{r['id']}")["context"] for r in runs
-                        if r["status"] in ("COMPLETED", "STOPPED")), None)
-            if not ctx:
+            run_ctx = next((api("GET", f"/api/workflow-runs/{r['id']}")["context"] for r in runs
+                            if r["status"] in ("COMPLETED", "STOPPED")), None)
+            if not run_ctx:
                 st.warning("No successful run yet - run the workflow once (a dry run is fine) to get sample data.")
             else:
                 try:
-                    _show_pdf(api("POST", "/api/workflows/pdf-preview", json={"template": s["template"], "context": ctx}))
+                    _show_pdf(api("POST", "/api/workflows/pdf-preview", json={"template": s["template"], "context": run_ctx}))
                 except ApiError as e:
                     st.error(str(e))
     elif t == "deliver":
-        pdfs = {x["save_as"]: x["save_as"] for x in steps if x["type"] == "pdf" and x.get("save_as")}
+        pdfs = {x["save_as"]: x["save_as"] for x in _walk(ctx["all"]) if x["type"] == "pdf" and x.get("save_as")}
         s["file"] = _pick("File (a PDF step)", pdfs, s.get("file"), f"file_{k}")
         s["connection"] = _pick("Send through", outs, s.get("connection"), f"conn_{k}")
         s["target"] = st.text_input("Folder / queue / path", s.get("target", ""), key=f"target_{k}")
+
+
+def _db_form(k: str, s: dict, dbs: dict):
+    """The DB connector: pick a table and an action; conditions and values are filled in tables, no SQL."""
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        s["connection"] = _pick("Database", dbs, s.get("connection") or "builtin", f"conn_{k}")
+    tables = _tables(s["connection"], common.token())
+    by_name = {x["name"]: x for x in tables}
+    if by_name:
+        names = list(by_name)
+        s["table"] = c2.selectbox("Table", names, names.index(s["table"]) if s.get("table") in names else 0,
+                                  key=f"table_{k}_{s['connection']}")
+    else:
+        s["table"] = c2.text_input("Table", s.get("table", ""), key=f"table_{k}",
+                                   help="Couldn't list the tables of this database - type the name.")
+    ops = list(DB_OPS)
+    s["operation"] = c3.selectbox("Action", ops, ops.index(s.get("operation") or "select_one"),
+                                  format_func=DB_OPS.get, key=f"op_{k}")
+    op = s["operation"]
+    cols = [c["name"] for c in (by_name.get(s["table"]) or {}).get("columns", [])]
+    if cols:
+        st.caption("Columns: " + ", ".join(f"`{c['name']}` {c['type']}" for c in by_name[s["table"]]["columns"]))
+    tk = f"{k}_{s['connection']}_{s['table']}"  # the editors start fresh when the table changes
+
+    if op.startswith("select"):
+        s["columns"] = st.multiselect("Columns to return (none = all)", cols, [c for c in s.get("columns") or []
+                                                                               if c in cols], key=f"cols_{tk}")
+    if op in ("insert", "update"):
+        st.markdown("**Values** " + ("for the new row" if op == "insert" else "to set"))
+        init = st.session_state.setdefault(f"vals_init_{tk}", [{"Column": c, "Value": v}
+                                                              for c, v in (s.get("values") or {}).items()])
+        rows = st.data_editor(pd.DataFrame(init, columns=["Column", "Value"]), num_rows="dynamic", hide_index=True,
+                              width="stretch", key=f"vals_{tk}", column_config={
+                                  "Column": st.column_config.SelectboxColumn("Column", options=cols, required=True)
+                                  if cols else st.column_config.TextColumn("Column", required=True),
+                                  "Value": st.column_config.TextColumn(
+                                      "Value", help="Fixed text, or a template like {{ trigger.id }}")})
+        s["values"] = {r["Column"]: ("" if pd.isna(r["Value"]) else str(r["Value"]))
+                       for r in rows.to_dict("records") if isinstance(r["Column"], str) and r["Column"]}
+    else:
+        s.pop("values", None)
+    if op != "insert":
+        st.markdown("**Conditions** (all must match)")
+        init = st.session_state.setdefault(f"where_init_{tk}", [
+            {"Column": w.get("column"), "Condition": w.get("op") or "=", "Value": w.get("value", "")}
+            for w in s.get("where") or []])
+        rows = st.data_editor(pd.DataFrame(init, columns=["Column", "Condition", "Value"]), num_rows="dynamic",
+                              hide_index=True, width="stretch", key=f"where_{tk}", column_config={
+                                  "Column": st.column_config.SelectboxColumn("Column", options=cols, required=True)
+                                  if cols else st.column_config.TextColumn("Column", required=True),
+                                  "Condition": st.column_config.SelectboxColumn("Condition", options=WHERE_OPS,
+                                                                                default="=", required=True),
+                                  "Value": st.column_config.TextColumn(
+                                      "Value", help="e.g. {{ trigger.customer_id }}; for 'in' a comma list; "
+                                                    "'like' accepts % wildcards")})
+        s["where"] = [{"column": r["Column"], "op": r["Condition"] or "=",
+                       "value": "" if pd.isna(r["Value"]) else str(r["Value"])}
+                      for r in rows.to_dict("records") if isinstance(r["Column"], str) and r["Column"]]
+    else:
+        s.pop("where", None)
+    if op.startswith("select"):
+        o = st.columns(3, vertical_alignment="bottom")
+        order = ["(none)"] + cols
+        picked = o[0].selectbox("Order by", order, order.index(s["order_by"]) if s.get("order_by") in order else 0,
+                                key=f"order_{tk}")
+        s["order_by"] = None if picked == "(none)" else picked
+        s["order_desc"] = o[1].toggle("Newest / largest first", s.get("order_desc", False), key=f"desc_{tk}",
+                                      disabled=not s["order_by"])
+        if op == "select_all":
+            s["limit"] = o[2].number_input("At most (rows)", 1, 10000, int(s.get("limit") or 100), key=f"limit_{k}")
+        else:
+            s["required"] = o[2].toggle("Fail if no row", s.get("required", True), key=f"req_{k}",
+                                        help="Off: the result is null and the run carries on (use a Branch to check).")
+    if op in ("update", "delete") and not s.get("where"):
+        s["allow_all_rows"] = st.checkbox(f"⚠️ No conditions - {op} **every row** in the table", False,
+                                          key=f"all_{tk}")
+    else:
+        s.pop("allow_all_rows", None)
+    hint = {"select_one": "The result is the row, e.g. `{{ name.column }}`.",
+            "select_all": "The result is a list of rows - loop over it in a PDF template or Transform.",
+            "insert": "The result is `{rowcount, key}` with the new row's key.",
+            "update": "The result is `{rowcount}`.", "delete": "The result is `{rowcount}`."}[op]
+    st.caption(hint + (" Dry runs don't change the database." if op in ("insert", "update", "delete") else ""))
+    if s.get("table") and st.button("🧾 Show the SQL", key=f"sqlprev_{k}"):
+        r = api("POST", f"/api/db/{s['connection']}/build-sql",
+                json={x: v for x, v in s.items() if not x.startswith("_")})
+        if r.get("sql"):
+            st.code(r["sql"], language="sql")
+            st.caption("Values are sent separately as parameters - never pasted into the SQL.")
+        else:
+            st.error(r.get("error") or "Couldn't build the SQL.")
 
 
 # ---------- trigger ----------

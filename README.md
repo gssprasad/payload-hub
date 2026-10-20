@@ -254,15 +254,26 @@ The **⚙️ Workflows** page chains steps where each step can use the results o
 Every run has a context: `trigger` (the record that started it) plus each step's result under its
 *Save result as* name.
 
+**Building:** the *Steps* tab is a visual builder. Add steps from the palette, edit each one in its
+card, move it up or down, duplicate it, switch it off (skipped when running) or remove it. The
+*Flow diagram* view draws the workflow with its branches; *JSON* shows the saved definition.
+
 | Step | Does |
 |------|------|
-| 🗄️ Database query | SELECT on any database connection or the built-in area; `:name` placeholders filled from *Parameters* (e.g. `order_id = {{ trigger.order_id }}`), never pasted into the SQL; one row or all rows |
-| ✏️ Database update | INSERT / UPDATE / DELETE (skipped in a dry run) |
+| 🧱 DB connector | No-SQL database step: pick a connection, a table and an action (get one row, get rows, insert, update, delete); choose columns, fill **conditions** (`=`, `!=`, `>`, `>=`, `<`, `<=`, `like`, `in`, `is null`, `is not null`) and **values** in small tables with templates like `{{ trigger.id }}`; order and row limit. *Show the SQL* previews the statement; values are always sent as parameters. Update/delete without a condition must be ticked explicitly. Insert returns `{rowcount, key}` |
+| 🗄️ SQL query | SELECT on any database connection or the built-in area; `:name` placeholders filled from *Parameters* (e.g. `order_id = {{ trigger.order_id }}`), never pasted into the SQL; one row or all rows |
+| ✏️ SQL update | INSERT / UPDATE / DELETE written as SQL (skipped in a dry run) |
 | 🌐 API call | GET/POST/PUT/PATCH/DELETE through an HTTP connection (path and body are templates), with the connection's retry policy; result `{status, data}` |
 | 🔀 Transform | JMESPath over all results |
-| ❓ Condition | JMESPath test; when false the run stops (status STOPPED) |
+| 🔱 Branch (if / else) | JMESPath condition, e.g. ``order.total > `1000` ``; true runs the **Yes** steps, otherwise the **No** steps (each can hold any steps, including further branches), then the run carries on |
+| ❓ Stop unless | JMESPath test; when false the run stops (status STOPPED) |
 | 📄 Create PDF | Jinja2 HTML template (`{{ … }}`, `{% for %}`, `| money`) → PDF (xhtml2pdf), stored with the run |
 | 📤 Deliver file | Send a PDF through any adapter, e.g. SFTP folder, HTTP API (skipped in a dry run) |
+
+**Retry per step:** database, API, PDF and deliver steps have *If this step fails*: number of
+attempts, the wait between them (optionally doubling each time), and then either **stop the run**
+or **carry on** (the step's result becomes `null`, status ⚠️ FAILED_CONTINUED, so a later Branch can
+check it). Every retry is listed in the run's timeline.
 
 **Triggers:** manual (*Run now*, or `POST /api/workflows/<id>/run`), schedule (every N minutes,
 optionally one run per row of a query), or database (one run per new row of `table:key`).
@@ -280,6 +291,10 @@ can be **rerun from the failed step**, reusing earlier results. Up to 4 runs exe
 5. mark the order INVOICED;
 6. create the invoice PDF (template in `samples/workflows/invoice-template.html`);
 7. deliver it to the SFTP test server's `invoices` folder.
+
+*customer-followup* shows the new pieces: a DB connector finds the customer, a branch checks
+whether it exists, the Yes path calls the customer API with 3 retries (carrying on if it still
+fails) and lists the recent orders, the No path marks the customer unknown.
 
 *Invoice on request* runs the same steps for every new row in `invoice_requests`, and *Scheduled
 invoices* (paused) does it hourly for every order with status NEW.

@@ -1241,6 +1241,15 @@ async def design_preview(target: str, req: DesignIn):
         return {"sql": None, "error": str(e)}
 
 
+@app.post("/api/db/{target}/build-sql")
+async def build_sql_preview(target: str, spec: dict):
+    """The SQL a workflow DB-connector step would run (values shown as :placeholders)."""
+    try:
+        return {"sql": await (await _db_target(target)).preview_structured(spec)}
+    except (adapters.AdapterError, KeyError) as e:
+        return {"sql": None, "error": str(e)}
+
+
 @app.post("/api/db/{target}/tables", status_code=201)
 async def design_create(target: str, req: DesignIn):
     try:

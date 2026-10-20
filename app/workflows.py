@@ -28,9 +28,11 @@ from jinja2.sandbox import SandboxedEnvironment
 from . import adapters, connectors, datastore, db
 from .transform import _OPTIONS
 
-log = logging.getLogger("workflows")
+log_ = log = logging.getLogger("workflows")
 
-STEP_TYPES = ("db_query", "db_update", "api_call", "transform", "condition", "pdf", "deliver")
+STEP_TYPES = ("db", "db_query", "db_update", "api_call", "transform", "branch", "condition", "pdf", "deliver")
+DB_OPS = ("select_one", "select_all", "insert", "update", "delete")
+NO_RESULT = ("condition", "deliver", "db_update", "branch")
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
 MAX_PARALLEL = 4
 
@@ -79,22 +81,46 @@ async def _database(conn_id: str) -> adapters.Database:
     return await connectors.adapter_for(conn_id)
 
 
-def validate(steps: list[dict]) -> list[dict]:
-    """Check a workflow's steps before saving. Returns cleaned steps."""
-    names, out = set(), []
-    for i, s in enumerate(steps or [], start=1):
-        t = s.get("type")
+def validate(steps: list[dict], names: set | None = None, where: str = "") -> list[dict]:
+    """Check a workflow's steps (including the steps inside branches) before saving. Returns cleaned steps."""
+    names = set() if names is None else names
+    out = []
+    for i, raw in enumerate(steps or [], start=1):
+        s = {k: v for k, v in raw.items() if not k.startswith("_")}  # drop UI-only keys
+        t, here = s.get("type"), f"{where}step {i}"
         if t not in STEP_TYPES:
-            raise StepError(f"Step {i}: unknown type '{t}'.")
+            raise StepError(f"{here}: unknown type '{t}'.")
         name = (s.get("save_as") or "").strip()
-        if t not in ("condition", "deliver", "db_update") and not NAME.match(name):
-            raise StepError(f"Step {i} ({t}): give it a name to save its result under (letters, digits, _).")
-        if name and name in names:
-            raise StepError(f"Step {i}: the name '{name}' is already used by an earlier step.")
+        needs_name = t not in NO_RESULT and not (t == "db" and s.get("operation") in ("insert", "update", "delete"))
+        if needs_name and not NAME.match(name):
+            raise StepError(f"{here} ({t}): give it a name to save its result under (letters, digits, _).")
+        if name and not NAME.match(name):
+            raise StepError(f"{here}: '{name}' isn't a valid name (letters, digits, _).")
+        if name in names:
+            raise StepError(f"{here}: the name '{name}' is already used by another step.")
         if name == "trigger":
-            raise StepError(f"Step {i}: 'trigger' is reserved for the record that starts the run.")
+            raise StepError(f"{here}: 'trigger' is reserved for the record that starts the run.")
         if name:
             names.add(name)
+        if t == "db":
+            if s.get("operation") not in DB_OPS:
+                raise StepError(f"{here}: choose what the database step does.")
+            if not s.get("table"):
+                raise StepError(f"{here}: choose a table.")
+            if s["operation"] in ("update", "delete") and not s.get("where") and not s.get("allow_all_rows"):
+                raise StepError(f"{here}: {s['operation']} without conditions would change every row - add a "
+                                "condition or tick 'all rows'.")
+        if t == "branch":
+            if not (s.get("expression") or "").strip():
+                raise StepError(f"{here}: the branch needs a condition.")
+            s["then"] = validate(s.get("then") or [], names, f"{here} → then → ")
+            s["else"] = validate(s.get("else") or [], names, f"{here} → else → ")
+        for k in ("retry_attempts", "retry_delay"):
+            if k in s and s[k] is not None:
+                try:
+                    s[k] = max(0, int(s[k]))
+                except (TypeError, ValueError) as e:
+                    raise StepError(f"{here}: {k.replace('_', ' ')} must be a number.") from e
         out.append({**s, "save_as": name or None})
     return out
 
@@ -115,13 +141,35 @@ async def _db_query(cfg, ctx, dry):
     return rows[0]
 
 
+async def _db(cfg, ctx, dry):
+    """The no-SQL database connector: select / insert / update / delete built from the step's settings."""
+    database = await _database(cfg.get("connection"))
+    spec = dict(cfg)
+    spec["where"] = [{**w, "value": value(w.get("value", ""), ctx)} for w in cfg.get("where") or []]
+    spec["values"] = {k: value(v, ctx) for k, v in (cfg.get("values") or {}).items() if str(v).strip()}
+    op = cfg.get("operation")
+    if dry and op in ("insert", "update", "delete"):
+        return {"skipped": "dry run", "would_run": await database.preview_structured(cfg),
+                "values": _jsonable(spec["values"]), "where": _jsonable(spec["where"])}
+    result = await database.run_structured(spec)
+    if op == "select_all":
+        return _jsonable(result["rows"])
+    if op == "select_one":
+        if not result["rows"]:
+            if cfg.get("required", True):
+                raise StepError("No matching row.")
+            return None
+        return _jsonable(result["rows"][0])
+    return {k: v for k, v in result.items() if k != "rows"}
+
+
 async def _db_update(cfg, ctx, dry):
     params = {k: value(v, ctx) for k, v in (cfg.get("params") or {}).items()}
     if dry:
         return {"skipped": "dry run", "would_run": cfg.get("sql"), "params": _jsonable(params)}
     database = await _database(cfg.get("connection"))
     result = await database.execute(cfg.get("sql") or "", params, write=True)
-    return {"rowcount": result["rowcount"]}
+    return {k: v for k, v in result.items() if k != "rows"}
 
 
 async def _api_call(cfg, ctx, dry):
@@ -217,7 +265,7 @@ async def _deliver(cfg, ctx, dry):
     return {"delivered": detail}
 
 
-STEPS = {"db_query": _db_query, "db_update": _db_update, "api_call": _api_call, "transform": _transform,
+STEPS = {"db": _db, "db_query": _db_query, "db_update": _db_update, "api_call": _api_call, "transform": _transform,
          "condition": _condition, "pdf": _pdf, "deliver": _deliver}
 
 
@@ -227,45 +275,93 @@ def _public(ctx: dict) -> dict:
 
 # ---------- running ----------
 
+class _Outcome:
+    def __init__(self):
+        self.status, self.error, self.failed = "COMPLETED", None, None
+
+
+async def _run_steps(steps, ctx, dry, log, outcome, run_id, wf_id, path="", depth=0, start_at=0):
+    """Run a list of steps (recursing into branches). Stops the list when the run fails or stops."""
+    for i, step in enumerate(steps):
+        here = f"{path}{i + 1}"
+        label = step.get("label") or step["type"]
+        top = int(here.split(".")[0]) - 1
+        if depth == 0 and i < start_at:
+            log.append({"index": top, "path": here, "depth": depth, "label": label, "type": step["type"], "status": "REUSED"})
+            continue
+        entry = {"index": top, "path": here, "depth": depth, "label": label, "type": step["type"],
+                 "save_as": step.get("save_as")}
+        t0 = time.perf_counter()
+        if step.get("disabled"):
+            entry.update(status="SKIPPED", output="Switched off", ms=0)
+            log.append(entry)
+            continue
+        if step["type"] == "branch":
+            try:
+                ok = bool(jmespath.search(step["expression"], _public(ctx), options=_OPTIONS))
+            except jmespath.exceptions.JMESPathError as e:
+                entry.update(status="FAILED", error=f"Condition error: {e}", ms=0)
+                log.append(entry)
+                outcome.status, outcome.error, outcome.failed = "FAILED", entry["error"], top
+                return
+            side = "then" if ok else "else"
+            entry.update(status="OK", output=f"condition is {str(ok).lower()} → {side}", ms=0)
+            log.append(entry)
+            await _run_steps(step.get(side) or [], ctx, dry, log, outcome, run_id, wf_id,
+                             f"{here}.{side}.", depth + 1)
+            if outcome.status != "COMPLETED":
+                return
+            continue
+        attempts = max(1, int(step.get("retry_attempts") or 1))
+        delay = max(0, int(step.get("retry_delay") or 0))
+        for attempt in range(1, attempts + 1):
+            try:
+                out = await STEPS[step["type"]](step, ctx, dry)
+                if step.get("save_as"):
+                    ctx[step["save_as"]] = out
+                entry.update(status="SKIPPED" if isinstance(out, dict) and "skipped" in out else "OK",
+                             output=_preview(out), attempts=attempt)
+                break
+            except StopRun as e:
+                entry.update(status="STOPPED", output=str(e), attempts=attempt)
+                outcome.status, outcome.error = "STOPPED", str(e)
+                break
+            except Exception as e:  # noqa: BLE001
+                msg = str(e) if isinstance(e, (StepError, adapters.AdapterError)) else f"{type(e).__name__}: {e}"
+                if not isinstance(e, (StepError, adapters.AdapterError)):
+                    log_.exception("workflow %s step %s crashed", wf_id, here)
+                if attempt < attempts:
+                    wait = delay * (2 ** (attempt - 1)) if step.get("retry_backoff", True) else delay
+                    entry.setdefault("retries", []).append(f"attempt {attempt}: {msg[:200]} - retrying in {wait} s")
+                    await asyncio.sleep(wait)
+                    continue
+                entry.update(error=msg, attempts=attempt)
+                if step.get("on_error") == "continue":
+                    entry["status"] = "FAILED_CONTINUED"
+                    if step.get("save_as"):
+                        ctx[step["save_as"]] = None
+                else:
+                    entry["status"] = "FAILED"
+                    outcome.status, outcome.error, outcome.failed = "FAILED", msg, top
+        entry["ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        log.append(entry)
+        await db.update_run(run_id, steps_log=log, context=_jsonable(_public(ctx)))
+        if outcome.status != "COMPLETED":
+            return
+
+
 async def run(wf: dict, input_: dict | None, source: str, dry_run: bool = False, start_at: int = 0,
               context: dict | None = None) -> dict:
     run_id = str(uuid.uuid4())
     input_ = _jsonable(input_ or {})
     await db.create_run(run_id, wf["id"], source, dry_run, input_)
     ctx = {**(context or {}), "trigger": input_, "_run_id": run_id}
-    steps_log, status, error, failed = [], "COMPLETED", None, None
+    steps_log, outcome = [], _Outcome()
     started = time.perf_counter()
     async with _slots:
-        for i, step in enumerate(wf["steps"]):
-            label = step.get("label") or step["type"]
-            if i < start_at:
-                steps_log.append({"index": i, "label": label, "type": step["type"], "status": "REUSED"})
-                continue
-            t0 = time.perf_counter()
-            entry = {"index": i, "label": label, "type": step["type"], "save_as": step.get("save_as")}
-            try:
-                out = await STEPS[step["type"]](step, ctx, dry_run)
-                if step.get("save_as"):
-                    ctx[step["save_as"]] = out
-                entry.update(status="SKIPPED" if isinstance(out, dict) and "skipped" in out else "OK",
-                             output=_preview(out))
-            except StopRun as e:
-                entry.update(status="STOPPED", output=str(e))
-                status, error = "STOPPED", str(e)
-            except (StepError, adapters.AdapterError) as e:
-                entry.update(status="FAILED", error=str(e))
-                status, error, failed = "FAILED", str(e), i
-            except Exception as e:  # noqa: BLE001
-                log.exception("workflow %s step %d crashed", wf["id"], i)
-                entry.update(status="FAILED", error=f"{type(e).__name__}: {e}")
-                status, error, failed = "FAILED", f"{type(e).__name__}: {e}", i
-            entry["ms"] = round((time.perf_counter() - t0) * 1000, 1)
-            steps_log.append(entry)
-            await db.update_run(run_id, steps_log=steps_log, context=_jsonable(_public(ctx)))
-            if status != "COMPLETED":
-                break
-    await db.update_run(run_id, status=status, error=error, failed_step=failed, steps_log=steps_log,
-                        context=_jsonable(_public(ctx)), finished_at=datetime.now(timezone.utc),
+        await _run_steps(wf["steps"], ctx, dry_run, steps_log, outcome, run_id, wf["id"], start_at=start_at)
+    await db.update_run(run_id, status=outcome.status, error=outcome.error, failed_step=outcome.failed,
+                        steps_log=steps_log, context=_jsonable(_public(ctx)), finished_at=datetime.now(timezone.utc),
                         duration_ms=round((time.perf_counter() - started) * 1000, 1))
     return await db.get_run(run_id)
 

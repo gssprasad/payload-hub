@@ -23,6 +23,7 @@ READ_ONLY_POSTS = (
     re.compile(r"^/api/data/query$"),  # the statement itself is checked against the user's permissions
     re.compile(r"^/api/connections/[^/]+/query$"),
     re.compile(r"^/api/db/[^/]+/ddl$"),  # SQL preview only
+    re.compile(r"^/api/db/[^/]+/build-sql$"),  # SQL preview only
     re.compile(r"^/api/workflows/pdf-preview$"),
     re.compile(r"^/api/db/[^/]+/tables/[^/]+/alter$"),  # checked per change inside (write or delete)
     re.compile(r"^/api/partners/[^/]+/store/preview$"),

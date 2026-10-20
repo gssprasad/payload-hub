@@ -1274,6 +1274,88 @@ class Database(Adapter):
 
         return await self._run(run)
 
+    # ---- the workflow DB connector: queries built from settings, never from typed SQL ----
+    _OPS = {"=": "__eq__", "!=": "__ne__", ">": "__gt__", ">=": "__ge__", "<": "__lt__", "<=": "__le__"}
+
+    def _structured(self, spec: dict):
+        import sqlalchemy as sa
+
+        try:
+            t = sa.Table(spec["table"], sa.MetaData(), autoload_with=self.engine())
+        except sa.exc.NoSuchTableError as e:
+            raise AdapterError(f"{self._describe()} has no table '{spec['table']}'.", retryable=False) from e
+
+        def col(name):
+            if name not in t.c:
+                raise AdapterError(f"Table '{spec['table']}' has no column '{name}'.", retryable=False)
+            return t.c[name]
+
+        conds = []
+        for w in spec.get("where") or []:
+            if not w.get("column"):
+                continue
+            c, op, v = col(w["column"]), (w.get("op") or "=").lower(), w.get("value")
+            if op == "is null":
+                conds.append(c.is_(None))
+            elif op == "is not null":
+                conds.append(c.is_not(None))
+            elif op == "like":
+                conds.append(c.like(v))
+            elif op == "in":
+                items = v if isinstance(v, list) else [x.strip() for x in str(v or "").split(",") if x.strip()]
+                conds.append(c.in_(items))
+            elif op in self._OPS:
+                conds.append(getattr(c, self._OPS[op])(v))
+            else:
+                raise AdapterError(f"Unknown condition '{op}'.", retryable=False)
+        op = spec.get("operation")
+        if op in ("select_one", "select_all"):
+            cols = [col(n) for n in spec.get("columns") or []] or [t]
+            stmt = sa.select(*cols).where(*conds)
+            if spec.get("order_by"):
+                c = col(spec["order_by"])
+                stmt = stmt.order_by(c.desc() if spec.get("order_desc") else c)
+            limit = 1 if op == "select_one" else int(spec.get("limit") or 1000)
+            return stmt.limit(min(limit, 10000))
+        values = {k: (json.dumps(v) if isinstance(v, (dict, list)) and not isinstance(col(k).type, sa.JSON) else v)
+                  for k, v in (spec.get("values") or {}).items()}
+        for k in values:
+            col(k)
+        if op == "insert":
+            if not values:
+                raise AdapterError("Insert needs at least one column value.", retryable=False)
+            return t.insert().values(**values)
+        if op in ("update", "delete") and not conds and not spec.get("allow_all_rows"):
+            raise AdapterError(f"Refusing to {op} every row - add a condition.", retryable=False)
+        if op == "update":
+            if not values:
+                raise AdapterError("Update needs at least one column value.", retryable=False)
+            return t.update().where(*conds).values(**values)
+        if op == "delete":
+            return t.delete().where(*conds)
+        raise AdapterError(f"Unknown operation '{op}'.", retryable=False)
+
+    async def preview_structured(self, spec: dict) -> str:
+        """The SQL the connector would run, with :placeholders for the values."""
+        return await self._run(lambda: str(self._structured(spec).compile(
+            dialect=self.engine().dialect, compile_kwargs={"render_postcompile": True})).strip())
+
+    async def run_structured(self, spec: dict) -> dict:
+        def run():
+            stmt = self._structured(spec)
+            if spec.get("operation", "").startswith("select"):
+                with self.engine().connect() as conn:
+                    return {"rows": [dict(r) for r in conn.execute(stmt).mappings()], "rowcount": None}
+            with self.engine().begin() as conn:
+                result = conn.execute(stmt)
+                if spec.get("operation") == "insert":
+                    key = result.inserted_primary_key
+                    return {"rows": [], "rowcount": 1, "key": _key(key[0]) if key and len(key) == 1
+                            else [_key(k) for k in key or []]}
+                return {"rows": [], "rowcount": result.rowcount}
+
+        return await self._run(run)
+
     async def send(self, target, body, headers, content_type):
         """Outbound: insert the payload into table `target`; JSON fields go to columns of the same name."""
         if "json" not in content_type:
@@ -1341,6 +1423,10 @@ class Database(Adapter):
     async def close(self):
         if self._engine is not None:
             await asyncio.to_thread(self._engine.dispose)
+
+
+def _key(v):
+    return v if v is None or isinstance(v, (int, float, str)) else _json_value(v)
 
 
 def _json_value(v):
