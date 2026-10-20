@@ -128,20 +128,28 @@ def api_access_dialog(p):
                                 role="queue / topic / folder / table to read")
 
     with outbound:
-        st.markdown("**↩️ Response to the caller**")
+        st.markdown("**🔁 Route: caller → System B → caller**")
         if p.get("reply_mode") == "forward" and p.get("reply_connection") in conns:
             rc = conns[p["reply_connection"]]
             fmt = {"input": p["input_format"], "json": "json", "xml": "xml", "unchanged": None}[p.get("response_format") or "input"]
-            _kv([("Mode", "Forward the transformed payload to another API and return its response"),
-                 ("Forward to", f"<code>{rc['config'].get('method', 'POST')} {common.connection_address(rc, p.get('reply_path'))}</code>"),
-                 ("Sends", f"Content-Type <code>{MIME[p['output_format']]}</code>"),
-                 ("Returns to caller", f"Content-Type <code>{MIME[fmt]}</code>" if fmt else "the API's own content type"),
+            http = rc["type"] == "http"
+            sends = "text/csv" if p.get("send_format") == "csv" else MIME[p["output_format"]]
+            _kv([("Mode", "Send the transformed payload to System B and return its "
+                          + ("response" if http else "delivery receipt")),
+                 ("System B", f"{rc['name']} ({rc['type']}) · "
+                              + ("👤 dedicated to this partner" if rc.get("owner_partner") else "🌍 common endpoint")),
+                 ("Sends to", f"<code>{((p.get('reply_method') or rc['config'].get('method', 'POST')) + ' ') if http else ''}"
+                              f"{common.connection_address(rc, p.get('reply_path'))}</code>"),
+                 ("Sends", f"Content-Type <code>{sends}</code>"),
+                 ("Returns to caller", f"Content-Type <code>{MIME[fmt]}</code> (translated)" if fmt
+                  else "System B's answer as is"),
                  ("Response mapping", f"<code>{p['response_expression']}</code>" if p.get("response_expression") else "none")])
-            _connection_details(rc, types, p.get("reply_path"), reveal, role="path")
+            _connection_details(rc, types, p.get("reply_path"), reveal,
+                                role="path" if rc["type"] == "http" else "folder / table / queue / topic")
         else:
             _kv([("Mode", "Return the transformed payload"),
                  ("Returns to caller", f"Content-Type <code>{MIME[p['output_format']]}</code>")])
-        st.markdown("**📤 Delivery (asynchronous)**")
+        st.markdown("**📤 Outbound copy (asynchronous, no reply)**")
         if p.get("outbound_connection") in conns:
             oc = conns[p["outbound_connection"]]
             _kv([("Sends", f"Content-Type <code>{MIME[p['output_format']]}</code>"),

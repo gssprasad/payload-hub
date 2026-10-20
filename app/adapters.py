@@ -818,7 +818,8 @@ class FileTransfer(Adapter):
         from datetime import datetime, timezone
 
         now = datetime.now(timezone.utc)
-        ext = "xml" if "xml" in content_type else "json" if "json" in content_type else "txt"
+        ext = "xml" if "xml" in content_type else "json" if "json" in content_type else \
+            "csv" if "csv" in content_type else "txt"
         pattern = self.config.get("filename_pattern") or "{partner}_{timestamp}_{txn}.{ext}"
         if headers.get("X-Filename"):  # e.g. a PDF from a workflow keeps its own name
             name = headers["X-Filename"]

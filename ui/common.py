@@ -223,12 +223,19 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
                  "Details": f"failures → {p['topic_dlq']}"})
     if p.get("reply_mode") == "forward" and p.get("reply_connection") in conns:
         c = conns[p["reply_connection"]]
-        rows.append({"Direction": "↪️ Outbound (sync)", "Type": f"Forward to API ({c['name']})",
-                     "Address": "POST " + connection_address(c, p.get("reply_path")),
-                     "Details": f"response returned to caller · retry: {retry_summary(c)}"})
+        http = c["type"] == "http"
+        method = (p.get("reply_method") or c.get("config", {}).get("method") or "POST") + " " if http else ""
+        rows.append({"Direction": "🎯 System B (sync)",
+                     "Type": f"{c['type'].upper()} ({c['name']}) · " + ("👤 dedicated" if c.get("owner_partner") else "🌍 common"),
+                     "Address": method + connection_address(c, p.get("reply_path")),
+                     "Details": ("sends CSV · " if p.get("send_format") == "csv" else "")
+                                + ("response" if http else "delivery receipt") + " returned to caller "
+                                + ("as is" if p.get("response_format") == "unchanged" else "translated")
+                                + f" · retry: {retry_summary(c)}"})
     if p.get("outbound_connection") and p["outbound_connection"] in conns:
         c = conns[p["outbound_connection"]]
-        rows.append({"Direction": "⬆️ Outbound (async)", "Type": f"Deliver via {c['type'].upper()} ({c['name']})",
+        rows.append({"Direction": "⬆️ Outbound copy (async)", "Type": f"Deliver via {c['type'].upper()} ({c['name']}) · "
+                     + ("👤 dedicated" if c.get("owner_partner") else "🌍 common"),
                      "Address": connection_address(c, p.get("outbound_target")), "Details": f"retry: {retry_summary(c)}"})
     if p.get("store_enabled") and p.get("store_table"):
         sc = conns.get(p.get("store_connection") or "")

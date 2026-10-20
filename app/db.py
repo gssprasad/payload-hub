@@ -122,6 +122,10 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS delivery_status text;
 
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_mode text NOT NULL DEFAULT 'transformed';
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_method text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS send_format text NOT NULL DEFAULT 'output';
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS csv_delimiter text;
+ALTER TABLE connections ADD COLUMN IF NOT EXISTS owner_partner text;  -- NULL = common to all partners
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_connection text REFERENCES connections(id);
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_path text;
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'input';
@@ -226,9 +230,9 @@ PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_form
                   "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
                   "outbound_target", "reply_mode", "reply_connection", "reply_path", "response_format",
                   "response_expression", "store_enabled", "store_table", "store_source", "store_row_path",
-                  "store_columns", "store_connection")
+                  "store_columns", "store_connection", "reply_method", "send_format", "csv_delimiter")
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
-                     "last_test_at, last_test_ok, last_test_detail, created_at, updated_at"
+                     "last_test_at, last_test_ok, last_test_detail, owner_partner, created_at, updated_at"
 
 pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kwargs={"row_factory": dict_row})
 
@@ -436,7 +440,7 @@ async def list_partners():
         cur = await conn.execute(
             """SELECT p.code, p.name, p.description, p.input_format, p.output_format, p.queue_mode, p.topic_in,
                       p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target,
-                      p.reply_mode, p.reply_connection, p.reply_path, p.response_format,
+                      p.reply_mode, p.reply_connection, p.reply_path, p.response_format, p.send_format,
                       p.store_enabled, p.store_table, p.store_connection, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
                       p.created_at, p.updated_at,
                       (SELECT count(*) FROM partner_documents d WHERE d.partner_code = p.code) AS documents,
@@ -542,14 +546,20 @@ async def get_connection(conn_id, with_secret=False):
         return await cur.fetchone()
 
 
-async def create_connection(conn_id, name, type_, config, secret):
+async def create_connection(conn_id, name, type_, config, secret, owner_partner=None):
     async with pool.connection() as conn:
         cur = await conn.execute(
-            """INSERT INTO connections (id, name, type, config, secret) VALUES (%s, %s, %s, %s, %s)
+            """INSERT INTO connections (id, name, type, config, secret, owner_partner) VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (id) DO NOTHING RETURNING id""",
-            (conn_id, name, type_, Jsonb(config), secret),
+            (conn_id, name, type_, Jsonb(config), secret, owner_partner),
         )
         return (await cur.fetchone()) is not None
+
+
+async def set_connection_owner(conn_id, owner_partner):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE connections SET owner_partner = %s, updated_at = now() WHERE id = %s",
+                           (owner_partner, conn_id))
 
 
 async def update_connection(conn_id, name, config, secret=None):

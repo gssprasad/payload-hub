@@ -75,6 +75,42 @@ def transform(payload: str, input_format: str, expression: str, output_format: s
     return serialise(mapped, output_format)
 
 
+def to_csv(payload: str, fmt: str, delimiter: str = ",") -> str:
+    """Rows for System B as CSV: a list of objects, the first list inside an object, or one object = one row.
+    Nested objects become dotted column names (customer.name)."""
+    import csv
+    import io
+
+    data = parse(payload, fmt)
+    if isinstance(data, dict):
+        if len(data) == 1 and isinstance(next(iter(data.values())), (dict, list)):
+            data = next(iter(data.values()))  # XML root element, or {"orders": [...]}
+        lists = [v for v in data.values() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)] \
+            if isinstance(data, dict) else []
+        if isinstance(data, dict) and len(lists) == 1:
+            data = lists[0]
+    rows = data if isinstance(data, list) else [data]
+
+    def flat(obj, prefix=""):
+        out = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                out.update(flat(v, f"{prefix}{k}."))
+        elif isinstance(obj, list):
+            out[prefix[:-1]] = json.dumps(obj, ensure_ascii=False)
+        else:
+            out[prefix[:-1] or "value"] = obj
+        return out
+
+    flat_rows = [flat(r) for r in rows]
+    columns = list(dict.fromkeys(k for r in flat_rows for k in r))
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, columns, delimiter=delimiter or ",", lineterminator="\n")
+    w.writeheader()
+    w.writerows(flat_rows)
+    return buf.getvalue()
+
+
 def convert_response(body: str, content_type: str, expression: str | None, response_format: str,
                      request_format: str) -> tuple[str, str]:
     """Turn an upstream API's response into the format the original caller expects.

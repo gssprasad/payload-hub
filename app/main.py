@@ -658,25 +658,37 @@ async def set_partner_adapters(code: str, req: PartnerAdapters):
 
 class PartnerReply(BaseModel):
     reply_mode: Literal["transformed", "forward"] = "transformed"
-    reply_connection: str | None = None
-    reply_path: str | None = None
+    reply_connection: str | None = None  # System B
+    reply_path: str | None = None  # API path, folder, table, queue or topic
+    reply_method: Literal["POST", "PUT", "PATCH", "GET", "DELETE"] | None = None
+    send_format: Literal["output", "csv"] = "output"
+    csv_delimiter: str | None = Field(default=None, max_length=1)
     response_format: Literal["input", "json", "xml", "unchanged"] = "input"
     response_expression: str | None = None
 
 
 @app.put("/api/partners/{code}/reply")
 async def set_partner_reply(code: str, req: PartnerReply):
-    """What callers get back: the transformed payload, or the response of another API the payload is forwarded to."""
+    """The System B route: send the transformed payload to System B (API, file, database, queue) and return its
+    answer to the caller - translated or as is. 'transformed' returns the transformed payload directly."""
     await _partner_or_404(code)
     if req.reply_mode == "forward":
         c = await db.get_connection(req.reply_connection or "")
         if not c:
-            raise HTTPException(422, "Choose the HTTP connection of the API to forward to.")
-        if c["type"] != "http":
-            raise HTTPException(422, "Forwarding needs an HTTP connection (an API endpoint).")
+            raise HTTPException(422, "Choose System B (an outbound connection).")
+        if not adapters.TYPES[c["type"]]["outbound"]:
+            raise HTTPException(422, f"A {c['type']} connection can't receive messages.")
+        if c.get("owner_partner") and c["owner_partner"] != code:
+            raise HTTPException(422, f"'{c['name']}' belongs to partner {c['owner_partner']}.")
+        if c["type"] != "http" and not (req.reply_path or "").strip():
+            raise HTTPException(422, "Give the folder, table, queue or topic to send to.")
+        if c["type"] == "database" and req.send_format == "csv":
+            raise HTTPException(422, "A database table takes rows, not CSV - choose 'as transformed' (JSON).")
     await db.update_partner(code, reply_mode=req.reply_mode,
                             reply_connection=req.reply_connection if req.reply_mode == "forward" else None,
                             reply_path=(req.reply_path or "").strip() or None,
+                            reply_method=req.reply_method, send_format=req.send_format,
+                            csv_delimiter=req.csv_delimiter or None,
                             response_format=req.response_format,
                             response_expression=(req.response_expression or "").strip() or None)
     return await db.get_partner(code)
@@ -1296,6 +1308,7 @@ class ConnectionIn(BaseModel):
     type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka", "database", "ftp"]
     config: dict = Field(default_factory=dict)
     secret: str | None = None  # write-only; None on update keeps the stored one
+    owner_partner: str | None = None  # None = common endpoint, shared by all partners
 
 
 def _clean_config(type_: str, config: dict) -> dict:
@@ -1331,7 +1344,10 @@ async def create_connection(req: ConnectionIn):
     conn_id = _slug(req.name)
     if len(conn_id) < 2:
         raise HTTPException(422, "Give the connection a name with letters or digits.")
-    if not await db.create_connection(conn_id, req.name, req.type, _clean_config(req.type, req.config), req.secret):
+    if req.owner_partner:
+        await _partner_or_404(req.owner_partner)
+    if not await db.create_connection(conn_id, req.name, req.type, _clean_config(req.type, req.config), req.secret,
+                                      req.owner_partner or None):
         raise HTTPException(409, f"A connection called '{conn_id}' already exists.")
     ok, detail = await connectors.test_connection(conn_id)
     return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
@@ -1348,6 +1364,26 @@ async def update_connection(conn_id: str, req: ConnectionIn):
     ok, detail = await connectors.test_connection(conn_id)
     await connectors.sync()
     return {**(await db.get_connection(conn_id)), "test_ok": ok, "test_detail": detail}
+
+
+class ConnectionOwner(BaseModel):
+    owner_partner: str | None = None
+
+
+@app.put("/api/connections/{conn_id}/owner")
+async def set_connection_owner(conn_id: str, req: ConnectionOwner):
+    """Make an endpoint common (None) or dedicated to one partner."""
+    c = await db.get_connection(conn_id)
+    if not c:
+        raise HTTPException(404, "Connection not found.")
+    if req.owner_partner:
+        await _partner_or_404(req.owner_partner)
+        others = [p for p in (next((x["used_by"] for x in await db.list_connections() if x["id"] == conn_id), []))
+                  if p != req.owner_partner]
+        if others:
+            raise HTTPException(422, f"Also used by {', '.join(others)} - it has to stay common.")
+    await db.set_connection_owner(conn_id, req.owner_partner or None)
+    return await db.get_connection(conn_id)
 
 
 @app.post("/api/connections/{conn_id}/test")
@@ -1420,7 +1456,8 @@ async def inbound(code: str, request: Request, wait: bool = True,
         if not reply["ok"] and "body" not in reply:
             return JSONResponse({"transaction_id": txn_id, "status": "FORWARD_FAILED", "error": reply["error"]},
                                 status_code=502, headers=headers)
-        media = {"xml": "application/xml", "json": "application/json"}.get(reply.get("format"), "text/plain")
+        media = {"xml": "application/xml", "json": "application/json"}.get(reply.get("format")) \
+            or reply.get("content_type") or "text/plain"  # 'as is' keeps System B's own content type
         return Response(reply["body"], status_code=reply["status"], media_type=media,
                         headers={**headers, "X-Status": "RESPONDED", "X-Upstream-Status": str(reply["status"])})
     if result and result["status"] == "COMPLETED":

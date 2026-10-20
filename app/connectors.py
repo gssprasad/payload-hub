@@ -7,13 +7,14 @@
                                        RabbitMQ / ActiveMQ / IBM MQ / HTTP / Kafka
 """
 import asyncio
+import json
 import logging
 import time
 import uuid
 from datetime import datetime, timezone
 
 from . import adapters, db, pipeline
-from .transform import TransformError, convert_response
+from .transform import TransformError, convert_response, to_csv
 
 log = logging.getLogger("connectors")
 
@@ -74,28 +75,47 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
 
 # ---------- forward to another API and reply ----------
 
+def _for_system_b(partner: dict, txn: dict) -> tuple[str, str]:
+    """The payload System B receives: the transformed output as is, or converted to CSV."""
+    if partner.get("send_format") == "csv":
+        return to_csv(txn["output_payload"], txn["output_format"], partner.get("csv_delimiter") or ","), "text/csv"
+    return txn["output_payload"], "application/xml" if txn["output_format"] == "xml" else "application/json"
+
+
 async def forward(partner: dict, txn: dict) -> dict:
-    """Send a completed transaction's output to the partner's reply API and convert the API's response
-    into the caller's agreed format. Returns {"ok", "status", "body", "format", "error"}."""
+    """Send a completed transaction's output to System B (the partner's reply connection) and turn System B's
+    answer into what the caller gets back. HTTP APIs answer with their own response; files, databases and
+    queues answer with a delivery receipt. Returns {"ok", "status", "body", "format", "error"}."""
     txn_id = str(txn["id"])
-    content_type = "application/xml" if txn["output_format"] == "xml" else "application/json"
     started = time.perf_counter()
-    status = ctype = body = url = None
+    status = ctype = body = where = None
     error = None
     try:
+        payload, content_type = _for_system_b(partner, txn)
+        conn = await db.get_connection(partner["reply_connection"]) or {}
         adapter = await adapter_for(partner["reply_connection"])
-        if not isinstance(adapter, adapters.HTTP):
-            raise adapters.AdapterError("The reply target must be an HTTP connection.")
+        headers = {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}
         policy = adapters.retry_policy(adapter.config)
-        retry_statuses = adapter._retry_statuses()
+        is_http = isinstance(adapter, adapters.HTTP)
+        retry_statuses = adapter._retry_statuses() if is_http else set()
         for attempt in range(1, policy["attempts"] + 1):
             try:
-                status, ctype, body, url = await adapter.request(
-                    partner["reply_path"] or "", txn["output_payload"].encode(),
-                    {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}, content_type)
+                if is_http:
+                    status, ctype, body, url = await adapter.request(
+                        partner["reply_path"] or "", payload.encode(), headers, content_type, partner.get("reply_method"))
+                    where = f"{(partner.get('reply_method') or adapter.config.get('method') or 'POST').upper()} {url}"
+                else:
+                    detail = await adapter.send(partner["reply_path"] or "", payload.encode(), headers, content_type)
+                    status, ctype, where = 200, "application/json", f"{conn.get('name')} ({conn.get('type')})"
+                    body = json.dumps({"status": "DELIVERED", "system": conn.get("name"), "type": conn.get("type"),
+                                       "target": partner["reply_path"] or "", "detail": detail,
+                                       "format": "csv" if content_type == "text/csv" else txn["output_format"],
+                                       "transactionId": txn_id})
                 error = None
             except adapters.AdapterError as e:
                 error, status = str(e), None
+                if not e.retryable:
+                    break
             if status is not None and status not in retry_statuses:
                 break
             if attempt < policy["attempts"]:
@@ -108,20 +128,21 @@ async def forward(partner: dict, txn: dict) -> dict:
     if status is None:
         await db.record_event(txn_id, "FORWARD_FAILED", error)
         await db.set_response(txn_id, None, None)
-        return {"ok": False, "status": 502, "error": f"Upstream API unreachable: {error}"}
+        return {"ok": False, "status": 502, "error": f"System B unreachable: {error}"}
     ms = (time.perf_counter() - started) * 1000
-    await db.record_event(txn_id, "FORWARDED", f"POST {url} → HTTP {status} in {ms:.0f} ms")
+    await db.record_event(txn_id, "FORWARDED", f"{where} → {'HTTP ' + str(status) if is_http else 'delivered'} "
+                                               f"in {ms:.0f} ms")
     try:
         converted, fmt = convert_response(body, ctype, partner["response_expression"], partner["response_format"],
                                           txn["input_format"])
     except TransformError as e:
-        await db.record_event(txn_id, "RESPONSE_FAILED", f"could not convert the API's response: {e}")
+        await db.record_event(txn_id, "RESPONSE_FAILED", f"could not convert System B's response: {e}")
         await db.set_response(txn_id, body, status)
-        return {"ok": False, "status": 502, "error": f"Could not convert the upstream response: {e}"}
+        return {"ok": False, "status": 502, "error": f"Could not convert System B's response: {e}"}
     await db.set_response(txn_id, converted, status)
     await db.record_event(txn_id, "RESPONDED", f"{len(converted)} bytes of {fmt.upper()} for the caller "
-                                               f"(upstream HTTP {status})")
-    return {"ok": status < 400, "status": status, "body": converted, "format": fmt}
+                                               f"(System B status {status})")
+    return {"ok": status < 400, "status": status, "body": converted, "format": fmt, "content_type": ctype}
 
 
 async def reply_for(partner: dict, txn_id: str, result: dict | None) -> dict | None:

@@ -144,6 +144,7 @@ def _connection_card(c, types):
         top[1].markdown(f"**{_status_badge(c)}**")
         if c["last_test_at"]:
             top[1].caption(f"tested {pd.to_datetime(c['last_test_at']).tz_convert(None):%Y-%m-%d %H:%M:%S}")
+        top[2].markdown(("👤 **Dedicated to** " + c["owner_partner"]) if c.get("owner_partner") else "🌍 **Common**")
         top[2].markdown("**Used by:** " + (", ".join(c["used_by"]) if c["used_by"] else "—"))
         if c["last_test_detail"]:
             (st.caption if c["last_test_ok"] else st.error)(c["last_test_detail"])

@@ -39,9 +39,12 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
         path = f"/{p['reply_path']}" if p.get("reply_path") else ""
         fmt = {"input": p["input_format"].upper(), "json": "JSON", "xml": "XML", "unchanged": "as-is"}.get(
             p.get("response_format") or "input")
-        lines.append(node("api", f"↪ {c.get('name', p['reply_connection'])}{path}\n(target API)", fill))
-        lines.append(f'"out" -> "api" [label="forward"]; "api" -> "http" [style=dashed, color="#4f46e5", '
-                     f'fontcolor="#4f46e5", label="response as {fmt}", constraint=false];')
+        kind = {"http": "API", "ftp": "file", "database": "table"}.get(c.get("type"), "queue")
+        csv = " · CSV" if p.get("send_format") == "csv" else ""
+        answer = "response" if c.get("type") == "http" else "receipt"
+        lines.append(node("api", f"🎯 System B: {c.get('name', p['reply_connection'])}\\n{kind} {path.lstrip('/')}{csv}", fill))
+        lines.append(f'"out" -> "api" [label="send"]; "api" -> "http" [style=dashed, color="#4f46e5", '
+                     f'fontcolor="#4f46e5", label="{answer} as {fmt}", constraint=false];')
     else:
         lines.append('"out" -> "http" [style=dashed, color="#4f46e5", fontcolor="#4f46e5", '
                      'label="transformed payload", constraint=false];')
@@ -75,9 +78,10 @@ def flow_tab(p: dict):
         st.page_link(common.PAGES["connections"], label="Manage adapters & connections (brokers, APIs, retry policy)",
                      icon="🔌")
 
-    _http_endpoint(p)
+    types = api("GET", "/api/connection-types")
+    _route_form(p, conns, types)
     st.divider()
-    _response_form(p, conns)
+    _http_endpoint(p)
     st.divider()
     _adapters_form(p, conns, listeners)
     st.divider()
@@ -129,51 +133,169 @@ def _http_endpoint(p):
 
 
 RESPONSE_FORMATS = {
-    "input": "Same as the request (the caller's agreed format)",
-    "json": "JSON",
-    "xml": "XML",
-    "unchanged": "Unchanged (whatever the API returns)",
+    "input": "Translated into the caller's format",
+    "json": "Translated into JSON",
+    "xml": "Translated into XML",
+    "unchanged": "As is - exactly what System B answered",
 }
+TARGET_LABEL = {"http": "Path (added to the API's base URL)", "ftp": "Folder", "database": "Table",
+                "kafka": "Topic", "rabbitmq": "Queue", "activemq": "Queue", "ibmmq": "Queue"}
+SCOPES = {"own": "👤 This partner's endpoints", "common": "🌍 Common endpoints (shared)",
+          "new": "➕ New endpoint for this partner"}
 
 
-def _response_form(p, conns):
+def visible_endpoints(conns: dict, code: str) -> dict:
+    """Common endpoints plus this partner's own; other partners' dedicated endpoints are hidden."""
+    return {cid: c for cid, c in conns.items() if c.get("owner_partner") in (None, code)}
+
+
+def _route_form(p, conns, types):
     code = p["code"]
-    st.subheader("↩️ Response to the caller")
-    http_conns = [c for c in conns if conns[c]["type"] == "http"]
-    modes = {"transformed": "Return the transformed payload",
-             "forward": "Forward to another API and return its response"}
-    mode = st.radio("When a caller sends a message", list(modes), format_func=modes.get, horizontal=True,
-                    index=list(modes).index(p.get("reply_mode") or "transformed"), key=f"reply_mode_{code}")
+    st.subheader("🔁 Route: caller → System B → caller")
+    st.caption("A partner (A) calls this partner's endpoint → the payload is transformed → sent to **System B** "
+               "(an API, a CSV/JSON/XML file on FTP/SFTP, a database table or a queue) → System B's answer goes back "
+               "to A, translated or as is.")
+    if pending := st.session_state.pop(f"route_pending_{code}", None):  # a just-created endpoint
+        st.session_state[f"route_scope_{code}"] = "own"
+        st.session_state[f"route_conn_{code}"] = pending
+        st.session_state[f"reply_mode_{code}"] = "forward"
+    modes = {"transformed": "Reply at once with the transformed payload (no System B)",
+             "forward": "Send to System B and reply with its answer"}
+    if f"reply_mode_{code}" not in st.session_state:
+        st.session_state[f"reply_mode_{code}"] = p.get("reply_mode") or "transformed"
+    mode = st.radio("When a caller sends a message", list(modes), format_func=modes.get, key=f"reply_mode_{code}")
     if mode == "transformed":
         st.caption(f"The caller gets the transformed {p['output_format'].upper()} straight back.")
         if (p.get("reply_mode") or "transformed") != "transformed" and \
                 st.button("Save", type="primary", key=f"reply_save_t_{code}", disabled=not common.can("write")):
             _save_reply(code, {"reply_mode": "transformed"})
         return
-    if not http_conns:
-        st.warning("Add an HTTP connection for the target API on the **Connections** page first.")
+
+    outs = {cid: c for cid, c in visible_endpoints(conns, code).items() if types[c["type"]]["outbound"]}
+    own = [cid for cid, c in outs.items() if c.get("owner_partner") == code]
+    shared = [cid for cid, c in outs.items() if not c.get("owner_partner")]
+    if f"route_scope_{code}" not in st.session_state:
+        cur = p.get("reply_connection")
+        st.session_state[f"route_scope_{code}"] = "own" if cur in own else "common" if cur in shared \
+            else "own" if own else "common" if shared else "new"
+    scope = st.radio("System B endpoint", list(SCOPES), horizontal=True, key=f"route_scope_{code}",
+                     format_func=lambda x: SCOPES[x] + {"own": f" ({len(own)})", "common": f" ({len(shared)})",
+                                                        "new": ""}[x])
+    if scope == "new":
+        _new_endpoint(p, types)
         return
-    with st.form(f"reply_{code}"):
-        c1, c2 = st.columns(2)
-        cur = p.get("reply_connection") if p.get("reply_connection") in http_conns else http_conns[0]
-        conn = c1.selectbox("Target API (HTTP connection)", http_conns, http_conns.index(cur),
-                            format_func=lambda c: f"🌐 {conns[c]['name']} · {conns[c]['config'].get('base_url', '')}")
-        path = c2.text_input("Path (appended to the base URL)", p.get("reply_path") or "",
-                             placeholder="e.g. orders/v1/submit")
-        fmt = st.selectbox("Send the API's response back as", list(RESPONSE_FORMATS),
+    choices = own if scope == "own" else shared
+    if not choices:
+        st.info("No endpoints here yet - choose **➕ New endpoint for this partner**, or add a common one on the "
+                "Adapters & Connections page.")
+        return
+    key = f"route_conn_{code}"
+    if st.session_state.get(key) not in choices:
+        st.session_state[key] = p.get("reply_connection") if p.get("reply_connection") in choices else choices[0]
+    conn_id = st.selectbox("System B", choices, key=key, format_func=lambda c: f"{types[outs[c]['type']]['icon']} "
+                           f"{outs[c]['name']} · {common.connection_address(outs[c])}")
+    c = outs[conn_id]
+    t = c["type"]
+    used = [x for x in c.get("used_by") or [] if x != code]
+    sc1, sc2 = st.columns([2, 1], vertical_alignment="center")
+    if c.get("owner_partner"):
+        sc1.caption(f"👤 Dedicated to **{code}** - other partners can't see or use it.")
+        if sc2.button("🌍 Make it common", key=f"own_common_{code}", disabled=not common.can("write")):
+            _set_owner(conn_id, None)
+    else:
+        sc1.caption("🌍 Common endpoint" + (f" - also used by {', '.join(used)}." if used else " - not used by other partners yet."))
+        if not used and sc2.button("👤 Dedicate to this partner", key=f"own_ded_{code}", disabled=not common.can("write")):
+            _set_owner(conn_id, code)
+    same = p.get("reply_connection") == conn_id
+    with st.form(f"reply_{code}_{conn_id}"):
+        if t == "http":
+            m1, m2 = st.columns([1, 3])
+            methods = ["POST", "PUT", "PATCH", "GET", "DELETE"]
+            cur_m = (p.get("reply_method") if same else None) or c["config"].get("method") or "POST"
+            method = m1.selectbox("Method", methods, methods.index(cur_m) if cur_m in methods else 0)
+            target = m2.text_input(TARGET_LABEL[t], (p.get("reply_path") if same else "") or "",
+                                   placeholder="e.g. orders/v1/submit")
+        else:
+            method = None
+            target = st.text_input(TARGET_LABEL[t] + " *", (p.get("reply_path") if same else "") or "",
+                                   placeholder={"ftp": "e.g. outbound/orders", "database": "e.g. orders_in"}.get(t, f"e.g. {code}.out"))
+        f1, f2 = st.columns([3, 1])
+        formats = {"output": f"As transformed ({p['output_format'].upper()})", "csv": "CSV"}
+        if t == "database":
+            formats = {"output": "Rows (JSON fields → columns)"}
+        cur_f = p.get("send_format") or "output"
+        send_format = f1.radio("System B receives", list(formats), list(formats).index(cur_f) if cur_f in formats else 0,
+                               format_func=formats.get, horizontal=True,
+                               help="CSV: one row per item of the transformed list (or one row for an object); "
+                                    "nested fields become columns like customer.name.")
+        delims = {",": "comma", ";": "semicolon", "|": "pipe", "\t": "tab"}
+        delim = f2.selectbox("CSV separator", list(delims), list(delims).index(p.get("csv_delimiter") or ",")
+                             if (p.get("csv_delimiter") or ",") in delims else 0, format_func=delims.get,
+                             disabled=t == "database")
+        fmt = st.selectbox("The caller gets System B's answer", list(RESPONSE_FORMATS),
                            list(RESPONSE_FORMATS).index(p.get("response_format") or "input"),
                            format_func=lambda f: RESPONSE_FORMATS[f].replace(
-                               "the caller's agreed format", f"{p['input_format'].upper()}, the caller's agreed format"))
-        expr = st.text_area("Response mapping (optional, JMESPath on the API's response)",
+                               "the caller's format", f"the caller's format ({p['input_format'].upper()})"))
+        expr = st.text_area("Translate the answer (optional JMESPath mapping on System B's answer)",
                             p.get("response_expression") or "", height=90,
                             placeholder="e.g. {confirmation: {reference: reference, state: status}}")
-        st.caption("Flow: caller → transform → POST the transformed payload to the target API → convert the API's "
-                   "response → caller. The API's HTTP status is passed through; if it can't be reached the caller "
-                   "gets 502. Messages from MQ or Kafka are forwarded too, and the response is kept on the "
-                   "transaction.")
-        if st.form_submit_button("Save response settings", type="primary", disabled=not common.can("write")):
-            _save_reply(code, {"reply_mode": "forward", "reply_connection": conn, "reply_path": path,
+        if t == "http":
+            st.caption("System B's HTTP status is passed back to the caller; if it can't be reached the caller gets 502. "
+                       f"Retries follow the endpoint's policy ({common.retry_summary(c)}).")
+        else:
+            st.caption("A file, table or queue doesn't answer, so the caller gets a **delivery receipt** - "
+                       "`{status: DELIVERED, system, type, target, detail, format, transactionId}` - which you can "
+                       "translate with the mapping above. If delivery fails the caller gets 502.")
+        if st.form_submit_button("Save route", type="primary", disabled=not common.can("write")):
+            _save_reply(code, {"reply_mode": "forward", "reply_connection": conn_id, "reply_path": target,
+                               "reply_method": method, "send_format": send_format,
+                               "csv_delimiter": delim,
                                "response_format": fmt, "response_expression": expr})
+
+
+def _set_owner(conn_id, owner):
+    try:
+        api("PUT", f"/api/connections/{conn_id}/owner", json={"owner_partner": owner})
+    except ApiError as e:
+        st.error(str(e))
+        return
+    st.toast("Endpoint is now " + ("dedicated to this partner" if owner else "common"), icon="🔌")
+    st.rerun()
+
+
+def _new_endpoint(p, types):
+    """Create a System B endpoint dedicated to this partner, without leaving the page."""
+    from .connections import DB_PORTS, _fields_form
+
+    code = p["code"]
+    kinds = {"http": "🌐 API (HTTP)", "ftp": "📁 File on FTP / SFTP (CSV, JSON, XML)", "database": "🗄️ Database table",
+             "rabbitmq": "🐇 RabbitMQ queue", "activemq": "📨 ActiveMQ queue", "ibmmq": "🏦 IBM MQ queue",
+             "kafka": "🟧 Kafka topic"}
+    kinds = {k: v for k, v in kinds.items() if k in types and types[k]["outbound"]}
+    t = st.selectbox("Kind of System B", list(kinds), format_func=kinds.get, key=f"newep_type_{code}")
+    fixed, values = {}, {}
+    if t == "ftp":
+        proto = st.selectbox("Protocol", ["sftp", "ftp", "ftps"], key=f"newep_proto_{code}",
+                             format_func={"sftp": "SFTP (over SSH)", "ftp": "FTP", "ftps": "FTPS (FTP over TLS)"}.get)
+        fixed, values = {"protocol": proto}, {"port": 22 if proto == "sftp" else 21}
+    if t == "database":
+        engine = st.selectbox("Database type", list(DB_PORTS), key=f"newep_engine_{code}")
+        fixed, values = {"engine": engine}, {"port": DB_PORTS[engine]}
+    fk = f"newep_{code}_{t}" + (f"_{next(iter(fixed.values()))}" if fixed else "")
+    with st.form(fk):
+        name = st.text_input("Name *", f"{p['name']} {kinds[t].split(' ', 1)[1].split(' (')[0]}", key=f"{fk}_name")
+        config, secret = _fields_form(t, types[t], values, fk, fixed=fixed)
+        if st.form_submit_button("Create endpoint and test", type="primary", disabled=not common.can("write")):
+            try:
+                c = api("POST", "/api/connections", json={"name": name, "type": t, "config": config, "secret": secret,
+                                                          "owner_partner": code})
+            except ApiError as e:
+                st.error(str(e))
+                return
+            (st.toast if c["test_ok"] else st.warning)(f"Created {c['name']} - {c['test_detail']}")
+            st.session_state[f"route_pending_{code}"] = c["id"]
+            st.rerun()
+    st.caption("The endpoint is dedicated to this partner. You can make it common later.")
 
 
 def _save_reply(code, body):
@@ -183,17 +305,19 @@ def _save_reply(code, body):
         st.error(str(e))
         return
     common.partners.clear()
-    st.toast("Response settings saved", icon="↩️")
+    st.toast("Route saved", icon="🔁")
     st.rerun()
 
 
 def _adapters_form(p, conns, listeners):
     code = p["code"]
     types = api("GET", "/api/connection-types")
-    st.subheader("🔀 Inbound & outbound adapters")
-    in_opts = [""] + [c for c in conns if types[conns[c]["type"]]["inbound"]]
-    out_opts = [""] + [c for c in conns if types[conns[c]["type"]]["outbound"]]
-    label = lambda c: f"{types[conns[c]['type']]['icon']} {conns[c]['name']}" if c else None  # noqa: E731
+    st.subheader("🔀 More inbound & outbound adapters")
+    mine = visible_endpoints(conns, code)
+    in_opts = [""] + [c for c in mine if types[conns[c]["type"]]["inbound"]]
+    out_opts = [""] + [c for c in mine if types[conns[c]["type"]]["outbound"]]
+    label = lambda c: (f"{types[conns[c]['type']]['icon']} {conns[c]['name']}"  # noqa: E731
+                       + (" · 👤 this partner" if conns[c].get("owner_partner") else " · 🌍 common")) if c else None
     with st.form(f"adapters_{code}"):
         left, right = st.columns(2)
         with left:
@@ -207,7 +331,7 @@ def _adapters_form(p, conns, listeners):
                 icon = {"running": "🟢", "error": "🔴"}.get(lst["state"], "⚪")
                 st.caption(f"{icon} Listener {lst['state']}: {lst['detail']}")
         with right:
-            st.markdown("**Outbound**")
+            st.markdown("**Outbound copy** (fire and forget, no reply)")
             cur = p.get("outbound_connection") or ""
             outbound = st.selectbox("Deliver to", out_opts, out_opts.index(cur) if cur in out_opts else 0,
                                     format_func=lambda c: label(c) or "Store only", key=f"out_conn_{code}")
