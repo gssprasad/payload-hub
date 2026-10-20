@@ -468,14 +468,16 @@ class HTTP(Adapter):
             raise AdapterError(f"{url} answered HTTP {r.status_code}")
         return f"Reached {url} (HTTP {r.status_code})"
 
-    async def request(self, target, body, headers, content_type) -> tuple[int, str, str, str]:
-        """Call the endpoint and return (status, content_type, body, url) - used for request/reply forwarding."""
+    async def request(self, target, body, headers, content_type, method: str | None = None) -> tuple[int, str, str, str]:
+        """Call the endpoint and return (status, content_type, body, url) - used for request/reply forwarding
+        and workflow API steps. method overrides the connection's default method."""
         import httpx
 
         url = self._url(target)
+        method = (method or self.config.get("method", "POST")).upper()
         try:
             async with httpx.AsyncClient(timeout=int(self.config.get("timeout", 15)), follow_redirects=True) as client:
-                r = await client.request(self.config.get("method", "POST").upper(), url, content=body,
+                r = await client.request(method, url, content=body if method not in ("GET", "HEAD") else None,
                                          headers={"Content-Type": content_type, "Accept": content_type,
                                                   **self._headers(), **{k: str(v) for k, v in headers.items()}})
         except Exception as e:  # noqa: BLE001
@@ -818,6 +820,10 @@ class FileTransfer(Adapter):
         now = datetime.now(timezone.utc)
         ext = "xml" if "xml" in content_type else "json" if "json" in content_type else "txt"
         pattern = self.config.get("filename_pattern") or "{partner}_{timestamp}_{txn}.{ext}"
+        if headers.get("X-Filename"):  # e.g. a PDF from a workflow keeps its own name
+            name = headers["X-Filename"]
+            path = await self.write_file(target, name, body)
+            return f"wrote {path} ({len(body)} bytes) on {self._describe()}"
         try:
             name = pattern.format(partner=headers.get("X-Partner", "payload"),
                                   txn=str(headers.get("X-Transaction-Id", "manual"))[:8],
@@ -1001,6 +1007,28 @@ class Database(Adapter):
             return {"columns": columns, "rows": rows, "rowcount": count,
                     "status": f"{statement.split(None, 1)[0].upper()} {count if count >= 0 else ''}".strip(),
                     "truncated": len(rows) == max_rows}
+
+        return await self._run(run)
+
+    async def execute(self, sql: str, params: dict, write: bool = False, max_rows: int = 1000) -> dict:
+        """Run one parameterised statement (:name placeholders). Reads are rolled back; writes are committed."""
+        import sqlalchemy as sa
+
+        if not (sql or "").strip():
+            raise AdapterError("The step has no SQL.", retryable=False)
+
+        def run():
+            with self.engine().connect() as conn:
+                trans = conn.begin()
+                try:
+                    result = conn.execute(sa.text(sql), params or {})
+                    rows = [dict(r) for r in result.mappings().fetchmany(max_rows)] if result.returns_rows else []
+                    count = result.rowcount
+                    (trans.commit if write else trans.rollback)()
+                except Exception:
+                    trans.rollback()
+                    raise
+            return {"rows": rows, "rowcount": count}
 
         return await self._run(run)
 

@@ -142,6 +142,45 @@ CREATE TABLE IF NOT EXISTS adapter_state (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS workflows (
+    id             text PRIMARY KEY,
+    name           text NOT NULL,
+    description    text,
+    trigger_type   text NOT NULL DEFAULT 'manual',
+    trigger_config jsonb NOT NULL DEFAULT '{}',
+    steps          jsonb NOT NULL DEFAULT '[]',
+    active         boolean NOT NULL DEFAULT true,
+    next_run_at    timestamptz,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id           uuid PRIMARY KEY,
+    workflow_id  text NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    status       text NOT NULL,
+    source       text,
+    dry_run      boolean NOT NULL DEFAULT false,
+    input        jsonb,
+    context      jsonb,
+    steps_log    jsonb NOT NULL DEFAULT '[]',
+    failed_step  int,
+    error        text,
+    started_at   timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz,
+    duration_ms  double precision
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_wf_idx ON workflow_runs (workflow_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS workflow_files (
+    id           bigserial PRIMARY KEY,
+    run_id       uuid NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    filename     text NOT NULL,
+    content_type text NOT NULL,
+    content      bytea NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS users (
     username      text PRIMARY KEY,
     password_hash text NOT NULL,
@@ -668,6 +707,112 @@ async def system_rows(name, limit=100):
             f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM public."{name}" '
             f'ORDER BY "{order}" DESC LIMIT %s', (min(limit, 500),))
         return {"columns": cols, "rows": await cur.fetchall()}
+
+
+# ---------- workflows ----------
+
+WORKFLOW_FIELDS = ("name", "description", "trigger_type", "trigger_config", "steps", "active", "next_run_at")
+
+
+async def list_workflows():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT w.id, w.name, w.description, w.trigger_type, w.trigger_config, w.active, w.next_run_at,
+                      jsonb_array_length(w.steps) AS step_count, w.updated_at,
+                      (SELECT count(*) FROM workflow_runs r WHERE r.workflow_id = w.id) AS runs,
+                      (SELECT count(*) FROM workflow_runs r WHERE r.workflow_id = w.id AND r.status = 'COMPLETED') AS completed,
+                      (SELECT count(*) FROM workflow_runs r WHERE r.workflow_id = w.id AND r.status = 'FAILED') AS failed,
+                      (SELECT max(started_at) FROM workflow_runs r WHERE r.workflow_id = w.id) AS last_run
+               FROM workflows w ORDER BY w.name""")
+        return await cur.fetchall()
+
+
+async def get_workflow(wf_id):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM workflows WHERE id = %s", (wf_id,))
+        return await cur.fetchone()
+
+
+async def create_workflow(wf_id, **fields):
+    fields = {k: (Jsonb(v) if k in ("trigger_config", "steps") else v) for k, v in fields.items()}
+    cols = ["id", *fields]
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"INSERT INTO workflows ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
+            "ON CONFLICT (id) DO NOTHING RETURNING id", (wf_id, *fields.values()))
+        return (await cur.fetchone()) is not None
+
+
+async def update_workflow(wf_id, **fields):
+    fields = {k: (Jsonb(v) if k in ("trigger_config", "steps") else v) for k, v in fields.items()
+              if k in WORKFLOW_FIELDS}
+    if not fields:
+        return
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    async with pool.connection() as conn:
+        await conn.execute(f"UPDATE workflows SET {sets}, updated_at = now() WHERE id = %s", (*fields.values(), wf_id))
+
+
+async def delete_workflow(wf_id):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM workflows WHERE id = %s", (wf_id,))
+
+
+async def create_run(run_id, wf_id, source, dry_run, input_):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO workflow_runs (id, workflow_id, status, source, dry_run, input) VALUES (%s, %s, 'RUNNING', %s, %s, %s)",
+            (run_id, wf_id, source, dry_run, Jsonb(input_)))
+
+
+async def update_run(run_id, **fields):
+    fields = {k: (Jsonb(v) if k in ("context", "steps_log", "input") else v) for k, v in fields.items()}
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    async with pool.connection() as conn:
+        await conn.execute(f"UPDATE workflow_runs SET {sets} WHERE id = %s", (*fields.values(), run_id))
+
+
+async def get_run(run_id):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM workflow_runs WHERE id = %s", (run_id,))
+        run = await cur.fetchone()
+        if run:
+            cur = await conn.execute(
+                "SELECT id, filename, content_type, length(content) AS size, created_at FROM workflow_files "
+                "WHERE run_id = %s ORDER BY id", (run_id,))
+            run["files"] = await cur.fetchall()
+        return run
+
+
+async def list_runs(wf_id=None, limit=50):
+    where, args = ("WHERE workflow_id = %s", (wf_id,)) if wf_id else ("", ())
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""SELECT id, workflow_id, status, source, dry_run, failed_step, error, started_at, finished_at, duration_ms,
+                       (SELECT count(*) FROM workflow_files f WHERE f.run_id = r.id) AS files
+                FROM workflow_runs r {where} ORDER BY started_at DESC LIMIT %s""", (*args, limit))
+        return await cur.fetchall()
+
+
+async def add_file(run_id, filename, content_type, content):
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO workflow_files (run_id, filename, content_type, content) VALUES (%s, %s, %s, %s) RETURNING id",
+            (run_id, filename, content_type, content))
+        return (await cur.fetchone())["id"]
+
+
+async def get_file(file_id):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM workflow_files WHERE id = %s", (file_id,))
+        return await cur.fetchone()
+
+
+async def due_workflows():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM workflows WHERE active AND trigger_type = 'schedule' AND (next_run_at IS NULL OR next_run_at <= now())")
+        return await cur.fetchall()
 
 
 async def ping():

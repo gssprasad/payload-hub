@@ -113,7 +113,7 @@ using partner API keys; `/health` and `/metrics` stay open for monitoring tools.
 
 ## Partners
 
-The Streamlit app's pages: **Partners**, **Adapters & Connections**, **AI Agent**, **Send & Test**,
+The Streamlit app's pages: **Partners**, **Adapters & Connections**, **Workflows**, **AI Agent**, **Send & Test**,
 **Transactions**, **Data**, **Monitoring** and (administrators) **Users**.
 
 **Onboarding.** On the Partners page, *Onboard a new partner* opens a step-by-step wizard: basics,
@@ -199,6 +199,42 @@ not installed". IBM MQ can't run on Streamlit Cloud.
 
 On Streamlit Cloud the partner HTTP endpoints run inside the app and aren't reachable from
 outside; use *Try it* for demos. They're fully callable when the backend runs on your laptop or a server.
+
+## Workflows (multi-step: database → API → database → PDF → deliver)
+
+The **⚙️ Workflows** page chains steps where each step can use the results of the earlier ones.
+Every run has a context: `trigger` (the record that started it) plus each step's result under its
+*Save result as* name.
+
+| Step | Does |
+|------|------|
+| 🗄️ Database query | SELECT on any database connection or the built-in area; `:name` placeholders filled from *Parameters* (e.g. `order_id = {{ trigger.order_id }}`), never pasted into the SQL; one row or all rows |
+| ✏️ Database update | INSERT / UPDATE / DELETE (skipped in a dry run) |
+| 🌐 API call | GET/POST/PUT/PATCH/DELETE through an HTTP connection (path and body are templates), with the connection's retry policy; result `{status, data}` |
+| 🔀 Transform | JMESPath over all results |
+| ❓ Condition | JMESPath test; when false the run stops (status STOPPED) |
+| 📄 Create PDF | Jinja2 HTML template (`{{ … }}`, `{% for %}`, `| money`) → PDF (xhtml2pdf), stored with the run |
+| 📤 Deliver file | Send a PDF through any adapter, e.g. SFTP folder, HTTP API (skipped in a dry run) |
+
+**Triggers:** manual (*Run now*, or `POST /api/workflows/<id>/run`), schedule (every N minutes,
+optionally one run per row of a query), or database (one run per new row of `table:key`).
+
+**Running:** *Dry run* runs everything except updates and deliveries. Each run shows a
+step-by-step timeline with every step's result, and the PDF inline and as a download. Failed runs
+can be **rerun from the failed step**, reusing earlier results. Up to 4 runs execute in parallel.
+
+**Example (`Order invoice`, on the sample tables in Local PostgreSQL):**
+
+1. read the order;
+2. call the customer system (built-in mock at `/mock/customers/<id>`) with `customer_id`;
+3. read the customer and the order lines;
+4. total them, but only if there are lines;
+5. mark the order INVOICED;
+6. create the invoice PDF (template in `samples/workflows/invoice-template.html`);
+7. deliver it to the SFTP test server's `invoices` folder.
+
+*Invoice on request* runs the same steps for every new row in `invoice_requests`, and *Scheduled
+invoices* (paused) does it hourly for every order with status NEW.
 
 ## Retry policy for outbound endpoints
 

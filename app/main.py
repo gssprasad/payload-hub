@@ -1,4 +1,5 @@
 """FastAPI app: REST API, monitoring endpoints and the web UI."""
+import asyncio
 import logging
 import os
 import re
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import adapters, agent, auth, connectors, datastore, db, mapping_doc, pipeline
+from . import adapters, agent, auth, connectors, datastore, db, mapping_doc, pipeline, workflows
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,7 +32,9 @@ async def lifespan(_app):
     await datastore.init()
     await pipeline.start()
     await connectors.start()
+    await workflows.start()
     yield
+    await workflows.stop()
     await connectors.stop()
     await pipeline.stop()
     await db.close()
@@ -858,6 +861,145 @@ async def kafka_messages(conn_id: str, topic: str, limit: int = 20):
         return await (await _kafka(conn_id)).peek(topic, min(max(limit, 1), 200))
     except adapters.AdapterError as e:
         raise HTTPException(422 if not e.retryable else 502, str(e)) from e
+
+
+# ---------- workflows ----------
+
+class WorkflowIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = None
+    trigger_type: Literal["manual", "schedule", "database"] = "manual"
+    trigger_config: dict = Field(default_factory=dict)
+    steps: list[dict] = Field(default_factory=list)
+    active: bool = True
+
+
+class RunIn(BaseModel):
+    input: dict = Field(default_factory=dict)
+    dry_run: bool = False
+    wait: bool = True
+
+
+async def _workflow_or_404(wf_id: str):
+    wf = await db.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(404, "Workflow not found.")
+    return wf
+
+
+def _clean_workflow(req: WorkflowIn) -> dict:
+    try:
+        steps = workflows.validate(req.steps)
+    except workflows.StepError as e:
+        raise HTTPException(422, str(e)) from e
+    return {**req.model_dump(), "steps": steps}
+
+
+@app.get("/api/workflows")
+async def list_workflows():
+    return {"workflows": await db.list_workflows(), "triggers": workflows.trigger_status()}
+
+
+@app.post("/api/workflows", status_code=201)
+async def create_workflow(req: WorkflowIn):
+    wf_id = _slug(req.name)
+    if not await db.create_workflow(wf_id, **_clean_workflow(req)):
+        raise HTTPException(409, f"A workflow called '{wf_id}' already exists.")
+    await workflows.sync()
+    return await db.get_workflow(wf_id)
+
+
+@app.get("/api/workflows/{wf_id}")
+async def get_workflow(wf_id: str):
+    return await _workflow_or_404(wf_id)
+
+
+@app.put("/api/workflows/{wf_id}")
+async def update_workflow(wf_id: str, req: WorkflowIn):
+    await _workflow_or_404(wf_id)
+    await db.update_workflow(wf_id, **_clean_workflow(req), next_run_at=None)
+    await workflows.sync()
+    return await db.get_workflow(wf_id)
+
+
+@app.delete("/api/workflows/{wf_id}", status_code=204)
+async def delete_workflow(wf_id: str):
+    await _workflow_or_404(wf_id)
+    await db.delete_workflow(wf_id)
+    await workflows.sync()
+
+
+@app.post("/api/workflows/{wf_id}/run")
+async def run_workflow(wf_id: str, req: RunIn, request: Request):
+    """Start a run. wait=true returns the finished run; wait=false returns at once with its id."""
+    wf = await _workflow_or_404(wf_id)
+    source = f"manual by {request.state.user['username']}"
+    if req.wait:
+        return await workflows.run(wf, req.input, source, req.dry_run)
+    task = asyncio.create_task(workflows.run(wf, req.input, source, req.dry_run))
+    await asyncio.sleep(0.2)
+    return {"status": "STARTED", "running": not task.done()}
+
+
+@app.get("/api/workflows/{wf_id}/runs")
+async def workflow_runs(wf_id: str, limit: int = 50):
+    return await db.list_runs(wf_id, min(limit, 500))
+
+
+@app.get("/api/workflow-runs")
+async def all_workflow_runs(limit: int = 50):
+    return await db.list_runs(None, min(limit, 500))
+
+
+@app.get("/api/workflow-runs/{run_id}")
+async def workflow_run(run_id: uuid.UUID):
+    run = await db.get_run(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found.")
+    return run
+
+
+@app.post("/api/workflow-runs/{run_id}/rerun")
+async def rerun_workflow(run_id: uuid.UUID):
+    try:
+        return await workflows.rerun(str(run_id))
+    except workflows.StepError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.get("/api/workflow-files/{file_id}")
+async def workflow_file(file_id: int):
+    f = await db.get_file(file_id)
+    if not f:
+        raise HTTPException(404, "File not found.")
+    return Response(bytes(f["content"]), media_type=f["content_type"],
+                    headers={"Content-Disposition": f'attachment; filename="{f["filename"]}"'})
+
+
+class PdfPreviewIn(BaseModel):
+    template: str
+    context: dict = Field(default_factory=dict)
+
+
+@app.post("/api/workflows/pdf-preview")
+async def pdf_preview(req: PdfPreviewIn):
+    """Render a PDF template with sample data (e.g. a previous run's results), without storing anything."""
+    try:
+        html = workflows._html_env.from_string(req.template).render(**req.context)
+        data = await asyncio.to_thread(workflows.make_pdf, html)
+    except Exception as e:  # noqa: BLE001 - template errors are shown to the user
+        raise HTTPException(422, f"Template error: {e}") from e
+    return Response(data, media_type="application/pdf")
+
+
+@app.get("/mock/customers/{customer_id}", tags=["mock external system"])
+async def mock_customer_api(customer_id: str):
+    """A stand-in 'other system' for workflow demos: a customer credit profile."""
+    seed = sum(ord(ch) for ch in customer_id)
+    segments = ["GOLD", "SILVER", "STANDARD"]
+    return {"customer_id": customer_id, "segment": segments[seed % 3], "credit_limit": 25000 + (seed % 7) * 5000,
+            "discount_percent": [10, 5, 0][seed % 3], "payment_terms_days": [45, 30, 15][seed % 3],
+            "account_manager": ["Priya Nair", "Karthik Rao", "Sara Thomas"][seed % 3]}
 
 
 # ---------- Payload Hub's own tables, read-only (administrators) ----------
