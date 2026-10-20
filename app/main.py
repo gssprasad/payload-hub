@@ -1,5 +1,6 @@
 """FastAPI app: REST API, monitoring endpoints and the web UI."""
 import asyncio
+import json
 import logging
 import os
 import re
@@ -18,8 +19,8 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import (adapters, agent, ai, auth, connectors, cron, datastore, db, mapping_doc, pipeline, ports, scheduler,
-               vault, workflows)
+from . import (adapters, agent, ai, alerts, auth, backup, connectors, cron, datastore, db, mapping_doc, migrate,
+               pipeline, ports, scheduler, vault, workflows)
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -37,7 +38,9 @@ async def lifespan(_app):
     await workflows.start()
     await ports.start()
     await scheduler.start()
+    await alerts.start()
     yield
+    await alerts.stop()
     await scheduler.stop()
     await ports.stop()
     await workflows.stop()
@@ -66,19 +69,58 @@ async def require_login(request: Request, call_next):
         return JSONResponse({"detail": f"Your account doesn't have {permission} permission."}, status_code=403)
     request.state.user = user
     request.state.token = token
+    audited = permission != "read" and request.method in ("POST", "PUT", "DELETE") and not NOT_AUDITED.match(path)
+    parts = path.split("/")[2:]  # /api/<type>/<id>/<sub>
+    before = await _snapshot(parts) if audited and request.method != "POST" else None
     response = await call_next(request)
-    if permission != "read" and request.method in ("POST", "PUT", "DELETE") and response.status_code < 400 \
-            and not NOT_AUDITED.match(path):
-        parts = path.split("/")[2:]  # /api/<type>/<id>/<sub>
+    if audited and response.status_code < 400:
         action = {"POST": "created", "PUT": "changed", "DELETE": "deleted"}[request.method]
         if len(parts) > 2:
             action = f"{action} {'/'.join(parts[2:])}"
         try:
+            detail = f"{request.method} {path}"
+            if before is not None:
+                after = await _snapshot(parts) if request.method != "DELETE" else None
+                detail = _diff(before, after) or detail
             await db.audit(user["username"], action, parts[0].rstrip("s") if parts else "?",
-                           parts[1] if len(parts) > 1 else None, f"{request.method} {path}")
+                           parts[1] if len(parts) > 1 else None, detail)
         except Exception:  # noqa: BLE001 - never fail a request because of the audit log
             logging.getLogger("audit").exception("audit write failed")
     return response
+
+
+# What an audited object looked like, so the audit log can say what changed (never secrets or counters).
+_SNAPSHOTS = {"partners": lambda i: db.get_partner(i), "connections": lambda i: db.get_connection(i),
+              "ports": lambda i: db.get_port(i), "schedules": lambda i: db.get_schedule(i),
+              "workflows": lambda i: db.get_workflow(i), "users": lambda i: db.get_user(i)}
+_NOT_DIFFED = {"updated_at", "created_at", "api_key", "password_hash", "secret", "has_secret", "last_poll_at",
+               "last_item", "last_error", "ok_count", "fail_count", "next_run_at", "last_run_at", "last_status",
+               "last_detail", "run_count", "running", "last_test_at", "last_test_ok", "last_test_detail",
+               "last_login_at", "used_by"}
+
+
+async def _snapshot(parts):
+    fetch = _SNAPSHOTS.get(parts[0]) if len(parts) > 1 else None
+    if not fetch:
+        return None
+    try:
+        row = await fetch(parts[1])
+    except Exception:  # noqa: BLE001
+        return None
+    return {k: v for k, v in (row or {}).items() if k not in _NOT_DIFFED}
+
+
+def _short(v) -> str:
+    text = "—" if v in (None, "", [], {}) else json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+    return text if len(text) <= 60 else "(changed)"
+
+
+def _diff(before: dict, after: dict | None) -> str:
+    if after is None:
+        return f"deleted (was: {before.get('name') or before.get('username') or ''})"
+    changes = [f"{k}: {_short(before.get(k))} → {_short(after.get(k))}" for k in sorted(set(before) | set(after))
+               if before.get(k) != after.get(k)]
+    return "; ".join(changes)[:2000]
 
 
 # Calls that change nothing worth auditing (runs, sends, tests, polls) or that write their own audit entries.
@@ -1247,6 +1289,172 @@ async def rotate_master_key(request: Request):
         return await vault.rotate_master_key(request.state.user["username"])
     except vault.VaultError as e:
         raise HTTPException(409, str(e)) from e
+
+
+@app.get("/api/partners/{code}/history")
+async def partner_history(code: str, limit: int = 50):
+    """Who changed this partner (and its route, adapters, storage, mapping), and what changed."""
+    return [e for e in await db.list_audit(500, "partner") if e["object_id"] == code][:limit]
+
+
+# ---------- alerts ----------
+
+class AlertChannelIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    type: Literal["webhook", "email"]
+    config: dict = Field(default_factory=dict)
+    secret_alias: str | None = None
+    enabled: bool = True
+
+
+class AlertRuleIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    enabled: bool = True
+    event: str
+    filter: dict = Field(default_factory=dict)
+    threshold: dict = Field(default_factory=dict)
+    channels: list[str] = Field(default_factory=list)
+    cooldown_minutes: int = Field(default=15, ge=0, le=1440)
+
+
+@app.get("/api/alerts")
+async def alerts_overview(limit: int = 100):
+    rules = await db.list_alert_rules()
+    return {"events": alerts.EVENTS, "filters": alerts.FILTERS, "channels": await db.list_alert_channels(),
+            "rules": [{**r, "text": alerts.describe_rule(r)} for r in rules],
+            "log": await db.list_alert_events(min(limit, 1000)), "watch": alerts.watch_state()}
+
+
+async def _clean_channel(req: AlertChannelIn) -> dict:
+    await _check_alias(req.secret_alias)
+    try:
+        config = alerts.validate_channel(req.model_dump())
+    except alerts.AlertError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"name": req.name.strip(), "type": req.type, "config": config, "secret_alias": req.secret_alias or None,
+            "enabled": req.enabled}
+
+
+@app.post("/api/alerts/channels", status_code=201)
+async def create_alert_channel(req: AlertChannelIn):
+    cid = _slug(req.name)
+    if not await db.create_alert_channel(cid, **await _clean_channel(req)):
+        raise HTTPException(409, f"A channel called '{cid}' already exists.")
+    return next(c for c in await db.list_alert_channels() if c["id"] == cid)
+
+
+@app.put("/api/alerts/channels/{cid}")
+async def update_alert_channel(cid: str, req: AlertChannelIn):
+    await db.update_alert_channel(cid, **await _clean_channel(req))
+    return next((c for c in await db.list_alert_channels() if c["id"] == cid), None)
+
+
+@app.delete("/api/alerts/channels/{cid}", status_code=204)
+async def delete_alert_channel(cid: str):
+    await db.delete_alert_channel(cid)
+
+
+@app.post("/api/alerts/channels/{cid}/test")
+async def test_alert_channel(cid: str):
+    ch = next((c for c in await db.list_alert_channels() if c["id"] == cid), None)
+    if not ch:
+        raise HTTPException(404, "Channel not found.")
+    try:
+        result = await alerts.send(ch, "Test alert", "If you can read this, alerts reach this channel.", "test", {})
+    except Exception as e:  # noqa: BLE001 - shown to the user
+        await db.update_alert_channel_state(cid, str(e) or type(e).__name__)
+        return {"ok": False, "detail": str(e) or type(e).__name__}
+    await db.update_alert_channel_state(cid, None)
+    return {"ok": True, "detail": result}
+
+
+async def _clean_rule(req: AlertRuleIn) -> dict:
+    if req.event not in alerts.EVENTS:
+        raise HTTPException(422, "Choose what the rule alerts on.")
+    known = {c["id"] for c in await db.list_alert_channels()}
+    if not req.channels or set(req.channels) - known:
+        raise HTTPException(422, "Choose at least one channel to send to.")
+    field = alerts.FILTERS.get(req.event)
+    flt = {field: req.filter[field]} if field and req.filter.get(field) else {}
+    threshold = {}
+    if req.event == "error_rate":
+        try:
+            threshold = {"count": max(1, int(req.threshold.get("count") or 5)),
+                         "minutes": max(1, int(req.threshold.get("minutes") or 10))}
+        except (TypeError, ValueError) as e:
+            raise HTTPException(422, "The threshold needs whole numbers.") from e
+    return {"name": req.name.strip(), "enabled": req.enabled, "event": req.event, "filter": flt,
+            "threshold": threshold, "channels": req.channels, "cooldown_minutes": req.cooldown_minutes}
+
+
+@app.post("/api/alerts/rules", status_code=201)
+async def create_alert_rule(req: AlertRuleIn):
+    rid = _slug(req.name)
+    if not await db.create_alert_rule(rid, **await _clean_rule(req)):
+        raise HTTPException(409, f"A rule called '{rid}' already exists.")
+    return next(r for r in await db.list_alert_rules() if r["id"] == rid)
+
+
+@app.put("/api/alerts/rules/{rid}")
+async def update_alert_rule(rid: str, req: AlertRuleIn):
+    await db.update_alert_rule(rid, **await _clean_rule(req))
+    return next((r for r in await db.list_alert_rules() if r["id"] == rid), None)
+
+
+@app.delete("/api/alerts/rules/{rid}", status_code=204)
+async def delete_alert_rule(rid: str):
+    await db.delete_alert_rule(rid)
+
+
+# ---------- backups and schema version (administrators) ----------
+
+@app.get("/api/backups")
+async def list_backups():
+    return {"backups": await asyncio.to_thread(backup.list_backups), "folder": str(backup.backup_dir()),
+            "keep": backup.keep(), "key_fingerprint": vault.key_info()["fingerprint"]}
+
+
+@app.post("/api/backups", status_code=201)
+async def create_backup(request: Request):
+    try:
+        manifest = await asyncio.to_thread(backup.create, f"by {request.state.user['username']}")
+    except backup.BackupError as e:
+        alerts.emit("backup_failed", "Database backup failed", str(e))
+        raise HTTPException(500, str(e)) from e
+    return manifest
+
+
+@app.post("/api/backups/{name}/verify")
+async def verify_backup(name: str):
+    try:
+        return await asyncio.to_thread(backup.verify, name)
+    except backup.BackupError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.get("/api/backups/{name}/download")
+async def download_backup(name: str, request: Request):
+    from fastapi.responses import FileResponse
+
+    try:
+        path = backup.path_of(name)
+    except backup.BackupError as e:
+        raise HTTPException(404, str(e)) from e
+    await db.audit(request.state.user["username"], "downloaded", "backup", name)
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+@app.delete("/api/backups/{name}", status_code=204)
+async def delete_backup(name: str):
+    try:
+        await asyncio.to_thread(backup.delete, name)
+    except backup.BackupError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.get("/api/system/schema")
+async def schema_status():
+    return await asyncio.to_thread(migrate.status)
 
 
 @app.get("/api/audit")

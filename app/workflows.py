@@ -363,6 +363,11 @@ async def run(wf: dict, input_: dict | None, source: str, dry_run: bool = False,
     await db.update_run(run_id, status=outcome.status, error=outcome.error, failed_step=outcome.failed,
                         steps_log=steps_log, context=_jsonable(_public(ctx)), finished_at=datetime.now(timezone.utc),
                         duration_ms=round((time.perf_counter() - started) * 1000, 1))
+    if outcome.status == "FAILED":
+        from . import alerts
+
+        alerts.emit("workflow_failed", f"Workflow {wf.get('name', wf['id'])} failed", outcome.error or "",
+                    workflow=wf["id"], run=run_id)
     return await db.get_run(run_id)
 
 

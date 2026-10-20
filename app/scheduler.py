@@ -11,7 +11,7 @@ from . import adapters, connectors, cron, db
 log = logging.getLogger("scheduler")
 
 TICK_SECONDS = float(os.getenv("SCHEDULER_TICK_SECONDS", "2"))
-ACTIONS = ("workflow", "partner", "http")
+ACTIONS = ("workflow", "partner", "http", "backup")
 _loop: asyncio.Task | None = None
 _running: set[asyncio.Task] = set()
 
@@ -30,6 +30,8 @@ async def validate_action(action: dict) -> dict:
         if not isinstance(action.get("input") or {}, dict):
             raise ScheduleError("The workflow input must be a JSON object.")
         return {"type": kind, "workflow_id": action["workflow_id"], "input": action.get("input") or {}}
+    if kind == "backup":
+        return {"type": kind}
     if kind == "partner":
         p = await db.get_partner(action.get("partner_code") or "")
         if not p:
@@ -53,6 +55,8 @@ def describe_action(action: dict) -> str:
         return f"⚙️ run workflow {action.get('workflow_id')}"
     if kind == "partner":
         return f"🤝 send a message to {action.get('partner_code')}"
+    if kind == "backup":
+        return "💾 back up the database"
     if kind == "http":
         return f"🌐 {action.get('method')} {action.get('connection')}/{(action.get('path') or '').lstrip('/')}"
     return "?"
@@ -74,6 +78,15 @@ async def _perform(task: dict) -> tuple[str, str, str | None]:
         status = {"COMPLETED": "OK", "STOPPED": "OK"}.get(run["status"], "FAILED")
         return status, run.get("error") or f"{run['status'].lower()} · {steps} step(s) · {run['duration_ms']} ms", \
             str(run["id"])
+    if action["type"] == "backup":
+        from . import alerts, backup
+
+        try:
+            m = await asyncio.to_thread(backup.create, f"scheduled task {task['id']}")
+        except backup.BackupError as e:
+            alerts.emit("backup_failed", "Scheduled database backup failed", str(e))
+            return "FAILED", str(e), None
+        return "OK", f"{m['file']} · {m['size'] / 1e6:.1f} MB", m["file"]
     if action["type"] == "partner":
         p = await db.get_partner(action["partner_code"])
         if not p:
@@ -110,6 +123,10 @@ async def execute(task: dict, trigger: str) -> dict:
         status, detail, ref = "FAILED", f"{type(e).__name__}: {e}", None
     ms = round((time.perf_counter() - started) * 1000, 1)
     await db.finish_schedule_run(run_id, status, (detail or "")[:2000], ref, ms)
+    if status == "FAILED":
+        from . import alerts
+
+        alerts.emit("schedule_failed", f"Scheduled task {task['name']} failed", detail or "", task=task["id"])
     now = datetime.now(timezone.utc)
     fields = {"last_run_at": now, "last_status": status, "last_detail": (detail or "")[:500],
               "run_count": task["run_count"] + 1, "fail_count": task["fail_count"] + (status == "FAILED")}

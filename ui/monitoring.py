@@ -46,7 +46,7 @@ def _dashboard(scope, partner_names):
         by["queue"] = by["queue_mode"].map({"shared": "Shared", "dedicated": "Dedicated"}).fillna("Shared")
         by["success"] = by.apply(lambda r: (r["completed"] / (r["completed"] + r["failed"]) * 100)
                                  if (r["completed"] + r["failed"]) else None, axis=1)
-        by["last_seen"] = pd.to_datetime(by["last_seen"]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
+        by["last_seen"] = pd.to_datetime(by["last_seen"]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
         st.dataframe(by[["partner", "queue", "total", "completed", "failed", "in_flight", "success", "avg_ms",
                          "delivered", "delivery_failed", "last_seen"]],
                      hide_index=True, width="stretch",
@@ -86,7 +86,7 @@ def _dashboard(scope, partner_names):
     runs = api("GET", "/api/agent/runs", params={"limit": 10})
     if runs:
         rdf = pd.DataFrame(runs)
-        rdf["created_at"] = pd.to_datetime(rdf["created_at"]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
+        rdf["created_at"] = pd.to_datetime(rdf["created_at"]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
         rdf["status"] = rdf["status"].map(status_label)
         rdf["partner"] = rdf["partner_code"].map(lambda c: partner_names.get(c, c) if c else "–")
         st.dataframe(rdf[["created_at", "partner", "mapping_doc_name", "status", "tool_calls", "input_tokens",

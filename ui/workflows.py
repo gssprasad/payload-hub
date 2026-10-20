@@ -763,7 +763,7 @@ def _trigger(wf, status):
         cfg["max_rows"] = st.number_input("At most rows per schedule", 1, 10000, int(cfg.get("max_rows") or 100),
                                           key=f"tmax_{wf['id']}")
         if wf.get("next_run_at") and wf["trigger_type"] == "schedule":
-            st.caption(f"Next run: {pd.to_datetime(wf['next_run_at']).tz_convert(None):%Y-%m-%d %H:%M}")
+            st.caption(f"Next run: {pd.to_datetime(wf['next_run_at']).tz_convert(common.TZ).tz_localize(None):%Y-%m-%d %H:%M}")
     else:
         cfg["connection"] = _pick("Database", {k: v for k, v in dbs.items() if k != "builtin"}, cfg.get("connection"),
                                   f"tconn_{wf['id']}")
@@ -794,7 +794,7 @@ def _runs(wf):
     if not runs:
         st.caption("No runs yet.")
         return
-    rows = [{"": STATUS.get(r["status"], ""), "Started": pd.to_datetime(r["started_at"]).tz_convert(None).strftime(
+    rows = [{"": STATUS.get(r["status"], ""), "Started": pd.to_datetime(r["started_at"]).tz_convert(common.TZ).tz_localize(None).strftime(
         "%Y-%m-%d %H:%M:%S"), "Status": r["status"], "Source": r["source"], "Dry run": "yes" if r["dry_run"] else "",
              "ms": r["duration_ms"], "Files": r["files"], "Error": r["error"] or ""} for r in runs]
     event = st.dataframe(rows, hide_index=True, width="stretch", on_select="rerun",

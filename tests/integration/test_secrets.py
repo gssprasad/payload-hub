@@ -96,3 +96,16 @@ def test_master_key_rotation_with_a_key_file(admin, tmp_path):
         # the rest of the session continues with whatever key is now in the file
         os.environ["PAYLOAD_HUB_SECRET_KEY"] = key_file.read_text().strip()
         vault.KEY_FILE, vault._fernet = original_file, None
+
+
+def test_audit_says_what_changed(admin, receiver):
+    from .test_partner_flow import make_partner
+
+    p = make_partner(admin, "Audit Diff Partner")
+    admin.put(f"/api/partners/{p['code']}/reply", json={"reply_mode": "forward", "reply_connection": receiver,
+                                                        "reply_path": "orders"})
+    (entry, *_) = admin.get(f"/api/partners/{p['code']}/history").json()
+    assert entry["action"] == "changed reply" and entry["username"] == "Administrator"
+    assert "reply_mode: transformed → forward" in entry["detail"]
+    assert f"reply_connection: — → {receiver}" in entry["detail"]
+    assert "api_key" not in entry["detail"]

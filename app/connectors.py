@@ -210,6 +210,10 @@ async def deliver(msg: dict):
         return
     await db.set_delivery(txn_id, "DELIVERY_FAILED")
     await db.record_event(txn_id, "DELIVERY_FAILED", f"gave up after {attempts} attempt(s): {last_error}")
+    from . import alerts
+
+    alerts.emit("delivery_failed", f"Delivery failed for {code}", f"gave up after {attempts} attempt(s): {last_error}",
+                partner=code, transaction=txn_id)
     try:
         await pipeline.producer.send_and_wait(msg["topic_dlq"], {**msg, "delivery_error": last_error},
                                               key=txn_id.encode())

@@ -27,6 +27,7 @@ READ_ONLY_POSTS = (
     re.compile(r"^/api/workflows/pdf-preview$"),
     re.compile(r"^/api/db/[^/]+/tables/[^/]+/alter$"),  # checked per change inside (write or delete)
     re.compile(r"^/api/partners/[^/]+/store/preview$"),
+    re.compile(r"^/api/alerts/channels/[^/]+/test$"),
 )
 
 
@@ -74,7 +75,8 @@ async def user_for_token(token: str | None):
 
 
 def required_permission(method: str, path: str) -> str:
-    if path.startswith(("/api/users", "/api/system", "/api/secrets", "/api/audit")):
+    if path.startswith(("/api/users", "/api/system", "/api/secrets", "/api/audit", "/api/backups",
+                        "/api/alerts/channels")) and not (method == "GET" and path == "/api/system/schema"):
         return "admin"
     if path.startswith("/api/connections/") and path.endswith("/secret"):
         return "admin"  # revealing a stored connection password

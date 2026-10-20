@@ -65,7 +65,7 @@ def _detail(c, types):
 
 
 def _overview(c, spec):
-    rows = [("Status", _status_badge(c) + (f" · tested {pd.to_datetime(c['last_test_at']).tz_convert(None):%Y-%m-%d %H:%M}"
+    rows = [("Status", _status_badge(c) + (f" · tested {pd.to_datetime(c['last_test_at']).tz_convert(common.TZ).tz_localize(None):%Y-%m-%d %H:%M}"
                                            if c["last_test_at"] else "")),
             ("Type", spec["label"]), ("Address", _endpoint(c)),
             ("Password", f"🔐 stored secret <code>{c['secret_alias']}</code>" if c.get("secret_alias")
@@ -328,7 +328,7 @@ def _test_receiver():
         st.caption("Nothing received yet.")
         return
     for m in msgs:
-        when = pd.to_datetime(m["at"]).tz_convert(None).strftime("%H:%M:%S")
+        when = pd.to_datetime(m["at"]).tz_convert(common.TZ).tz_localize(None).strftime("%H:%M:%S")
         with st.expander(f"{when} · /{m['name']} · {m['headers'].get('x-partner', '')} · "
                          f"txn {m['headers'].get('x-transaction-id', '')[:8]}"):
             ctype = m["headers"].get("content-type", "")

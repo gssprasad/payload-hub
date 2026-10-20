@@ -25,3 +25,4 @@ openai
 google-genai
 cryptography
 psutil
+alembic>=1.13

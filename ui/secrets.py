@@ -10,7 +10,7 @@ KINDS = {"password": "🔑 Password", "api_key": "🗝️ API key", "token": "�
 
 
 def _when(v) -> str:
-    return pd.to_datetime(v).tz_convert(None).strftime("%Y-%m-%d %H:%M") if v else "—"
+    return pd.to_datetime(v).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M") if v else "—"
 
 
 def page():
@@ -114,7 +114,7 @@ def _audit():
     if not rows:
         st.caption("Nothing recorded yet.")
         return
-    st.dataframe([{"When": pd.to_datetime(r["at"]).tz_convert(None).strftime("%Y-%m-%d %H:%M:%S"),
+    st.dataframe([{"When": pd.to_datetime(r["at"]).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S"),
                    "Who": r["username"] or "system", "Did": r["action"], "What": r["object_type"],
                    "Which": r["object_id"] or "", "Detail": r["detail"] or ""} for r in rows],
                  hide_index=True, width="stretch", height=480)

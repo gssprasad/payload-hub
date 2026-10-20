@@ -124,6 +124,7 @@ def _start_backend():
 
 from ui import (agent, common, connections, data, monitoring, overview, partners, ports, schedulers, send,  # noqa: E402
                 transactions, users, workflows)
+from ui import alerts, backups  # noqa: E402
 from ui import secrets as secrets_page  # noqa: E402
 
 common.style()
@@ -246,14 +247,16 @@ sections = {
     "Connect": [_page(ports.page, "Ports", "📡", "ports"),
                 _page(connections.page, "Connections", "🔌", "connections")],
     "Operate": [_page(transactions.page, "Transactions", "🔎", "transactions"),
-                _page(monitoring.page, "Monitoring", "📊", "monitoring")],
+                _page(monitoring.page, "Monitoring", "📊", "monitoring"),
+                _page(alerts.page, "Alerts", "🔔", "alerts")],
     "Tools": [_page(send.page, "Send & Test", "▶️", "send"),
               _page(agent.page, "AI Agent", "🤖", "agent"),
               _page(data.page, "Data", "🗄️", "data")],
 }
 if common.can("admin"):
     sections["Administer"] = [_page(users.page, "Users", "👥", "users"),
-                              _page(secrets_page.page, "Secrets", "🔐", "secrets")]
+                              _page(secrets_page.page, "Secrets", "🔐", "secrets"),
+                              _page(backups.page, "Backups", "💾", "backups")]
 pages = [pg for group in sections.values() for pg in group]
 common.PAGES = {pg.url_path: pg for pg in pages}
 nav = st.navigation(sections, expanded=True)

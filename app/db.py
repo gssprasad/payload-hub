@@ -8,306 +8,8 @@ from psycopg_pool import AsyncConnectionPool
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/payloadhub")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS transactions (
-    id             uuid PRIMARY KEY,
-    created_at     timestamptz NOT NULL DEFAULT now(),
-    updated_at     timestamptz NOT NULL DEFAULT now(),
-    status         text NOT NULL,
-    mapping_name   text NOT NULL,
-    input_format   text NOT NULL,
-    output_format  text NOT NULL,
-    expression     text NOT NULL,
-    input_payload  text NOT NULL,
-    output_payload text,
-    error          text,
-    transform_ms   double precision,
-    total_ms       double precision
-);
-CREATE INDEX IF NOT EXISTS transactions_created_at_idx ON transactions (created_at DESC);
-CREATE INDEX IF NOT EXISTS transactions_status_idx ON transactions (status);
+# The schema lives in migrations/versions (Alembic) and is applied at start-up - see app/migrate.py.
 
-CREATE TABLE IF NOT EXISTS transaction_events (
-    id      bigserial PRIMARY KEY,
-    txn_id  uuid NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    at      timestamptz NOT NULL DEFAULT now(),
-    stage   text NOT NULL,
-    detail  text
-);
-CREATE INDEX IF NOT EXISTS transaction_events_txn_idx ON transaction_events (txn_id, at);
-
-CREATE TABLE IF NOT EXISTS mappings (
-    name          text PRIMARY KEY,
-    label         text NOT NULL,
-    input_format  text NOT NULL,
-    output_format text NOT NULL,
-    expression    text NOT NULL,
-    request       text,
-    created_by    text NOT NULL DEFAULT 'agent',
-    updated_at    timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS agent_runs (
-    id            bigserial PRIMARY KEY,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    request       text NOT NULL,
-    status        text NOT NULL,
-    mapping_name  text,
-    tool_calls    int NOT NULL,
-    input_tokens  int NOT NULL,
-    output_tokens int NOT NULL,
-    duration_ms   int NOT NULL,
-    explanation   text,
-    steps         jsonb NOT NULL
-);
-ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS mapping_doc_name text;
-ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS mapping_doc text;
-ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS partner_code text;
-
-CREATE TABLE IF NOT EXISTS partners (
-    code            text PRIMARY KEY,
-    name            text NOT NULL,
-    description     text,
-    contact         text,
-    input_format    text NOT NULL,
-    output_format   text NOT NULL,
-    sample_input    text,
-    expected_output text,
-    expression      text,
-    mapping_source  text,
-    queue_mode      text NOT NULL CHECK (queue_mode IN ('shared', 'dedicated')),
-    topic_in        text NOT NULL,
-    topic_out       text NOT NULL,
-    topic_dlq       text NOT NULL,
-    active          boolean NOT NULL DEFAULT true,
-    created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS partner_documents (
-    id           bigserial PRIMARY KEY,
-    partner_code text NOT NULL REFERENCES partners(code) ON DELETE CASCADE,
-    filename     text NOT NULL,
-    content      bytea NOT NULL,
-    text         text NOT NULL,
-    sheets       jsonb NOT NULL,
-    uploaded_at  timestamptz NOT NULL DEFAULT now()
-);
-
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS partner_code text;
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS topic text;
-CREATE INDEX IF NOT EXISTS transactions_partner_idx ON transactions (partner_code, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS connections (
-    id               text PRIMARY KEY,
-    name             text NOT NULL,
-    type             text NOT NULL,
-    config           jsonb NOT NULL DEFAULT '{}',
-    secret           text,
-    last_test_at     timestamptz,
-    last_test_ok     boolean,
-    last_test_detail text,
-    created_at       timestamptz NOT NULL DEFAULT now(),
-    updated_at       timestamptz NOT NULL DEFAULT now()
-);
-
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS api_key text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS inbound_connection text REFERENCES connections(id);
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS inbound_source text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS outbound_connection text REFERENCES connections(id);
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS outbound_target text;
-UPDATE partners SET api_key = 'ph_' || md5(random()::text || code) WHERE api_key IS NULL;
-
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source text;
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS delivery_status text;
-
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_mode text NOT NULL DEFAULT 'transformed';
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_method text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS send_format text NOT NULL DEFAULT 'output';
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS csv_delimiter text;
-ALTER TABLE connections ADD COLUMN IF NOT EXISTS owner_partner text;  -- NULL = common to all partners
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_connection text REFERENCES connections(id);
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_path text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'input';
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_expression text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_enabled boolean NOT NULL DEFAULT false;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_table text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_source text NOT NULL DEFAULT 'output';
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_row_path text;
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_columns jsonb;
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS response_payload text;
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upstream_status int;
-
-ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_connection text REFERENCES connections(id);
-
-CREATE TABLE IF NOT EXISTS adapter_state (
-    key        text PRIMARY KEY,
-    value      text,
-    updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS workflows (
-    id             text PRIMARY KEY,
-    name           text NOT NULL,
-    description    text,
-    trigger_type   text NOT NULL DEFAULT 'manual',
-    trigger_config jsonb NOT NULL DEFAULT '{}',
-    steps          jsonb NOT NULL DEFAULT '[]',
-    active         boolean NOT NULL DEFAULT true,
-    next_run_at    timestamptz,
-    created_at     timestamptz NOT NULL DEFAULT now(),
-    updated_at     timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS workflow_runs (
-    id           uuid PRIMARY KEY,
-    workflow_id  text NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    status       text NOT NULL,
-    source       text,
-    dry_run      boolean NOT NULL DEFAULT false,
-    input        jsonb,
-    context      jsonb,
-    steps_log    jsonb NOT NULL DEFAULT '[]',
-    failed_step  int,
-    error        text,
-    started_at   timestamptz NOT NULL DEFAULT now(),
-    finished_at  timestamptz,
-    duration_ms  double precision
-);
-CREATE INDEX IF NOT EXISTS workflow_runs_wf_idx ON workflow_runs (workflow_id, started_at DESC);
-
-CREATE TABLE IF NOT EXISTS workflow_files (
-    id           bigserial PRIMARY KEY,
-    run_id       uuid NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
-    filename     text NOT NULL,
-    content_type text NOT NULL,
-    content      bytea NOT NULL,
-    created_at   timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS ai_providers (
-    provider    text PRIMARY KEY,
-    api_key_enc text,
-    key_hint    text,
-    config      jsonb NOT NULL DEFAULT '{}',
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS app_settings (
-    key        text PRIMARY KEY,
-    value      jsonb NOT NULL,
-    updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS provider text;
-ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS model text;
-
-CREATE TABLE IF NOT EXISTS users (
-    username      text PRIMARY KEY,
-    password_hash text NOT NULL,
-    can_read      boolean NOT NULL DEFAULT true,
-    can_write     boolean NOT NULL DEFAULT false,
-    can_delete    boolean NOT NULL DEFAULT false,
-    is_admin      boolean NOT NULL DEFAULT false,
-    active        boolean NOT NULL DEFAULT true,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    last_login_at timestamptz
-);
-CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (lower(username));
-
-CREATE TABLE IF NOT EXISTS sessions (
-    token_hash text PRIMARY KEY,
-    username   text NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    expires_at timestamptz NOT NULL
-);
-
--- Named secrets (encrypted with the master key) that connections can use instead of their own password.
-CREATE TABLE IF NOT EXISTS secrets (
-    alias        text PRIMARY KEY,
-    kind         text NOT NULL DEFAULT 'password',
-    description  text,
-    value_enc    text NOT NULL,
-    version      integer NOT NULL DEFAULT 1,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    created_by   text,
-    updated_at   timestamptz NOT NULL DEFAULT now(),
-    updated_by   text
-);
-ALTER TABLE connections ADD COLUMN IF NOT EXISTS secret_alias text REFERENCES secrets(alias) ON UPDATE CASCADE;
-
--- Who changed what (secrets, keys, connection passwords, ports, users). Never holds secret values.
-CREATE TABLE IF NOT EXISTS audit_log (
-    id           bigserial PRIMARY KEY,
-    at           timestamptz NOT NULL DEFAULT now(),
-    username     text,
-    action       text NOT NULL,
-    object_type  text NOT NULL,
-    object_id    text,
-    detail       text
-);
-CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log (at DESC);
-
--- Scheduler: tasks that run a workflow, send a message to a partner or call an API on a schedule.
-CREATE TABLE IF NOT EXISTS schedules (
-    id           text PRIMARY KEY,
-    name         text NOT NULL,
-    description  text,
-    enabled      boolean NOT NULL DEFAULT true,
-    schedule     jsonb NOT NULL,
-    action       jsonb NOT NULL,
-    next_run_at  timestamptz,
-    last_run_at  timestamptz,
-    last_status  text,
-    last_detail  text,
-    run_count    integer NOT NULL DEFAULT 0,
-    fail_count   integer NOT NULL DEFAULT 0,
-    running      boolean NOT NULL DEFAULT false,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    updated_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS schedule_runs (
-    id           bigserial PRIMARY KEY,
-    schedule_id  text NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
-    trigger      text NOT NULL,
-    started_at   timestamptz NOT NULL DEFAULT now(),
-    finished_at  timestamptz,
-    status       text NOT NULL DEFAULT 'RUNNING',
-    detail       text,
-    ref          text,
-    duration_ms  double precision
-);
-CREATE INDEX IF NOT EXISTS schedule_runs_schedule_idx ON schedule_runs (schedule_id, started_at DESC);
-
--- Ports: inbound listeners defined on their own (file polling on a server folder, or a listener on a
--- connection), each feeding a partner or a workflow.
-CREATE TABLE IF NOT EXISTS ports (
-    id            text PRIMARY KEY,
-    name          text NOT NULL,
-    type          text NOT NULL,
-    enabled       boolean NOT NULL DEFAULT true,
-    config        jsonb NOT NULL DEFAULT '{}',
-    target_type   text NOT NULL,
-    target_id     text NOT NULL,
-    last_poll_at  timestamptz,
-    last_item     text,
-    last_error    text,
-    ok_count      integer NOT NULL DEFAULT 0,
-    fail_count    integer NOT NULL DEFAULT 0,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    updated_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS port_events (
-    id        bigserial PRIMARY KEY,
-    port_id   text NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-    at        timestamptz NOT NULL DEFAULT now(),
-    item      text,
-    status    text NOT NULL,
-    detail    text,
-    ref       text
-);
-CREATE INDEX IF NOT EXISTS port_events_port_idx ON port_events (port_id, at DESC);
-"""
 
 USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, created_at, last_login_at"
 
@@ -324,9 +26,12 @@ pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kw
 
 
 async def init():
+    import asyncio
+
+    from . import migrate
+
+    await asyncio.to_thread(migrate.on_startup)  # create or upgrade the schema before anything uses it
     await pool.open(wait=True, timeout=15)
-    async with pool.connection() as conn:
-        await conn.execute(SCHEMA)
 
 
 async def close():
@@ -1163,6 +868,10 @@ async def delete_port(pid):
 
 async def record_port_event(pid, item, status, detail=None, ref=None):
     ok = status in ("OK", "ACCEPTED")
+    if not ok:
+        from . import alerts
+
+        alerts.emit("port_error", f"Port {pid} couldn't process {item}", detail or "", port=pid, key=f"port-item:{pid}")
     async with pool.connection() as conn:
         await conn.execute("INSERT INTO port_events (port_id, item, status, detail, ref) VALUES (%s, %s, %s, %s, %s)",
                            (pid, item, status, detail, ref))
@@ -1240,3 +949,114 @@ async def list_audit(limit=200, object_type=None):
         else:
             cur = await conn.execute("SELECT * FROM audit_log ORDER BY at DESC LIMIT %s", (limit,))
         return await cur.fetchall()
+
+
+# ---------- alerts ----------
+
+ALERT_CHANNEL_FIELDS = ("name", "type", "config", "secret_alias", "enabled")
+ALERT_RULE_FIELDS = ("name", "enabled", "event", "filter", "threshold", "channels", "cooldown_minutes")
+
+
+async def _insert(table, key, fields, json_keys):
+    fields = {k: (Jsonb(v) if k in json_keys else v) for k, v in fields.items()}
+    cols = ["id", *fields]
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
+                                 "ON CONFLICT (id) DO NOTHING RETURNING id", (key, *fields.values()))
+        return (await cur.fetchone()) is not None
+
+
+async def _update(table, key, fields, json_keys):
+    fields = {k: (Jsonb(v) if k in json_keys else v) for k, v in fields.items()}
+    if fields:
+        async with pool.connection() as conn:
+            await conn.execute(f"UPDATE {table} SET {', '.join(f'{k} = %s' for k in fields)}, updated_at = now() "
+                               "WHERE id = %s", (*fields.values(), key))
+
+
+async def list_alert_channels():
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM alert_channels ORDER BY name")).fetchall()
+
+
+async def alert_channels(ids):
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM alert_channels WHERE id = ANY(%s)", (list(ids or []),))).fetchall()
+
+
+async def create_alert_channel(cid, **f):
+    return await _insert("alert_channels", cid, {k: v for k, v in f.items() if k in ALERT_CHANNEL_FIELDS}, ("config",))
+
+
+async def update_alert_channel(cid, **f):
+    await _update("alert_channels", cid, {k: v for k, v in f.items() if k in ALERT_CHANNEL_FIELDS}, ("config",))
+
+
+async def update_alert_channel_state(cid, error):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE alert_channels SET last_sent_at = CASE WHEN %s::text IS NULL THEN now() "
+                           "ELSE last_sent_at END, last_error = %s WHERE id = %s", (error, error, cid))
+
+
+async def delete_alert_channel(cid):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM alert_channels WHERE id = %s", (cid,))
+        await conn.execute("UPDATE alert_rules SET channels = channels - %s", (cid,))
+
+
+async def list_alert_rules():
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM alert_rules ORDER BY name")).fetchall()
+
+
+async def alert_rules_for(event):
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM alert_rules WHERE enabled AND event = %s", (event,))).fetchall()
+
+
+async def create_alert_rule(rid, **f):
+    return await _insert("alert_rules", rid, {k: v for k, v in f.items() if k in ALERT_RULE_FIELDS},
+                         ("filter", "threshold", "channels"))
+
+
+async def update_alert_rule(rid, **f):
+    await _update("alert_rules", rid, {k: v for k, v in f.items() if k in ALERT_RULE_FIELDS},
+                  ("filter", "threshold", "channels"))
+
+
+async def delete_alert_rule(rid):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM alert_rules WHERE id = %s", (rid,))
+
+
+async def mark_rule_fired(rid):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE alert_rules SET last_fired_at = now(), fired_count = fired_count + 1 WHERE id = %s",
+                           (rid,))
+
+
+async def record_alert(rule_id, event, key, subject, detail, status, results):
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO alert_events (rule_id, event, key, subject, detail, status, results) "
+                           "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                           (rule_id, event, key, subject, detail, status, Jsonb(results)))
+
+
+async def alert_sent_since(rule_id, key, since) -> bool:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT 1 FROM alert_events WHERE rule_id = %s AND key = %s AND at > %s "
+                                 "AND status <> 'suppressed' LIMIT 1", (rule_id, key, since))
+        return (await cur.fetchone()) is not None
+
+
+async def list_alert_events(limit=200):
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM alert_events ORDER BY at DESC LIMIT %s", (limit,))).fetchall()
+
+
+async def count_failed_transactions(minutes, partner=None) -> int:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM transactions WHERE status = 'FAILED' AND updated_at > now() - make_interval(mins => %s)"
+            + (" AND partner_code = %s" if partner else ""), (minutes, partner) if partner else (minutes,))
+        return (await cur.fetchone())["n"]

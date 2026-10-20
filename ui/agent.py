@@ -241,7 +241,7 @@ def _history():
         return
     names = {p["code"]: p["name"] for p in common.partners()}
     df = pd.DataFrame(runs)
-    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
     df["status"] = df["status"].map(status_label)
     df["partner"] = df["partner_code"].map(lambda c: names.get(c, c) if c else "Standalone")
     df["seconds"] = df["duration_ms"] / 1000

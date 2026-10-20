@@ -94,7 +94,7 @@ def show_events(events: list[dict]):
 
     if events:
         df = pd.DataFrame(events)
-        df["at"] = pd.to_datetime(df["at"]).dt.tz_convert(None).dt.strftime("%H:%M:%S.%f").str[:-3]
+        df["at"] = pd.to_datetime(df["at"]).dt.tz_convert(TZ).dt.tz_localize(None).dt.strftime("%H:%M:%S.%f").str[:-3]
         st.dataframe(df, hide_index=True, width="stretch",
                      column_config={"at": "Time", "stage": "Stage", "detail": "Detail"})
 
@@ -244,6 +244,18 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
                      "Address": connection_address(sc, p["store_table"]) if sc else f"userdata.{p['store_table']}",
                      "Details": f"from the {p.get('store_source') or 'output'} payload"})
     return rows
+
+
+def _local_zone() -> str:
+    import os
+
+    if os.getenv("TZ"):
+        return os.environ["TZ"]
+    path = os.path.realpath("/etc/localtime")
+    return path.split("zoneinfo/", 1)[1] if "zoneinfo/" in path else "UTC"
+
+
+TZ = _local_zone()  # times on screen are shown in the server's local time
 
 
 def pick_row(rows: list[dict], key: str, ids: list, column_config: dict | None = None, height: int | None = None):

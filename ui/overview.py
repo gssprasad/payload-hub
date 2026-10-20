@@ -57,7 +57,7 @@ def _dashboard():
 
     if c["recent_errors"]:
         st.markdown("**Latest errors**")
-        st.dataframe([{"Time": pd.to_datetime(e["at"]).tz_convert(None).strftime("%Y-%m-%d %H:%M:%S"),
+        st.dataframe([{"Time": pd.to_datetime(e["at"]).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S"),
                        "Where": "🔁 Workflow" if e["kind"] == "workflow" else "📨 Transaction",
                        "Partner / workflow": e["what"], "Error": (e["detail"] or "")[:160]}
                       for e in c["recent_errors"]], hide_index=True, width="stretch")
@@ -70,7 +70,9 @@ def _dashboard():
         r[2].metric("Disk", f"{s['disk_percent']:.0f}%", help=f"{_bytes(s['disk_used'])} of {_bytes(s['disk_total'])}")
         r[3].metric("App memory", _bytes(s["app_memory"]), help=f"{s['app_threads']} threads")
         r[4].metric("Uptime", _uptime(s["uptime_seconds"]))
-        st.caption(f"{s['host']} · {s['os']} · Python {s['python']}")
+        schema = api("GET", "/api/system/schema")
+        st.caption(f"{s['host']} · {s['os']} · Python {s['python']} · database schema {schema['current']}"
+                   + (f" ({len(schema['pending'])} pending)" if schema["pending"] else ""))
         st.markdown(f"**PostgreSQL** `{pg['database']}` · {_bytes(pg['db_bytes'])} · {pg['connections']} connections  \n"
                     + (f"**Kafka** {kafka['bootstrap']} · {kafka['topics']} topics · {kafka['messages']:,} messages · "
                        f"{kafka['backlog']} waiting" if kafka["up"] else f"**Kafka** 🔴 {kafka.get('error', 'unreachable')}"))

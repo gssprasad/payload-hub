@@ -116,7 +116,7 @@ def _detail(p):
         else:
             events = api("GET", f"/api/ports/{p['id']}/events", params={"limit": 30})
             if events:
-                st.dataframe([{"When": pd.to_datetime(e["at"]).tz_convert(None).strftime("%Y-%m-%d %H:%M:%S"),
+                st.dataframe([{"When": pd.to_datetime(e["at"]).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S"),
                                "File / message": e["item"], "Result": e["status"], "Detail": e["detail"],
                                "Transaction / run": e["ref"]} for e in events], hide_index=True, width="stretch")
             else:

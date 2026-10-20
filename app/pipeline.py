@@ -195,6 +195,12 @@ async def _finish(msg, status, detail, **fields):
         IN_FLIGHT.dec()
     TXN_TOTAL.labels(status=status, mapping=msg["mapping_name"], partner=msg.get("partner_code") or "-").inc()
     await db.record_event(txn_id, status, detail, status=status, total_ms=total_ms, **fields)
+    if status == "FAILED":
+        from . import alerts
+
+        who = msg.get("partner_code") or msg["mapping_name"]
+        alerts.emit("transaction_failed", f"Transaction failed for {who}", fields.get("error") or detail,
+                    partner=msg.get("partner_code"), transaction=txn_id)
     fut = _waiters.get(txn_id)
     if fut and not fut.done():
         fut.set_result(await db.get_transaction(txn_id))

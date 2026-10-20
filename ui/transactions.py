@@ -43,7 +43,7 @@ def page():
         return
 
     df = pd.DataFrame(txns)
-    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
     df["status"] = df["status"].map(status_label)
     df["partner"] = df["partner_code"].map(lambda c: partner_names.get(c, c) if c else "Ad-hoc")
     df["formats"] = df["input_format"] + " → " + df["output_format"]

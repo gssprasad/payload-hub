@@ -28,7 +28,7 @@ def _table(users):
         df[col] = df[col].map({True: "✅", False: "—"})
     df["active"] = df["active"].map({True: "Active", False: "Disabled"})
     for col in ("created_at", "last_login_at"):
-        df[col] = pd.to_datetime(df[col]).dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M").fillna("never")
+        df[col] = pd.to_datetime(df[col]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M").fillna("never")
     st.dataframe(df[["username", "active", *PERMISSIONS, "last_login_at", "created_at"]], hide_index=True,
                  width="stretch", column_config={"username": "User", "active": "Status",
                                                  **{k: v[0] for k, v in PERMISSIONS.items()},

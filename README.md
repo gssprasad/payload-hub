@@ -564,6 +564,21 @@ Standard JMESPath plus `concat(a, b, ...)`, `upper(s)`, `lower(s)`, `multiply(a,
 `to_float(v)`. XML input is parsed with xmltodict: attributes are `"@name"` keys and all
 values are strings.
 
+## Operations: migrations, alerts, backups
+
+See **[docs/OPERATIONS.md](docs/OPERATIONS.md)** for the runbook. In short:
+
+- **Schema migrations (Alembic)** - the schema is versioned in `migrations/versions`; the app upgrades the
+  database at start-up under a lock (`PAYLOAD_HUB_AUTO_MIGRATE=false` to leave it to a DBA).
+  `python -m app.migrate status | upgrade | downgrade <rev> | new "message"`.
+- **🔔 Alerts** (Operate) - webhook (Slack, Teams, JSON) and email channels; rules for failed transactions,
+  deliveries, workflows, scheduled tasks and backups, ports/listeners in error, Kafka/database/workers down
+  (and recovered), and error-rate thresholds; per-rule cool-down; an alert log.
+- **💾 Backups** (Administer) - `pg_dump` backups with checksum and manifest, nightly via the scheduler,
+  retention, verify, download; restore with `python -m app.backup restore <file> --yes` (or `--into` a scratch
+  database for a restore drill). The master key is not in backups - keep it separately.
+- **Audit trail** - who changed what, with before → after values; each partner's *Activity* tab shows its history.
+
 ## Tests
 
 ```bash

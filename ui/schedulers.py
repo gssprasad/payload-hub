@@ -13,11 +13,12 @@ RESULT = {"OK": "✅", "FAILED": "❌", "SKIPPED": "⏭️", "ACCEPTED": "📨",
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 KINDS = {"interval": "🔁 Every N seconds / minutes / hours", "daily": "📅 Daily at a time",
          "cron": "🧮 Cron expression", "once": "1️⃣ Once"}
-ACTIONS = {"workflow": "⚙️ Run a workflow", "partner": "🤝 Send a message to a partner", "http": "🌐 Call an API"}
+ACTIONS = {"workflow": "⚙️ Run a workflow", "partner": "🤝 Send a message to a partner", "http": "🌐 Call an API",
+           "backup": "💾 Back up the database"}
 
 
 def _when(value) -> str:
-    return pd.to_datetime(value).tz_convert(None).strftime("%Y-%m-%d %H:%M:%S") if value else "—"
+    return pd.to_datetime(value).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S") if value else "—"
 
 
 def page():
@@ -154,6 +155,9 @@ def _action_fields(a_type, action, ctx):
             st.error(f"The input isn't valid JSON: {e}")
             return None
         return {"type": "workflow", "workflow_id": wf, "input": data}
+    if a_type == "backup":
+        st.caption("Takes a database backup into the backup folder (see the Backups page). Administrators only.")
+        return {"type": "backup"}
     if a_type == "partner":
         code = _pick("Partner", ctx["partners"], action.get("partner_code"))
         payload = st.text_area("Message (empty = the partner's sample input)", action.get("payload") or "", height=120)

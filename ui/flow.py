@@ -98,6 +98,15 @@ def storage_tab(p: dict):
 
 def activity_tab(p: dict):
     _recent(p)
+    st.markdown("**Change history**")
+    history = api("GET", f"/api/partners/{p['code']}/history", params={"limit": 30})
+    if history:
+        import pandas as pd
+
+        st.dataframe([{"When": pd.to_datetime(e["at"]).tz_convert(common.TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M"), "Who": e["username"],
+                       "What": e["action"], "Changes": e["detail"]} for e in history], hide_index=True, width="stretch")
+    else:
+        st.caption("No changes recorded yet.")
 
 
 def _http_endpoint(p):
@@ -460,7 +469,7 @@ def _recent(p):
         st.caption("No transactions yet.")
         return
     df = pd.DataFrame(txns)
-    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(None).dt.strftime("%H:%M:%S")
+    df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert(common.TZ).dt.tz_localize(None).dt.strftime("%H:%M:%S")
     df["status"] = df["status"].map(status_label)
     df["delivery"] = df["delivery_status"].map({"DELIVERED": "📤 Delivered", "DELIVERY_FAILED": "⚠️ Failed"}).fillna("–")
     st.dataframe(df[["created_at", "source", "status", "delivery", "total_ms", "error"]], hide_index=True,
