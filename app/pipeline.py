@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
@@ -24,12 +25,15 @@ from .transform import TransformError, transform
 log = logging.getLogger("pipeline")
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-TOPIC_IN, TOPIC_OUT, TOPIC_DLQ = "payload.in", "payload.out", "payload.dlq"
+# Optional prefix for every topic and consumer group, so several instances (e.g. the test suite) can share one
+# Kafka cluster without seeing each other's messages.
+PREFIX = os.getenv("KAFKA_TOPIC_PREFIX", "")
+TOPIC_IN, TOPIC_OUT, TOPIC_DLQ = f"{PREFIX}payload.in", f"{PREFIX}payload.out", f"{PREFIX}payload.dlq"
 SHARED_TOPICS = (TOPIC_IN, TOPIC_OUT, TOPIC_DLQ)
 TOPIC_PARTITIONS = int(os.getenv("KAFKA_TOPIC_PARTITIONS", "2"))
-IN_PATTERN = r"^(payload|partner\.[a-z0-9-]+)\.in$"
-OUT_PATTERN = r"^(payload|partner\.[a-z0-9-]+)\.out$"
-GROUP_TRANSFORMER, GROUP_SINK = "payload-hub-transformer", "payload-hub-result-sink"
+IN_PATTERN = rf"^{re.escape(PREFIX)}(payload|partner\.[a-z0-9-]+)\.in$"
+OUT_PATTERN = rf"^{re.escape(PREFIX)}(payload|partner\.[a-z0-9-]+)\.out$"
+GROUP_TRANSFORMER, GROUP_SINK = f"{PREFIX}payload-hub-transformer", f"{PREFIX}payload-hub-result-sink"
 
 TXN_TOTAL = Counter("payload_transactions_total", "Transactions by final status",
                     ["status", "mapping", "partner"])
@@ -46,7 +50,7 @@ on_completed: list = []  # async callbacks(msg) run after a transaction complete
 
 
 def partner_topics(code: str) -> tuple[str, str, str]:
-    return f"partner.{code}.in", f"partner.{code}.out", f"partner.{code}.dlq"
+    return f"{PREFIX}partner.{code}.in", f"{PREFIX}partner.{code}.out", f"{PREFIX}partner.{code}.dlq"
 
 
 def _connection() -> dict:
@@ -205,7 +209,8 @@ async def queue_stats(max_age: float = 5.0) -> list[dict]:
     await admin.start()
     await probe.start()
     try:
-        topics = sorted(t for t in await admin.list_topics() if t.startswith(("payload.", "partner.")))
+        topics = sorted(t for t in await admin.list_topics() if re.match(
+            rf"^{re.escape(PREFIX)}(payload|partner\.[a-z0-9-]+)\.(in|out|dlq)$", t))
         described = await admin.describe_topics(topics) if topics else []
         parts = [TopicPartition(d["topic"], p["partition"]) for d in described for p in d["partitions"]]
         ends = await probe.end_offsets(parts) if parts else {}
@@ -223,7 +228,7 @@ async def queue_stats(max_age: float = 5.0) -> list[dict]:
                 lag = sum(max(0, ends[tp] - max(committed[group].get(tp, starts[tp]), starts[tp])) for tp in tps)
             rows.append({
                 "topic": t,
-                "queue": "shared" if t.startswith("payload.") else t.split(".")[1],
+                "queue": "shared" if t.startswith(f"{PREFIX}payload.") else t[len(PREFIX):].split(".")[1],
                 "kind": kind,
                 "partitions": len(tps),
                 "messages": sum(ends[tp] - starts[tp] for tp in tps),

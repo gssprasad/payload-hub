@@ -472,6 +472,28 @@ Standard JMESPath plus `concat(a, b, ...)`, `upper(s)`, `lower(s)`, `multiply(a,
 `to_float(v)`. XML input is parsed with xmltodict: attributes are `"@name"` keys and all
 values are strings.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest            # everything (about 15 s)
+pytest tests/unit # no servers needed
+ruff check .      # undefined names, unused imports, syntax errors
+```
+
+- **Unit tests** (`tests/unit`): mapping functions, JSON/XML/CSV conversion, response translation, password
+  hashing and permissions, workflow validation and templates, the DB connector on SQLite (every condition
+  operator, insert keys, guarded update/delete, values sent as parameters), and the workflow designer helpers.
+- **Integration tests** (`tests/integration`): start the real app on a free port against a **separate
+  database** (`payloadhub_test`, dropped and re-created each run; override with `PAYLOAD_HUB_TEST_DATABASE_URL`)
+  and **separate Kafka topics** (a unique `KAFKA_TOPIC_PREFIX`, deleted afterwards), so a running Payload Hub
+  is never touched. They cover sign-in and permissions, partner endpoints (JSON, XML, failures), target-system
+  routes (API as is / translated, database receipt, unreachable target, dedicated endpoints), workflows
+  (branches, retry with carry-on, dry run, rerun from the failed step) and render every UI page.
+  Without PostgreSQL or Kafka they are skipped locally.
+- **CI**: `.github/workflows/ci.yml` runs lint and all tests on every push and pull request, with PostgreSQL
+  and Kafka as service containers.
+
 ## Deploy to Streamlit Community Cloud
 
 Streamlit Cloud runs only `streamlit_app.py`, so the pipeline runs inside it

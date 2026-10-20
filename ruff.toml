@@ -1,0 +1,6 @@
+# Lint for real mistakes (undefined names, unused imports, syntax errors) - style is left alone.
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["F", "E9"]

@@ -189,9 +189,9 @@ def _review(wiz):
     c2.markdown(f"**Kafka:** {wiz['queue_mode']} queues  \n"
                 f"**Inbound:** HTTP" + (f" + `{wiz['inbound_connection']}` → `{wiz['inbound_source']}`"
                                          if wiz.get("inbound_connection") else "") + "  \n"
-                f"**Response:** " + (f"forward to `{wiz['reply_connection']}` and return its response"
+                "**Response:** " + (f"forward to `{wiz['reply_connection']}` and return its response"
                                      if wiz.get("reply_mode") == "forward" else "transformed payload") + "  \n"
-                f"**Outbound:** " + (f"`{wiz['outbound_connection']}` → `{wiz.get('outbound_target', '')}`"
+                "**Outbound:** " + (f"`{wiz['outbound_connection']}` → `{wiz.get('outbound_target', '')}`"
                                      if wiz.get("outbound_connection") else "store only"))
     if st.button("✅ Create partner", type="primary", disabled=not common.can("write")):
         body = {k: (wiz.get(k) or None) for k in ("name", "code", "description", "contact", "sample_input",

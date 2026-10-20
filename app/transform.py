@@ -59,7 +59,9 @@ def serialise(data, fmt: str) -> str:
     if fmt == "json":
         return json.dumps(data, indent=2, ensure_ascii=False)
     if fmt == "xml":
-        if not (isinstance(data, dict) and len(data) == 1):
+        if isinstance(data, list):
+            data = {"result": {"item": data}}  # XML needs one root element; list entries become <item>s
+        elif not (isinstance(data, dict) and len(data) == 1):
             data = {"result": data}
         try:
             return xmltodict.unparse(data, pretty=True, indent="  ")
