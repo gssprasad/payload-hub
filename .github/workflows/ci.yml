@@ -61,3 +61,25 @@ jobs:
         run: pytest tests/unit -q
       - name: Integration and UI tests (PostgreSQL + Kafka)
         run: pytest tests/integration -q -rs
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t payload-hub:latest .
+      - name: Start the stack (PostgreSQL, Kafka, backend, console)
+        env:
+          POSTGRES_PASSWORD: ci-db-pass
+          ADMIN_PASSWORD: ci-admin-pass
+        run: |
+          export PAYLOAD_HUB_SECRET_KEY=$(python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          docker compose up -d --wait --wait-timeout 300
+      - name: Smoke test
+        run: |
+          pip install httpx
+          python scripts/smoke_test.py http://localhost:8000 ci-admin-pass http://localhost:8501
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail 200

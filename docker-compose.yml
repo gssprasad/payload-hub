@@ -1,0 +1,87 @@
+# Payload Hub with PostgreSQL and Kafka.
+#   cp .env.example .env   # then set the passwords and the master key
+#   docker compose up -d --build
+# Backend http://localhost:8000 (partner endpoints, API) · web console http://localhost:8501
+name: payload-hub
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://payloadhub:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/payloadhub
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_TOPIC_PARTITIONS: "3"
+  PAYLOAD_HUB_SECRET_KEY: ${PAYLOAD_HUB_SECRET_KEY:?set PAYLOAD_HUB_SECRET_KEY in .env}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+  PAYLOAD_HUB_APP_URL: ${PAYLOAD_HUB_APP_URL:-http://localhost:8501}
+  PAYLOAD_HUB_TRUSTED_PROXIES: 127.0.0.1,::1,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
+  PAYLOAD_HUB_SSO_SECRET: ${PAYLOAD_HUB_SSO_SECRET:-}
+  TZ: ${TZ:-UTC}
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: payloadhub
+      POSTGRES_USER: payloadhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payloadhub -d payloadhub"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  backend:
+    build: .
+    image: payload-hub:latest
+    restart: unless-stopped
+    environment: *app-env
+    ports: ["${PAYLOAD_HUB_API_PORT:-8000}:8000"]
+    volumes: [hub-data:/app/data]
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+
+  console:
+    image: payload-hub:latest
+    restart: unless-stopped
+    command: ["streamlit", "run", "streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0",
+              "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+    environment:
+      <<: *app-env
+      PAYLOAD_HUB_API: http://backend:8000
+    ports: ["${PAYLOAD_HUB_CONSOLE_PORT:-8501}:8501"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+    depends_on:
+      backend: {condition: service_healthy}
+
+volumes:
+  postgres-data:
+  kafka-data:
+  hub-data:

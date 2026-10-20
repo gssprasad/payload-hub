@@ -1,0 +1,13 @@
+.venv
+.git
+.github
+data
+tests
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.streamlit/secrets.toml
+.env
+.DS_Store
+.claude

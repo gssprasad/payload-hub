@@ -30,6 +30,7 @@ STATIC = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(_app):
     await db.init()
+    vault._get()  # refuse to start with an unusable master key, with a clear message
     await vault.migrate()
     cluster.on_txn_done = pipeline.resolve_waiter
     await cluster.start()

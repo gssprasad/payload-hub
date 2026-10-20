@@ -40,7 +40,13 @@ def _key() -> bytes:
 def _get() -> Fernet:
     global _fernet
     if _fernet is None:
-        _fernet = Fernet(_key())
+        try:
+            _fernet = Fernet(_key())
+        except ValueError as e:
+            source = "PAYLOAD_HUB_SECRET_KEY" if os.getenv("PAYLOAD_HUB_SECRET_KEY") else str(KEY_FILE)
+            raise VaultError(f"The master key in {source} isn't a valid key (32 url-safe base64-encoded bytes). "
+                             "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+                             "print(Fernet.generate_key().decode())\"") from e
     return _fernet
 
 

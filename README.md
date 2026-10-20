@@ -564,6 +564,25 @@ Standard JMESPath plus `concat(a, b, ...)`, `upper(s)`, `lower(s)`, `multiply(a,
 `to_float(v)`. XML input is parsed with xmltodict: attributes are `"@name"` keys and all
 values are strings.
 
+## Run with Docker
+
+Everything - PostgreSQL, Kafka, the backend and the web console - with one command:
+
+```bash
+cp .env.example .env        # set POSTGRES_PASSWORD, ADMIN_PASSWORD and PAYLOAD_HUB_SECRET_KEY (see the file)
+docker compose up -d --build
+```
+
+The backend (partner endpoints and API) is on http://localhost:8000 and the web console on http://localhost:8501
+(change with `PAYLOAD_HUB_API_PORT` / `PAYLOAD_HUB_CONSOLE_PORT`). Data lives in Docker volumes (`postgres-data`,
+`kafka-data`, `hub-data` for backups and polled folders); the database is migrated automatically.
+`python scripts/smoke_test.py http://localhost:8000 <admin password> http://localhost:8501` checks a running stack;
+CI builds the image and runs that smoke test on every push.
+
+For production, point `DATABASE_URL` and `KAFKA_BOOTSTRAP` at managed PostgreSQL and Kafka instead of the bundled
+ones, put HTTPS in front (a load balancer or reverse proxy), and run more than one `backend` if you need failover
+(see docs/OPERATIONS.md).
+
 ## Sign-in security and single sign-on
 
 - **No token in the URL.** The web console keeps your session in a cookie for this site only (`SameSite=Strict`,
