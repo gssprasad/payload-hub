@@ -23,7 +23,8 @@ PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_form
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
                      "last_test_at, last_test_ok, last_test_detail, owner_partner, secret_alias, created_at, updated_at"
 
-pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kwargs={"row_factory": dict_row})
+POOL_MAX = int(os.getenv("PAYLOAD_HUB_DB_POOL_MAX", "20"))  # database connections per instance
+pool = AsyncConnectionPool(DATABASE_URL, min_size=2, max_size=POOL_MAX, open=False, kwargs={"row_factory": dict_row})
 
 
 async def init():
@@ -55,14 +56,30 @@ async def create_transaction(txn_id, mapping_name, input_format, output_format, 
         )
 
 
+FINAL_STATUSES = ("COMPLETED", "FAILED")
+
+
+async def finished_transactions(ids):
+    """The full rows of those transactions that are COMPLETED or FAILED."""
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM transactions WHERE id = ANY(%s::uuid[]) AND status IN ('COMPLETED', 'FAILED')",
+                                 (list(ids),))
+        return await cur.fetchall()
+
+
 async def record_event(txn_id, stage, detail=None, **fields):
-    """Append an audit event and optionally update columns on the transaction row."""
+    """Append an audit event and optionally update columns on the transaction row. A finished transaction
+    (COMPLETED / FAILED) is never moved back to an in-progress status by a late write - with several instances
+    the steps of one transaction can finish in any order."""
     sets = ", ".join(f"{k} = %s" for k in fields)
+    guard = ""
+    if fields.get("status") and fields["status"] not in FINAL_STATUSES:
+        guard = " AND status NOT IN ('COMPLETED', 'FAILED')"
     async with pool.connection() as conn:
         async with conn.transaction():
             if fields:
                 await conn.execute(
-                    f"UPDATE transactions SET {sets}, updated_at = now() WHERE id = %s",
+                    f"UPDATE transactions SET {sets}, updated_at = now() WHERE id = %s{guard}",
                     (*fields.values(), txn_id),
                 )
             await conn.execute(

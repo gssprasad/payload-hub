@@ -1,8 +1,8 @@
 """Running several Payload Hub instances against one database and one Kafka cluster (for failover and scale).
 
 What each instance shares through PostgreSQL:
-- finished transactions: the instance whose result sink finishes a transaction tells the others (NOTIFY), so an
-  HTTP caller waiting on another instance gets its answer;
+- finished transactions: an HTTP caller waiting on one instance gets its answer even when another instance
+  finished the work - each instance checks its waiting callers in one query every 50 ms (pipeline.py);
 - ownership: work that must happen exactly once - pollers (database tables, FTP/SFTP folders, server folders),
   workflow database triggers and the alert watcher - is owned by one instance at a time through a PostgreSQL
   advisory lock held on a dedicated connection. If that instance dies, its connection drops, the locks are freed
@@ -25,7 +25,6 @@ from . import db
 log = logging.getLogger("cluster")
 
 INSTANCE = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:4]}"
-CHANNEL = "payloadhub_txn_done"
 SUPERVISE_SECONDS = float(os.getenv("PAYLOAD_HUB_SUPERVISE_SECONDS", "30"))
 _LOCK_NAMESPACE = 7272  # first half of the two-key advisory lock
 
@@ -33,7 +32,6 @@ _lock_conn: psycopg.AsyncConnection | None = None
 _lock_guard = asyncio.Lock()
 _owned: set[str] = set()
 _tasks: list[asyncio.Task] = []
-on_txn_done = None  # set by the pipeline: async callback(txn_id)
 
 
 def _key(name: str) -> int:
@@ -101,38 +99,12 @@ async def _keep_locks():
                 _lock_conn = None
 
 
-async def notify_done(txn_id: str):
-    try:
-        async with db.pool.connection() as conn:
-            await conn.execute("SELECT pg_notify(%s, %s)", (CHANNEL, txn_id))
-    except Exception:  # noqa: BLE001 - a waiting caller falls back to polling
-        log.exception("notify for %s failed", txn_id)
-
-
-async def _listen():
-    """Hear about transactions other instances finished."""
-    while True:
-        try:
-            async with await psycopg.AsyncConnection.connect(db.DATABASE_URL, autocommit=True,
-                                                             application_name=f"payloadhub-listen-{INSTANCE}") as conn:
-                await conn.execute(f"LISTEN {CHANNEL}")
-                async for note in conn.notifies():
-                    if on_txn_done:
-                        await on_txn_done(note.payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log.warning("transaction notifications interrupted (%s) - reconnecting", e)
-            await asyncio.sleep(2)
-
-
 def status() -> dict:
     return {"instance": INSTANCE, "owns": sorted(_owned)}
 
 
 async def start():
-    _tasks.extend([asyncio.create_task(_listen(), name="cluster-listen"),
-                   asyncio.create_task(_keep_locks(), name="cluster-locks")])
+    _tasks.append(asyncio.create_task(_keep_locks(), name="cluster-locks"))
 
 
 async def stop():

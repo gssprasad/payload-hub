@@ -628,6 +628,11 @@ See **[docs/OPERATIONS.md](docs/OPERATIONS.md)** for the runbook. In short:
   database for a restore drill). The master key is not in backups - keep it separately.
 - **Audit trail** - who changed what, with before → after values; each partner's *Activity* tab shows its history.
 
+## Performance
+
+About **350 partner calls per second per instance** on a laptop, more with more instances (two gave +60%), with no
+errors in a 5-minute soak test. Details, and how to run the load test yourself: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
 ## Tests
 
 ```bash

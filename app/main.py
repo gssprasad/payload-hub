@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import secrets
+import time
 import uuid
 from collections import deque
 from datetime import date, datetime
@@ -32,7 +33,6 @@ async def lifespan(_app):
     await db.init()
     vault._get()  # refuse to start with an unusable master key, with a clear message
     await vault.migrate()
-    cluster.on_txn_done = pipeline.resolve_waiter
     await cluster.start()
     await auth.ensure_admin()
     await datastore.init()
@@ -1836,7 +1836,15 @@ async def _authorised_partner(code: str, api_key: str | None):
 async def inbound(code: str, request: Request, wait: bool = True,
                   x_api_key: str | None = Header(default=None)):
     """Partner HTTP endpoint. Send the raw payload (JSON or XML) as the body with header X-API-Key.
-    wait=true (default) returns the transformed output; wait=false returns 202 with a transaction id."""
+    wait=true (default) returns the transformed output; wait=false returns 202 with a transaction id.
+    X-Processing-Ms in the answer says how long the server spent on the call."""
+    started = time.perf_counter()
+    response = await _inbound(code, request, wait, x_api_key)
+    response.headers["X-Processing-Ms"] = f"{(time.perf_counter() - started) * 1000:.1f}"
+    return response
+
+
+async def _inbound(code: str, request: Request, wait: bool, x_api_key: str | None):
     p = await _authorised_partner(code, x_api_key or request.query_params.get("api_key"))
     body = (await request.body()).decode("utf-8", errors="replace")
     if not body.strip():

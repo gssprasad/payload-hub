@@ -86,8 +86,9 @@ secrets): Secrets page → *Audit log*, and each partner's *Activity* tab shows 
 
 Start several backends against the same PostgreSQL database and Kafka cluster (behind a load balancer for HTTP):
 
-- **Partner calls** can land on any instance: whichever instance finishes the transaction tells the others
-  (PostgreSQL `NOTIFY`), so the waiting caller always gets its answer.
+- **Partner calls** can land on any instance: if another instance finishes the transaction, the instance holding
+  the caller finds out within 50 ms (it checks all its waiting callers in one database query), so the caller
+  always gets its answer.
 - **Queue consumers** (Kafka, RabbitMQ, ActiveMQ, IBM MQ) and **HTTP ports** run on every instance and share the work.
 - **Pollers** (folders, FTP/SFTP, database tables), **workflow database triggers** and the **alert watcher** run on
   exactly one instance - the one holding its database lock. The Ports page shows the others as *standby*.

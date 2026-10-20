@@ -91,6 +91,9 @@ def _encode(obj) -> bytes:
 async def start():
     global producer
     await ensure_topics(SHARED_TOPICS)
+    task = asyncio.create_task(_watch_waiters(), name="waiter-watch")
+    task.add_done_callback(_log_crash)
+    _tasks.append(task)
     producer = AIOKafkaProducer(**_connection(), value_serializer=_encode, acks="all")
     await producer.start()
     for name, group, pattern, coro in (("transformer", GROUP_TRANSFORMER, IN_PATTERN, _transformer),
@@ -124,11 +127,11 @@ async def submit(txn_id: str, message: dict, wait_seconds: float = 15):
     _started_at[txn_id] = time.perf_counter()
     IN_FLIGHT.inc()
     try:
+        # mark it queued before publishing: once published, another instance may finish it at any moment
+        await db.record_event(txn_id, "QUEUED", f"publishing to {message['topic_in']}", status="QUEUED")
         meta = await producer.send_and_wait(message["topic_in"], message, key=txn_id.encode())
-        await db.record_event(
-            txn_id, "PUBLISHED", f"{message['topic_in']} partition {meta.partition} offset {meta.offset}",
-            status="QUEUED",
-        )
+        await db.record_event(txn_id, "PUBLISHED", f"{message['topic_in']} partition {meta.partition} "
+                                                   f"offset {meta.offset}")
         return await asyncio.wait_for(asyncio.shield(fut), wait_seconds)
     except asyncio.TimeoutError:
         return None  # still processing; the UI polls the transaction log
@@ -173,8 +176,12 @@ async def _result_sink(consumer: AIOKafkaConsumer):
     try:
         async for rec in consumer:
             msg = rec.value
-            await _finish(msg, "COMPLETED", output_payload=msg["output"],
-                          detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
+            try:
+                await _finish(msg, "COMPLETED", output_payload=msg["output"],
+                              detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
+            except Exception:  # keep the consumer alive on unexpected errors
+                log.exception("result sink failed on %s", msg.get("id"))
+                continue
             for callback in on_completed:
                 asyncio.create_task(callback(msg))
     finally:
@@ -201,22 +208,32 @@ async def _finish(msg, status, detail, **fields):
         who = msg.get("partner_code") or msg["mapping_name"]
         alerts.emit("transaction_failed", f"Transaction failed for {who}", fields.get("error") or detail,
                     partner=msg.get("partner_code"), transaction=txn_id)
-    fut = _waiters.get(txn_id)
-    if fut and not fut.done():
-        fut.set_result(await db.get_transaction(txn_id))
-    elif status in ("COMPLETED", "FAILED"):
-        from . import cluster
-
-        await cluster.notify_done(txn_id)  # the caller may be waiting on another instance
-
-
-async def resolve_waiter(txn_id: str):
-    """Another instance finished a transaction - answer the caller waiting here, if any."""
-    fut = _waiters.get(txn_id)
-    if fut and not fut.done():
+    if txn_id in _waiters:
         txn = await db.get_transaction(txn_id)
-        if txn and txn["status"] in ("COMPLETED", "FAILED") and not fut.done():
+        fut = _waiters.get(txn_id)
+        if fut and not fut.done():  # no await between the check and set_result: the waiter watch may answer too
             fut.set_result(txn)
+
+
+
+WAITER_POLL_SECONDS = float(os.getenv("PAYLOAD_HUB_WAITER_POLL_SECONDS", "0.05"))
+
+
+async def _watch_waiters():
+    """Answer callers whose transaction another instance finished: one query every WAITER_POLL_SECONDS for all
+    callers waiting here, however many there are. (Transactions finished on this instance answer at once.)"""
+    while True:
+        await asyncio.sleep(WAITER_POLL_SECONDS)
+        waiting = [t for t, f in _waiters.items() if not f.done()]
+        if not waiting:
+            continue
+        try:
+            for txn in await db.finished_transactions(waiting):
+                fut = _waiters.get(str(txn["id"]))
+                if fut and not fut.done():
+                    fut.set_result(txn)
+        except Exception:  # noqa: BLE001 - try again next round
+            log.exception("checking waiting callers")
 
 
 async def queue_stats(max_age: float = 5.0) -> list[dict]:
