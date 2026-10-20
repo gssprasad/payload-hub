@@ -256,6 +256,14 @@ Local test servers (development only): `.venv/bin/python scripts/dev_file_server
 127.0.0.1:2121 and SFTP on 127.0.0.1:2222, both with user `demo` / `demo123`, serving `data/ftp`
 and `data/sftp`. Needs `pip install pyftpdlib`.
 
+## Seeing tables
+
+- An empty database on the Data page offers **Create sample tables**: `customers`, `orders` and
+  `order_lines` with primary keys (composite on order_lines), a unique email and example rows.
+- Administrators also get **🛡️ Payload Hub system tables** in the Database picker: the tool's own
+  tables (partners, transactions, events, connections, users...), read-only, with password hashes,
+  session tokens, connection secrets, partner API keys and document contents left out.
+
 ## Table designer
 
 Data → **🧱 Table designer** works on the built-in area and on every database connection, e.g. the

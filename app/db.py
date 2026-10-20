@@ -634,6 +634,42 @@ async def delete_session(token_hash):
         await conn.execute("DELETE FROM sessions WHERE token_hash = %s", (token_hash,))
 
 
+# Columns never shown in the read-only system tables view.
+SYSTEM_HIDDEN = {"users": {"password_hash"}, "sessions": {"token_hash"}, "connections": {"secret"},
+                 "partners": {"api_key"}, "partner_documents": {"content", "text"}}
+
+
+async def system_tables():
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT c.table_name, c.column_name, c.data_type FROM information_schema.columns c
+               JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+               WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+               ORDER BY c.table_name, c.ordinal_position""")
+        tables: dict[str, dict] = {}
+        for r in await cur.fetchall():
+            t = tables.setdefault(r["table_name"], {"name": r["table_name"], "columns": [], "rows": 0})
+            if r["column_name"] not in SYSTEM_HIDDEN.get(r["table_name"], set()):
+                t["columns"].append({"name": r["column_name"], "type": r["data_type"]})
+        for t in tables.values():
+            cur = await conn.execute(f'SELECT count(*) AS n FROM public."{t["name"]}"')
+            t["rows"] = (await cur.fetchone())["n"]
+        return list(tables.values())
+
+
+async def system_rows(name, limit=100):
+    tables = {t["name"]: t for t in await system_tables()}
+    if name not in tables:
+        return None
+    cols = [c["name"] for c in tables[name]["columns"]]
+    order = "created_at" if "created_at" in cols else cols[0]
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM public."{name}" '
+            f'ORDER BY "{order}" DESC LIMIT %s', (min(limit, 500),))
+        return {"columns": cols, "rows": await cur.fetchall()}
+
+
 async def ping():
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")

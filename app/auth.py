@@ -72,7 +72,7 @@ async def user_for_token(token: str | None):
 
 
 def required_permission(method: str, path: str) -> str:
-    if path.startswith("/api/users"):
+    if path.startswith(("/api/users", "/api/system")):
         return "admin"
     if path.startswith("/api/auth/"):
         return "signed_in"

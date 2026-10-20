@@ -5,7 +5,7 @@ import re
 import secrets
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -858,6 +858,74 @@ async def kafka_messages(conn_id: str, topic: str, limit: int = 20):
         return await (await _kafka(conn_id)).peek(topic, min(max(limit, 1), 200))
     except adapters.AdapterError as e:
         raise HTTPException(422 if not e.retryable else 502, str(e)) from e
+
+
+# ---------- Payload Hub's own tables, read-only (administrators) ----------
+
+@app.get("/api/system/tables")
+async def system_tables():
+    """The tool's own tables with sensitive columns (passwords, keys, tokens, secrets) left out."""
+    return await db.system_tables()
+
+
+@app.get("/api/system/tables/{name}/rows")
+async def system_rows(name: str, limit: int = 100):
+    data = await db.system_rows(name, limit)
+    if data is None:
+        raise HTTPException(404, "Table not found.")
+    return data
+
+
+# ---------- sample tables ----------
+
+SAMPLE_TABLES = [
+    ({"name": "customers", "add_tracking": False, "columns": [
+        {"name": "customer_id", "type": "varchar", "length": 20, "primary_key": True},
+        {"name": "name", "type": "varchar", "length": 120, "nullable": False},
+        {"name": "email", "type": "varchar", "length": 160, "unique": True},
+        {"name": "country", "type": "varchar", "length": 2},
+        {"name": "created_at", "type": "timestamp", "default": "now"}]},
+     [{"customer_id": "C-1001", "name": "Asha Rao", "email": "asha.rao@example.com", "country": "IN"},
+      {"customer_id": "C-1002", "name": "Arjun Menon", "email": "arjun.menon@example.com", "country": "IN"},
+      {"customer_id": "C-1003", "name": "Meera Iyer", "email": "meera.iyer@example.com", "country": "US"}]),
+    ({"name": "orders", "add_tracking": False, "columns": [
+        {"name": "order_id", "type": "varchar", "length": 20, "primary_key": True},
+        {"name": "customer_id", "type": "varchar", "length": 20, "nullable": False},
+        {"name": "order_date", "type": "date"},
+        {"name": "status", "type": "varchar", "length": 20, "default": "NEW"},
+        {"name": "total", "type": "numeric", "precision": 12, "scale": 2}]},
+     [{"order_id": "NR-20931", "customer_id": "C-1002", "order_date": date(2026, 10, 18), "status": "SHIPPED", "total": 4244.00},
+      {"order_id": "ZP-45821", "customer_id": "C-1003", "order_date": date(2026, 10, 15), "status": "NEW", "total": 24330.00},
+      {"order_id": "AC-1042", "customer_id": "C-1001", "order_date": date(2026, 10, 19), "status": "INVOICED", "total": 61.00}]),
+    ({"name": "order_lines", "add_tracking": False, "columns": [
+        {"name": "order_id", "type": "varchar", "length": 20, "primary_key": True},
+        {"name": "line_no", "type": "integer", "primary_key": True},
+        {"name": "sku", "type": "varchar", "length": 30, "nullable": False},
+        {"name": "quantity", "type": "integer", "default": "1"},
+        {"name": "unit_price", "type": "numeric", "precision": 12, "scale": 2}]},
+     [{"order_id": "NR-20931", "line_no": 1, "sku": "YM-01", "quantity": 2, "unit_price": 1299},
+      {"order_id": "NR-20931", "line_no": 2, "sku": "BL-07", "quantity": 3, "unit_price": 449},
+      {"order_id": "ZP-45821", "line_no": 1, "sku": "MED-PCM-500", "quantity": 200, "unit_price": 18.50},
+      {"order_id": "AC-1042", "line_no": 1, "sku": "YM-01", "quantity": 2, "unit_price": 24.50}]),
+]
+
+
+@app.post("/api/db/{target}/samples", status_code=201)
+async def create_sample_tables(target: str):
+    """Create customers, orders and order_lines with example rows (skips tables that already exist)."""
+    database = await _db_target(target)
+    try:
+        existing = {t["name"] for t in await database.tables()}
+        created = []
+        for spec, rows in SAMPLE_TABLES:
+            if spec["name"] in existing:
+                continue
+            await database.create_designed(spec)
+            await database.insert_rows(spec["name"], rows)
+            created.append(spec["name"])
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"created": created}
 
 
 # ---------- table designer (built-in area or any database connection) ----------

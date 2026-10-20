@@ -15,10 +15,13 @@ EXAMPLES = {
 
 
 BUILTIN = ""
+SYSTEM = "__system__"
 
 
 def _base(target: str) -> str:
-    """API prefix for the chosen database: the built-in data area, or a database connection."""
+    """API prefix for the chosen database: the built-in data area, the system tables, or a database connection."""
+    if target == SYSTEM:
+        return "/api/system"
     return "/api/data" if target == BUILTIN else f"/api/connections/{target}"
 
 
@@ -27,16 +30,21 @@ def page():
                           "change it with SQL - in the built-in data area or any connected database.")
     status = api("GET", "/api/data/status")
     dbs = {c["id"]: c for c in api("GET", "/api/connections") if c["type"] == "database"}
-    options = [BUILTIN, *dbs]
+    options = [BUILTIN, *dbs] + ([SYSTEM] if common.can("admin") else [])
+    labels = {BUILTIN: "🏠 Payload Hub data area (built-in, schema userdata)",
+              SYSTEM: "🛡️ Payload Hub system tables (read-only, administrators)"}
     target = st.selectbox(
         "Database", options, key="data_target",
-        format_func=lambda t: "🏠 Payload Hub data area (built-in, schema userdata)" if t == BUILTIN else
+        format_func=lambda t: labels.get(t) or
         f"🗄️ {dbs[t]['name']} · {common.connection_address(dbs[t]).replace(' → table ', '')}",
         help="Add PostgreSQL, MySQL, SQL Server, Oracle or SQLite databases on the Adapters & Connections page.")
     if target == BUILTIN and not status["restricted_role"]:
         st.warning("This database didn't allow creating the restricted data role, so the SQL console is limited "
                    "to administrators.")
-    if target != BUILTIN:
+    if target == SYSTEM:
+        st.caption("The tool's own tables in the payloadhub database, for looking only. Passwords, API keys, session "
+                   "tokens and connection secrets are never shown. Change things through the app's pages instead.")
+    elif target != BUILTIN:
         st.caption("Changes run with this connection's database user, so that user's own rights also apply. "
                    "Read queries are always rolled back.")
     try:
@@ -46,8 +54,11 @@ def page():
         return
     c = st.columns(3)
     c[0].metric("Tables", len(tables))
-    c[1].metric("Rows stored", sum(t["rows"] for t in tables))
+    c[1].metric("Rows", sum(t["rows"] for t in tables))
     c[2].metric("Partners storing", sum(1 for p in common.partners() if p.get("store_enabled")))
+    if target == SYSTEM:
+        _browse(target, tables)
+        return
 
     browse, design, modify, console = st.tabs(["📋 Tables", "🧱 Table designer", "🛠️ Modify a table", "🧮 SQL console"])
     with browse:
@@ -62,7 +73,17 @@ def page():
 
 def _browse(target, tables):
     if not tables:
-        st.info("No tables yet - create one on the **Table designer** tab.")
+        st.info("This database has no tables yet. Create your own on the **Table designer** tab, or add three "
+                "sample tables (customers, orders and order_lines, with primary keys and example rows) to explore.")
+        if st.button("➕ Create sample tables", type="primary", key=f"samples_{target}",
+                     disabled=not common.can("write")):
+            try:
+                r = api("POST", f"/api/db/{'builtin' if target == BUILTIN else target}/samples")
+            except ApiError as e:
+                st.error(str(e))
+            else:
+                st.toast("Created " + ", ".join(r["created"]), icon="✅")
+                st.rerun()
         return
     users_of = {}
     for p in common.partners():
@@ -86,6 +107,8 @@ def _browse(target, tables):
                         st.caption("Showing the latest 100 rows - use the SQL console for more.")
                 else:
                     st.caption("No rows yet.")
+            if target == SYSTEM:
+                continue
             if st.checkbox(f"I want to delete table {t['name']} and all its rows", key=f"drop_ok_{target}_{t['name']}") \
                     and st.button("Delete table", key=f"drop_{target}_{t['name']}", disabled=not common.can("delete")):
                 try:
