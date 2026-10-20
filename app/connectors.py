@@ -17,7 +17,6 @@ from .transform import TransformError, convert_response
 
 log = logging.getLogger("connectors")
 
-DELIVERY_ATTEMPTS = 3
 SUPERVISE_SECONDS = 15
 SYNC_SOURCES = ("HTTP", "UI")  # callers waiting for a reply; others (MQ, Kafka) get the forward done in the background
 
@@ -81,15 +80,32 @@ async def forward(partner: dict, txn: dict) -> dict:
     txn_id = str(txn["id"])
     content_type = "application/xml" if txn["output_format"] == "xml" else "application/json"
     started = time.perf_counter()
+    status = ctype = body = url = None
+    error = None
     try:
         adapter = await adapter_for(partner["reply_connection"])
         if not isinstance(adapter, adapters.HTTP):
             raise adapters.AdapterError("The reply target must be an HTTP connection.")
-        status, ctype, body, url = await adapter.request(
-            partner["reply_path"] or "", txn["output_payload"].encode(),
-            {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}, content_type)
+        policy = adapters.retry_policy(adapter.config)
+        retry_statuses = adapter._retry_statuses()
+        for attempt in range(1, policy["attempts"] + 1):
+            try:
+                status, ctype, body, url = await adapter.request(
+                    partner["reply_path"] or "", txn["output_payload"].encode(),
+                    {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}, content_type)
+                error = None
+            except adapters.AdapterError as e:
+                error, status = str(e), None
+            if status is not None and status not in retry_statuses:
+                break
+            if attempt < policy["attempts"]:
+                wait = min(policy["backoff"] * 2 ** (attempt - 1), policy["backoff_max"], 5)  # caller is waiting
+                await db.record_event(txn_id, "FORWARD_RETRY", f"attempt {attempt}: "
+                                      + (error or f"HTTP {status}") + f" - retrying in {wait} s")
+                await asyncio.sleep(wait)
     except Exception as e:  # noqa: BLE001
         error = str(e) or type(e).__name__
+    if status is None:
         await db.record_event(txn_id, "FORWARD_FAILED", error)
         await db.set_response(txn_id, None, None)
         return {"ok": False, "status": 502, "error": f"Upstream API unreachable: {error}"}
@@ -136,23 +152,34 @@ async def deliver(msg: dict):
     content_type = "application/xml" if msg["output_format"] == "xml" else "application/json"
     headers = {"X-Transaction-Id": txn_id, "X-Partner": code}
     target = partner["outbound_target"] or ""
-    last_error = None
-    for attempt in range(1, DELIVERY_ATTEMPTS + 1):
+    last_error, attempts = None, 1
+    try:
+        adapter = await adapter_for(partner["outbound_connection"])
+        policy = adapters.retry_policy(adapter.config)
+    except Exception as e:  # noqa: BLE001
+        adapter, policy, last_error = None, {"attempts": 0}, str(e) or type(e).__name__
+    for attempt in range(1, policy["attempts"] + 1):
+        attempts = attempt
         try:
-            adapter = await adapter_for(partner["outbound_connection"])
             detail = await adapter.send(target, msg["output"].encode(), headers, content_type)
         except Exception as e:  # noqa: BLE001
             last_error = str(e) or type(e).__name__
             log.warning("delivery %s attempt %d failed: %s", txn_id, attempt, last_error)
-            if attempt < DELIVERY_ATTEMPTS:
-                await db.record_event(txn_id, "DELIVERY_RETRY", f"attempt {attempt} failed: {last_error}")
-                await asyncio.sleep(2 ** attempt)
+            if not getattr(e, "retryable", True):
+                await db.record_event(txn_id, "DELIVERY_ERROR", f"attempt {attempt}: permanent error, not retrying")
+                break
+            if attempt < policy["attempts"]:
+                wait = min(policy["backoff"] * 2 ** (attempt - 1), policy["backoff_max"])
+                await db.record_event(txn_id, "DELIVERY_RETRY",
+                                      f"attempt {attempt} failed: {last_error} - retrying in {wait} s")
+                await asyncio.sleep(wait)
             continue
         await db.set_delivery(txn_id, "DELIVERED")
-        await db.record_event(txn_id, "DELIVERED", f"{detail} via connection '{partner['outbound_connection']}'")
+        await db.record_event(txn_id, "DELIVERED", f"{detail} via connection '{partner['outbound_connection']}'"
+                                                  + (f" (attempt {attempt})" if attempt > 1 else ""))
         return
     await db.set_delivery(txn_id, "DELIVERY_FAILED")
-    await db.record_event(txn_id, "DELIVERY_FAILED", f"gave up after {DELIVERY_ATTEMPTS} attempts: {last_error}")
+    await db.record_event(txn_id, "DELIVERY_FAILED", f"gave up after {attempts} attempt(s): {last_error}")
     try:
         await pipeline.producer.send_and_wait(msg["topic_dlq"], {**msg, "delivery_error": last_error},
                                               key=txn_id.encode())
@@ -232,8 +259,23 @@ def listener_status() -> dict:
 
 # ---------- lifecycle ----------
 
+async def store(msg: dict):
+    """Called when a transaction completes: write its data into the partner's table if storing is on."""
+    from . import datastore
+
+    code = msg.get("partner_code")
+    if not code:
+        return
+    partner = await db.get_partner(code)
+    if partner and partner.get("store_enabled") and partner.get("store_table"):
+        txn = await db.get_transaction(msg["id"])
+        if txn:
+            await datastore.store_for(partner, txn)
+
+
 async def start():
     global _supervisor
+    pipeline.on_completed.append(store)
     pipeline.on_completed.append(deliver)
     await sync()
     _supervisor = asyncio.create_task(_supervise(), name="listener-supervisor")

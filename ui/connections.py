@@ -17,7 +17,8 @@ PRESETS = {
 
 
 def page():
-    common.hero("🔌 Connections", "Adapters to message brokers and HTTP endpoints. Partners use them to receive messages (inbound) and to deliver transformed results (outbound).")
+    common.hero("🔌 Adapters & Connections", "Connect message brokers (RabbitMQ, ActiveMQ, IBM MQ, Kafka) and HTTP "
+                "APIs once; partners use them to receive messages, deliver results and forward requests.")
     types = api("GET", "/api/connection-types")
     conns = api("GET", "/api/connections")
 
@@ -47,10 +48,21 @@ def _status_badge(c) -> str:
 
 
 def _fields_form(type_key, spec, values, key_prefix, editing=False):
-    """Render one input per field spec; returns (config, secret)."""
+    """Render one input per field spec (connection fields, then the retry policy); returns (config, secret)."""
     config, secret = {}, None
+    main = [f for f in spec["fields"] if f.get("group") != "retry"]
+    retry = [f for f in spec["fields"] if f.get("group") == "retry"]
+    secret = _render_fields(main, values, key_prefix, editing, config)
+    if retry:
+        st.markdown("**🔁 Retry policy** (outbound deliveries and API forwarding)")
+        _render_fields(retry, values, key_prefix, editing, config)
+    return config, secret
+
+
+def _render_fields(fields, values, key_prefix, editing, config):
+    secret = None
     cols = st.columns(2)
-    for i, f in enumerate(spec["fields"]):
+    for i, f in enumerate(fields):
         col = cols[i % 2] if f["kind"] not in ("textarea",) else st
         k = f"{key_prefix}_{f['key']}"
         current = values.get(f["key"], f["default"])
@@ -67,7 +79,7 @@ def _fields_form(type_key, spec, values, key_prefix, editing=False):
             secret = entered if (entered or not editing) else None
         else:
             config[f["key"]] = col.text_input(f["label"], value=current or "", key=k, help=f.get("help"))
-    return config, secret
+    return secret
 
 
 def _add_connection(types):
@@ -109,6 +121,12 @@ def _connection_card(c, types):
         top[2].markdown("**Used by:** " + (", ".join(c["used_by"]) if c["used_by"] else "—"))
         if c["last_test_detail"]:
             (st.caption if c["last_test_ok"] else st.error)(c["last_test_detail"])
+        if spec.get("outbound"):
+            cfg = c["config"]
+            statuses = f" · retries on HTTP {cfg.get('retry_on_status', '408,425,429,500,502,503,504')}" \
+                if c["type"] == "http" else ""
+            st.caption(f"🔁 {cfg.get('retry_attempts', 3)} attempts · first retry after {cfg.get('retry_backoff', 2)} s, "
+                       f"doubling up to {cfg.get('retry_backoff_max', 30)} s{statuses}")
 
         b = st.columns([1, 1, 1, 3])
         if b[0].button("Test", key=f"test_{c['id']}"):

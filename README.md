@@ -113,8 +113,8 @@ using partner API keys; `/health` and `/metrics` stay open for monitoring tools.
 
 ## Partners
 
-The Streamlit app has six pages: **Partners**, **Connections**, **AI Agent**, **Send & Test**,
-**Transactions** and **Monitoring**.
+The Streamlit app's pages: **Partners**, **Adapters & Connections**, **AI Agent**, **Send & Test**,
+**Transactions**, **Data**, **Monitoring** and (administrators) **Users**.
 
 **Onboarding.** On the Partners page, *Onboard a new partner* opens a step-by-step wizard: basics,
 payloads and mapping (and an optional mapping document), Kafka queues, inbound, outbound, and a
@@ -199,6 +199,38 @@ not installed". IBM MQ can't run on Streamlit Cloud.
 
 On Streamlit Cloud the partner HTTP endpoints run inside the app and aren't reachable from
 outside; use *Try it* for demos. They're fully callable when the backend runs on your laptop or a server.
+
+## Retry policy for outbound endpoints
+
+Every outbound-capable connection (HTTP, RabbitMQ, ActiveMQ, IBM MQ, Kafka) has a retry policy on
+the *Adapters & Connections* page: delivery attempts, the first wait (doubling each time) and the
+longest wait. HTTP connections also list which status codes are temporary (default
+`408,425,429,500,502,503,504`); other errors, such as 400 or 401, are treated as permanent and not
+retried. Failed deliveries are parked on the partner's failure queue. Forwarding to an API uses
+the same policy, with waits capped at 5 s because the caller is waiting.
+
+The partner's *API access* view and *Flow & endpoints* tab list every inbound and outbound
+address (HTTP endpoint, MQ listener, forward API, delivery target, storage table) with its retry
+policy.
+
+## Data tables and storing partner data
+
+The **Data** page creates tables (column editor with types), browses their rows, and has a SQL
+console. Everything lives in the `userdata` schema and runs as the restricted role
+`payloadhub_data`, which can't touch Payload Hub's own tables. Permissions: SELECT needs read;
+INSERT, UPDATE, CREATE and ALTER need write; DELETE, DROP and TRUNCATE need delete. One statement
+at a time, read queries run read-only, and every statement has a 15 s limit.
+
+Per partner, *Flow & endpoints → Store in the database* is an on/off switch. When on, every
+completed message writes rows into a chosen table. You pick:
+
+- the source (transformed or original payload);
+- optionally, a list to turn into one row per item (e.g. `salesOrder.lines`);
+- a JMESPath expression per column. Use `$root.<path>` for whole-payload fields, or
+  `$transaction_id`, `$partner` and `$received_at`.
+
+*Preview* shows the rows for the partner's sample without writing anything. Each message's
+timeline shows `STORED` or `STORE_FAILED`.
 
 ## Mapping documents (Excel)
 

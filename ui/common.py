@@ -6,6 +6,7 @@ import streamlit as st
 
 API = "http://localhost:8000"  # set by streamlit_app.py before any page runs
 EMBEDDED = False  # True on Streamlit Cloud, where the backend runs inside the Streamlit process
+PAGES: dict = {}  # name -> st.Page, set by streamlit_app.py so pages can link to each other
 STATUSES = ["COMPLETED", "FAILED", "QUEUED", "TRANSFORMING", "TRANSFORMED"]
 STATUS_ICON = {"COMPLETED": "✅", "FAILED": "❌", "SAVED": "✅", "NOT_SAVED": "⚠️"}
 GOOD, CRITICAL = "#0ca30c", "#d03b3b"
@@ -172,3 +173,53 @@ def hero(title: str, subtitle: str = ""):
 
     sub = f"<p>{html.escape(subtitle)}</p>" if subtitle else ""
     st.html(f'<div class="ph-hero"><h1>{html.escape(title)}</h1>{sub}</div>')
+
+
+def connection_address(c: dict, target: str = "") -> str:
+    """Human-readable address of a connection plus queue/topic/path."""
+    cfg, t = c.get("config", {}), (target or "").strip()
+    if c["type"] == "http":
+        base = cfg.get("base_url", "").rstrip("/")
+        return f"{base}/{t.lstrip('/')}" if t else base
+    if c["type"] == "rabbitmq":
+        vhost = cfg.get("vhost", "/")
+        return f"amqp{'s' if cfg.get('tls') else ''}://{cfg.get('host')}:{cfg.get('port')}{vhost if vhost.startswith('/') else '/' + vhost} → queue {t}"
+    if c["type"] == "activemq":
+        return f"stomp://{cfg.get('host')}:{cfg.get('port')} → {cfg.get('destination_prefix', '/queue/')}{t}"
+    if c["type"] == "ibmmq":
+        return f"{cfg.get('queue_manager')} @ {cfg.get('host')}({cfg.get('port')}) channel {cfg.get('channel')} → queue {t}"
+    if c["type"] == "kafka":
+        return f"kafka://{cfg.get('bootstrap')} → topic {t}"
+    return t
+
+
+def retry_summary(c: dict) -> str:
+    cfg = c.get("config", {})
+    extra = f", on HTTP {cfg.get('retry_on_status', '408,425,429,500,502,503,504')}" if c["type"] == "http" else ""
+    return (f"{cfg.get('retry_attempts', 3)} attempts, first retry after {cfg.get('retry_backoff', 2)} s, "
+            f"doubling to max {cfg.get('retry_backoff_max', 30)} s{extra}")
+
+
+def partner_endpoints(p: dict, conns: dict) -> list[dict]:
+    """Every inbound and outbound address of a partner, for the API access view and the flow tab."""
+    rows = [{"Direction": "⬇️ Inbound", "Type": "HTTP endpoint", "Address": f"POST {API}/inbound/{p['code']}",
+             "Details": f"header X-API-Key · body {p['input_format'].upper()}"}]
+    if p.get("inbound_connection") and p["inbound_connection"] in conns:
+        c = conns[p["inbound_connection"]]
+        rows.append({"Direction": "⬇️ Inbound", "Type": f"{c['type'].upper()} listener ({c['name']})",
+                     "Address": connection_address(c, p.get("inbound_source")), "Details": "messages are consumed and transformed"})
+    rows.append({"Direction": "⚙️ Internal", "Type": "Kafka", "Address": f"{p['topic_in']} → {p['topic_out']}",
+                 "Details": f"failures → {p['topic_dlq']}"})
+    if p.get("reply_mode") == "forward" and p.get("reply_connection") in conns:
+        c = conns[p["reply_connection"]]
+        rows.append({"Direction": "↪️ Outbound (sync)", "Type": f"Forward to API ({c['name']})",
+                     "Address": "POST " + connection_address(c, p.get("reply_path")),
+                     "Details": f"response returned to caller · retry: {retry_summary(c)}"})
+    if p.get("outbound_connection") and p["outbound_connection"] in conns:
+        c = conns[p["outbound_connection"]]
+        rows.append({"Direction": "⬆️ Outbound (async)", "Type": f"Deliver via {c['type'].upper()} ({c['name']})",
+                     "Address": connection_address(c, p.get("outbound_target")), "Details": f"retry: {retry_summary(c)}"})
+    if p.get("store_enabled") and p.get("store_table"):
+        rows.append({"Direction": "🗄️ Store", "Type": "Database table", "Address": f"userdata.{p['store_table']}",
+                     "Details": f"from the {p.get('store_source') or 'output'} payload"})
+    return rows

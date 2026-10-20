@@ -126,6 +126,11 @@ ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_connection text REFERENCES c
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_path text;
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'input';
 ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_expression text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_table text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_source text NOT NULL DEFAULT 'output';
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_row_path text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_columns jsonb;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS response_payload text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upstream_status int;
 
@@ -156,7 +161,8 @@ PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_form
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
                   "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
                   "outbound_target", "reply_mode", "reply_connection", "reply_path", "response_format",
-                  "response_expression")
+                  "response_expression", "store_enabled", "store_table", "store_source", "store_row_path",
+                  "store_columns")
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
                      "last_test_at, last_test_ok, last_test_detail, created_at, updated_at"
 
@@ -363,7 +369,8 @@ async def list_partners():
         cur = await conn.execute(
             """SELECT p.code, p.name, p.description, p.input_format, p.output_format, p.queue_mode, p.topic_in,
                       p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target,
-                      p.reply_mode, p.reply_connection, p.reply_path, p.response_format, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
+                      p.reply_mode, p.reply_connection, p.reply_path, p.response_format,
+                      p.store_enabled, p.store_table, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
                       p.created_at, p.updated_at,
                       (SELECT count(*) FROM partner_documents d WHERE d.partner_code = p.code) AS documents,
                       (SELECT count(*) FROM transactions t WHERE t.partner_code = p.code) AS transactions

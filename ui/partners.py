@@ -99,6 +99,9 @@ def api_access_dialog(p):
       <b>Async option</b><span><code>?wait=false</code> → 202 + transaction id, then
         <code>GET /inbound/{code}/transactions/&lt;id&gt;</code></span>
     </div>""")
+    st.markdown("**Inbound & outbound endpoints**")
+    conns = {c["id"]: c for c in api("GET", "/api/connections")}
+    st.dataframe(common.partner_endpoints(p, conns), hide_index=True, width="stretch")
     st.markdown("**Endpoint URL**")
     st.code(url, language="text")
     reveal = common.can("write") and st.toggle("Show API key", key=f"dlg_reveal_{code}")

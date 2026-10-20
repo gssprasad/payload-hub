@@ -15,7 +15,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from . import adapters, agent, auth, connectors, db, mapping_doc, pipeline
+from psycopg.types.json import Jsonb
+
+from . import adapters, agent, auth, connectors, datastore, db, mapping_doc, pipeline
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -26,6 +28,7 @@ STATIC = Path(__file__).parent / "static"
 async def lifespan(_app):
     await db.init()
     await auth.ensure_admin()
+    await datastore.init()
     await pipeline.start()
     await connectors.start()
     yield
@@ -590,6 +593,124 @@ async def set_partner_reply(code: str, req: PartnerReply):
                             response_format=req.response_format,
                             response_expression=(req.response_expression or "").strip() or None)
     return await db.get_partner(code)
+
+
+class PartnerStore(BaseModel):
+    store_enabled: bool = False
+    store_table: str | None = None
+    store_source: Literal["output", "input"] = "output"
+    store_row_path: str | None = None
+    store_columns: dict[str, str] = Field(default_factory=dict)
+
+
+@app.put("/api/partners/{code}/store")
+async def set_partner_store(code: str, req: PartnerStore):
+    """Whether (and how) each completed message is also written into a data table."""
+    await _partner_or_404(code)
+    if req.store_enabled:
+        tables = {t["name"] for t in await datastore.list_tables()}
+        if req.store_table not in tables:
+            raise HTTPException(422, "Choose an existing table (create one on the Data page).")
+        if not any(v.strip() for v in req.store_columns.values()):
+            raise HTTPException(422, "Map at least one column to a field.")
+    await db.update_partner(code, store_enabled=req.store_enabled, store_table=req.store_table,
+                            store_source=req.store_source, store_row_path=(req.store_row_path or "").strip() or None,
+                            store_columns=Jsonb({k: v for k, v in req.store_columns.items() if v and v.strip()}))
+    return await db.get_partner(code)
+
+
+@app.post("/api/partners/{code}/store/preview")
+async def preview_partner_store(code: str, req: PartnerStore):
+    """Show the rows a mapping would store for the partner's sample, without writing anything."""
+    p = await _partner_or_404(code)
+    if not p["sample_input"]:
+        raise HTTPException(422, "The partner needs a sample input to preview.")
+    try:
+        if req.store_source == "output":
+            if not p["expression"]:
+                raise HTTPException(422, "The partner has no mapping yet, so there is no output to preview.")
+            payload, fmt = transform(p["sample_input"], p["input_format"], p["expression"], p["output_format"]), \
+                p["output_format"]
+        else:
+            payload, fmt = p["sample_input"], p["input_format"]
+        rows = datastore.build_rows({"row_path": req.store_row_path, "columns": req.store_columns}, payload, fmt,
+                                    {"id": "00000000-0000-0000-0000-000000000000", "partner_code": code,
+                                     "created_at": "(now)"})
+    except (TransformError, datastore.DataError) as e:
+        raise HTTPException(422, str(e)) from e
+    except Exception as e:  # noqa: BLE001 - JMESPath syntax errors etc.
+        raise HTTPException(422, f"Mapping error: {e}") from e
+    return {"rows": rows}
+
+
+# ---------- data tables & SQL console ----------
+
+class TableIn(BaseModel):
+    name: str
+    columns: list[dict]
+    add_tracking: bool = True
+
+
+class QueryIn(BaseModel):
+    sql: str = Field(min_length=1, max_length=20000)
+
+
+@app.get("/api/data/status")
+async def data_status():
+    return {"schema": datastore.SCHEMA, "restricted_role": datastore.role_ok, "types": list(datastore.TYPES)}
+
+
+@app.get("/api/data/tables")
+async def data_tables():
+    return await datastore.list_tables()
+
+
+@app.post("/api/data/tables", status_code=201)
+async def data_create_table(req: TableIn):
+    try:
+        await datastore.create_table(req.name, req.columns, req.add_tracking)
+    except datastore.DataError as e:
+        raise HTTPException(e.status, str(e)) from e
+    return {"created": req.name.strip().lower()}
+
+
+@app.delete("/api/data/tables/{name}", status_code=204)
+async def data_drop_table(name: str):
+    in_use = [p["code"] for p in await db.list_partners() if p.get("store_enabled") and p.get("store_table") == name]
+    if in_use:
+        raise HTTPException(409, "Partners store into this table: " + ", ".join(in_use))
+    try:
+        await datastore.drop_table(name)
+    except datastore.DataError as e:
+        raise HTTPException(e.status, str(e)) from e
+
+
+@app.get("/api/data/tables/{name}/rows")
+async def data_rows(name: str, limit: int = 100):
+    try:
+        return await datastore.rows(name, limit)
+    except datastore.DataError as e:
+        raise HTTPException(e.status, str(e)) from e
+
+
+@app.post("/api/data/query")
+async def data_query(req: QueryIn, request: Request):
+    """Run one SQL statement in the data area. SELECT needs read, INSERT/UPDATE/CREATE/ALTER need write,
+    DELETE/DROP/TRUNCATE need delete permission."""
+    user = request.state.user
+    try:
+        statement, needed = datastore.classify(req.sql)
+    except datastore.DataError as e:
+        raise HTTPException(e.status, str(e)) from e
+    if not auth.allowed(user, needed):
+        raise HTTPException(403, f"This statement needs {needed} permission.")
+    if not datastore.role_ok and not user["is_admin"]:
+        raise HTTPException(403, "The SQL console is limited to administrators on this database "
+                                 "(the restricted data role couldn't be created).")
+    try:
+        return {**await datastore.run(statement, needed), "permission": needed}
+    except datastore.DataError as e:
+        raise HTTPException(e.status, str(e)) from e
 
 
 @app.post("/api/partners/{code}/api-key")

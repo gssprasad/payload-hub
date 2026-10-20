@@ -45,6 +45,9 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
     else:
         lines.append('"out" -> "http" [style=dashed, color="#4f46e5", fontcolor="#4f46e5", '
                      'label="transformed payload", constraint=false];')
+    if p.get("store_enabled") and p.get("store_table"):
+        lines.append(node("db", f"🗄️ Table\\nuserdata.{p['store_table']}", BLUE, "cylinder"))
+        lines.append('"out" -> "db" [label="store"];')
     if p.get("outbound_connection"):
         c = conns.get(p["outbound_connection"], {})
         ok = c.get("last_test_ok")
@@ -65,12 +68,19 @@ def flow_tab(p: dict):
     st.graphviz_chart(flow_diagram(p, listeners, conns))
     if (lst := listeners.get(code)) and lst["state"] == "error":
         st.error(f"Inbound listener problem: {lst['detail']}")
+    st.markdown("**Inbound & outbound endpoints**")
+    st.dataframe(common.partner_endpoints(p, conns), hide_index=True, width="stretch")
+    if "connections" in common.PAGES:
+        st.page_link(common.PAGES["connections"], label="Manage adapters & connections (brokers, APIs, retry policy)",
+                     icon="🔌")
 
     _http_endpoint(p)
     st.divider()
     _response_form(p, conns)
     st.divider()
     _adapters_form(p, conns, listeners)
+    st.divider()
+    _store_form(p)
     st.divider()
     _kafka_queues(p)
     st.divider()
@@ -225,6 +235,67 @@ def _adapters_form(p, conns, listeners):
                         json={"target": p["inbound_source"], "body": body, "content_type": ctype})
                 (st.success if r["ok"] else st.error)(r["detail"] + (" - the listener will pick it up; see "
                                                                      "Recent activity below." if r["ok"] else ""))
+
+
+def _store_form(p):
+    code = p["code"]
+    st.subheader("🗄️ Store in the database")
+    enabled = st.toggle("Store each completed message in a data table", value=bool(p.get("store_enabled")),
+                        key=f"store_on_{code}", disabled=not common.can("write"))
+    if not enabled:
+        st.caption("Off: messages are kept in the transaction log only.")
+        if p.get("store_enabled") and st.button("Save (turn storing off)", key=f"store_off_{code}"):
+            _save_store(code, {"store_enabled": False})
+        return
+    tables = {t["name"]: t for t in api("GET", "/api/data/tables")}
+    if not tables:
+        st.warning("No data tables yet - create one on the **Data** page first.")
+        if "data" in common.PAGES:
+            st.page_link(common.PAGES["data"], label="Open the Data page", icon="🗄️")
+        return
+    names = list(tables)
+    c1, c2 = st.columns(2)
+    table = c1.selectbox("Table", names, names.index(p["store_table"]) if p.get("store_table") in names else 0,
+                         key=f"store_table_{code}", format_func=lambda t: f"userdata.{t} ({tables[t]['rows']} rows)")
+    source = c2.selectbox("Take values from", ["output", "input"],
+                          ["output", "input"].index(p.get("store_source") or "output"), key=f"store_src_{code}",
+                          format_func={"output": f"Transformed payload ({p['output_format'].upper()})",
+                                       "input": f"Original payload ({p['input_format'].upper()})"}.get)
+    row_path = st.text_input("One row per item in (optional JMESPath to a list)", p.get("store_row_path") or "",
+                             key=f"store_rows_{code}", placeholder="e.g. salesOrder.lines - leave empty for one row per message")
+    current = p.get("store_columns") or {}
+    auto = {"id", "transaction_id", "partner_code", "stored_at"}
+    editor = st.data_editor(
+        [{"column": c["name"], "type": c["type"], "value from": current.get(c["name"], "")}
+         for c in tables[table]["columns"] if c["name"] not in auto],
+        key=f"store_map_{code}_{table}", hide_index=True, width="stretch", disabled=["column", "type"],
+        column_config={"value from": st.column_config.TextColumn(
+            "Value from (JMESPath)", help="Evaluated on each row item. Use $root.<path> for the whole payload, or "
+                                          "$transaction_id, $partner, $received_at. Empty = leave the column empty.")})
+    st.caption("transaction_id, partner_code and stored_at are filled automatically when the table has them.")
+    body = {"store_enabled": True, "store_table": table, "store_source": source, "store_row_path": row_path,
+            "store_columns": {r["column"]: r["value from"] or "" for r in editor}}
+    b1, b2 = st.columns([1, 1])
+    if b1.button("Preview rows from the sample", key=f"store_preview_{code}"):
+        try:
+            rows = api("POST", f"/api/partners/{code}/store/preview", json=body)["rows"]
+        except ApiError as e:
+            st.error(str(e))
+        else:
+            st.dataframe(rows, width="stretch")
+    if b2.button("Save storage settings", type="primary", key=f"store_save_{code}", disabled=not common.can("write")):
+        _save_store(code, body)
+
+
+def _save_store(code, body):
+    try:
+        api("PUT", f"/api/partners/{code}/store", json=body)
+    except ApiError as e:
+        st.error(str(e))
+        return
+    common.partners.clear()
+    st.toast("Storage settings saved", icon="🗄️")
+    st.rerun()
 
 
 def _kafka_queues(p):

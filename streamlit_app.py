@@ -122,7 +122,7 @@ def _start_backend():
     return server
 
 
-from ui import agent, common, connections, monitoring, partners, send, transactions, users  # noqa: E402
+from ui import agent, common, connections, data, monitoring, partners, send, transactions, users  # noqa: E402
 
 common.style()
 
@@ -233,14 +233,16 @@ def _health():
 
 pages = [
     st.Page(partners.page, title="Partners", icon="🤝", url_path="partners", default=True),
-    st.Page(connections.page, title="Connections", icon="🔌", url_path="connections"),
+    st.Page(connections.page, title="Adapters & Connections", icon="🔌", url_path="connections"),
     st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
     st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
     st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),
+    st.Page(data.page, title="Data", icon="🗄️", url_path="data"),
     st.Page(monitoring.page, title="Monitoring", icon="📊", url_path="monitoring"),
 ]
 if common.can("admin"):
     pages.append(st.Page(users.page, title="Users", icon="👥", url_path="users"))
+common.PAGES = {pg.url_path: pg for pg in pages}
 nav = st.navigation(pages)
 
 with st.sidebar:

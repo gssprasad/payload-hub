@@ -81,8 +81,37 @@ TYPES = {
 }
 
 
+RETRY_FIELDS = [
+    {"key": "retry_attempts", "label": "Delivery attempts", "kind": "int", "default": 3, "group": "retry",
+     "help": "How many times to try an outbound delivery before giving up (1 = no retries)."},
+    {"key": "retry_backoff", "label": "First retry after (seconds)", "kind": "int", "default": 2, "group": "retry",
+     "help": "Wait before the first retry; each later retry waits twice as long."},
+    {"key": "retry_backoff_max", "label": "Longest wait (seconds)", "kind": "int", "default": 30, "group": "retry",
+     "help": "Cap on the wait between retries."},
+]
+HTTP_RETRY_STATUS = {"key": "retry_on_status", "label": "Retry on HTTP status", "kind": "text",
+                     "default": "408,425,429,500,502,503,504", "group": "retry",
+                     "help": "Comma-separated. Other errors (e.g. 400, 401, 404) are treated as permanent."}
+
+
 class AdapterError(Exception):
-    """A connection or delivery problem, with a message fit for the UI."""
+    """A connection or delivery problem, with a message fit for the UI.
+    retryable=False marks permanent failures (e.g. HTTP 400) that retrying won't fix."""
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def retry_policy(config: dict) -> dict:
+    def number(key, default, low):
+        try:
+            return max(low, int(config.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return {"attempts": number("retry_attempts", 3, 1), "backoff": number("retry_backoff", 2, 0),
+            "backoff_max": number("retry_backoff_max", 30, 0)}
 
 
 class Listener:
@@ -411,10 +440,15 @@ class HTTP(Adapter):
             raise AdapterError(f"Can't reach {url}: {str(e) or type(e).__name__}") from e
         return r.status_code, r.headers.get("content-type", ""), r.text, url
 
+    def _retry_statuses(self) -> set[int]:
+        raw = str(self.config.get("retry_on_status", HTTP_RETRY_STATUS["default"]))
+        return {int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()}
+
     async def send(self, target, body, headers, content_type):
         status, _, text, url = await self.request(target, body, headers, content_type)
         if status >= 300:
-            raise AdapterError(f"{url} answered HTTP {status}: {text[:200]}")
+            raise AdapterError(f"{url} answered HTTP {status}: {text[:200]}",
+                               retryable=status in self._retry_statuses())
         return f"{self.config.get('method', 'POST').upper()} {url} → HTTP {status}"
 
 
@@ -493,6 +527,10 @@ class Kafka(Adapter):
 
 
 ADAPTERS = {cls.kind: cls for cls in (RabbitMQ, ActiveMQ, IBMMQ, HTTP, Kafka)}
+
+for _kind, _spec in TYPES.items():
+    if _spec["outbound"]:
+        _spec["fields"] += RETRY_FIELDS + ([HTTP_RETRY_STATUS] if _kind == "http" else [])
 
 
 def make(conn: dict) -> Adapter:
