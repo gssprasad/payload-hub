@@ -13,6 +13,7 @@ PRESETS = {
     "ibmmq": "IBM MQ (dev queue manager)",
     "http": "Partner webhook",
     "kafka": "External Kafka",
+    "database": "Partner database",
 }
 
 
@@ -47,10 +48,14 @@ def _status_badge(c) -> str:
     return "🟢 Connected" if c["last_test_ok"] else "🔴 Failing"
 
 
-def _fields_form(type_key, spec, values, key_prefix, editing=False):
-    """Render one input per field spec (connection fields, then the retry policy); returns (config, secret)."""
-    config, secret = {}, None
-    main = [f for f in spec["fields"] if f.get("group") != "retry"]
+DB_PORTS = {"postgresql": 5432, "mysql": 3306, "sqlserver": 1433, "oracle": 1521, "sqlite": 0}
+
+
+def _fields_form(type_key, spec, values, key_prefix, editing=False, fixed=None):
+    """Render one input per field spec (connection fields, then the retry policy); returns (config, secret).
+    fixed: values chosen outside the form (e.g. the database type), not rendered again."""
+    config, secret = dict(fixed or {}), None
+    main = [f for f in spec["fields"] if f.get("group") != "retry" and f["key"] not in (fixed or {})]
     retry = [f for f in spec["fields"] if f.get("group") == "retry"]
     secret = _render_fields(main, values, key_prefix, editing, config)
     if retry:
@@ -66,7 +71,11 @@ def _render_fields(fields, values, key_prefix, editing, config):
         col = cols[i % 2] if f["kind"] not in ("textarea",) else st
         k = f"{key_prefix}_{f['key']}"
         current = values.get(f["key"], f["default"])
-        if f["kind"] == "int":
+        if f["kind"] == "select":
+            opts = f["options"]
+            config[f["key"]] = col.selectbox(f["label"], opts, index=opts.index(current) if current in opts else 0,
+                                             key=k, help=f.get("help"))
+        elif f["kind"] == "int":
             config[f["key"]] = col.number_input(f["label"], value=int(current or 0), step=1, key=k, help=f.get("help"))
         elif f["kind"] == "bool":
             config[f["key"]] = col.toggle(f["label"], value=bool(current), key=k, help=f.get("help"))
@@ -95,9 +104,20 @@ def _add_connection(types):
             st.warning("IBM MQ needs IBM's MQ client libraries on the machine running Payload Hub: install the IBM MQ "
                        "redistributable client (or MQ for Developers) from IBM, then `pip install ibmmq`. You can save "
                        "the connection now; it will connect once the client is installed.")
-        with st.form(f"new_conn_{type_key}", clear_on_submit=False):
-            name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{type_key}")
-            config, secret = _fields_form(type_key, spec, {}, f"new_{type_key}")
+        fixed, values = {}, {}
+        if type_key == "database":
+            engine = st.selectbox("Database type", list(DB_PORTS), key="new_db_engine",
+                                  format_func={"postgresql": "PostgreSQL", "mysql": "MySQL / MariaDB",
+                                               "sqlserver": "Microsoft SQL Server", "oracle": "Oracle",
+                                               "sqlite": "SQLite (file)"}.get)
+            fixed = {"engine": engine}
+            values = {"port": DB_PORTS[engine]}
+            if engine == "sqlite":
+                st.caption("For SQLite, only the file path matters (Database / service name / SQLite file).")
+        form_key = f"new_conn_{type_key}" + (f"_{fixed['engine']}" if fixed else "")
+        with st.form(form_key, clear_on_submit=False):
+            name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{form_key}")
+            config, secret = _fields_form(type_key, spec, values, f"new_{form_key}", fixed=fixed)
             if st.form_submit_button("Save and test", type="primary", disabled=not common.can("write")):
                 try:
                     c = api("POST", "/api/connections",
@@ -180,6 +200,10 @@ def _endpoint(c) -> str:
         return cfg.get("bootstrap", "")
     if c["type"] == "ibmmq":
         return f"{cfg.get('queue_manager')} @ {cfg.get('host')}({cfg.get('port')})"
+    if c["type"] == "database":
+        if cfg.get("engine") == "sqlite":
+            return f"SQLite · {cfg.get('database')}"
+        return f"{cfg.get('engine')} · {cfg.get('host')}:{cfg.get('port')}/{cfg.get('database')}"
     return f"{cfg.get('host')}:{cfg.get('port')}"
 
 

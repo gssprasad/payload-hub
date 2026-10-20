@@ -190,6 +190,10 @@ def connection_address(c: dict, target: str = "") -> str:
         return f"{cfg.get('queue_manager')} @ {cfg.get('host')}({cfg.get('port')}) channel {cfg.get('channel')} → queue {t}"
     if c["type"] == "kafka":
         return f"kafka://{cfg.get('bootstrap')} → topic {t}"
+    if c["type"] == "database":
+        where = cfg.get("database") if cfg.get("engine") == "sqlite" else \
+            f"{cfg.get('host')}:{cfg.get('port')}/{cfg.get('database')}"
+        return f"{cfg.get('engine')}://{where} → table {t}"
     return t
 
 
@@ -220,6 +224,8 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
         rows.append({"Direction": "⬆️ Outbound (async)", "Type": f"Deliver via {c['type'].upper()} ({c['name']})",
                      "Address": connection_address(c, p.get("outbound_target")), "Details": f"retry: {retry_summary(c)}"})
     if p.get("store_enabled") and p.get("store_table"):
-        rows.append({"Direction": "🗄️ Store", "Type": "Database table", "Address": f"userdata.{p['store_table']}",
+        sc = conns.get(p.get("store_connection") or "")
+        rows.append({"Direction": "🗄️ Store", "Type": f"Database table ({sc['name'] if sc else 'built-in data area'})",
+                     "Address": connection_address(sc, p["store_table"]) if sc else f"userdata.{p['store_table']}",
                      "Details": f"from the {p.get('store_source') or 'output'} payload"})
     return rows

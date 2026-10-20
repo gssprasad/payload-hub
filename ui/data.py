@@ -6,7 +6,7 @@ from . import common
 from .common import ApiError, api
 
 EXAMPLES = {
-    "Latest rows": "SELECT * FROM {table} ORDER BY stored_at DESC LIMIT 50",
+    "Latest rows": "SELECT * FROM {table} ORDER BY 1 DESC LIMIT 50",
     "Count per partner": "SELECT partner_code, count(*) AS rows FROM {table} GROUP BY partner_code ORDER BY rows DESC",
     "Insert a row": "INSERT INTO {table} ({first_column}) VALUES ('example')",
     "Update rows": "UPDATE {table} SET {first_column} = 'changed' WHERE {first_column} = 'example'",
@@ -14,14 +14,36 @@ EXAMPLES = {
 }
 
 
+BUILTIN = ""
+
+
+def _base(target: str) -> str:
+    """API prefix for the chosen database: the built-in data area, or a database connection."""
+    return "/api/data" if target == BUILTIN else f"/api/connections/{target}"
+
+
 def page():
     common.hero("🗄️ Data", "Create tables for your integration data, see what partners stored, and query or "
-                          "change it with SQL.")
+                          "change it with SQL - in the built-in data area or any connected database.")
     status = api("GET", "/api/data/status")
-    if not status["restricted_role"]:
+    dbs = {c["id"]: c for c in api("GET", "/api/connections") if c["type"] == "database"}
+    options = [BUILTIN, *dbs]
+    target = st.selectbox(
+        "Database", options, key="data_target",
+        format_func=lambda t: "🏠 Payload Hub data area (built-in, schema userdata)" if t == BUILTIN else
+        f"🗄️ {dbs[t]['name']} · {common.connection_address(dbs[t]).replace(' → table ', '')}",
+        help="Add PostgreSQL, MySQL, SQL Server, Oracle or SQLite databases on the Adapters & Connections page.")
+    if target == BUILTIN and not status["restricted_role"]:
         st.warning("This database didn't allow creating the restricted data role, so the SQL console is limited "
                    "to administrators.")
-    tables = api("GET", "/api/data/tables")
+    if target != BUILTIN:
+        st.caption("Changes run with this connection's database user, so that user's own rights also apply. "
+                   "Read queries are always rolled back.")
+    try:
+        tables = api("GET", f"{_base(target)}/tables")
+    except ApiError as e:
+        st.error(f"Can't read this database: {e}")
+        return
     c = st.columns(3)
     c[0].metric("Tables", len(tables))
     c[1].metric("Rows stored", sum(t["rows"] for t in tables))
@@ -29,14 +51,14 @@ def page():
 
     browse, create, console = st.tabs(["📋 Tables", "➕ Create a table", "🧮 SQL console"])
     with browse:
-        _browse(tables)
+        _browse(target, tables)
     with create:
-        _create(status["types"])
+        _create(target, status["types"])
     with console:
-        _console(tables)
+        _console(target, tables)
 
 
-def _browse(tables):
+def _browse(target, tables):
     if not tables:
         st.info("No tables yet - create one on the **Create a table** tab.")
         return
@@ -44,9 +66,11 @@ def _browse(tables):
     for p in common.partners():
         if p.get("store_enabled") and p.get("store_table"):
             users_of.setdefault(p["store_table"], []).append(p["name"])
+    prefix = "userdata." if target == BUILTIN else ""
     for t in tables:
-        with st.expander(f"**userdata.{t['name']}** · {t['rows']} rows · {len(t['columns'])} columns"
-                         + (f" · filled by {', '.join(users_of[t['name']])}" if t["name"] in users_of else "")):
+        fillers = users_of.get(t["name"], []) if target == BUILTIN else []
+        with st.expander(f"**{prefix}{t['name']}** · {t['rows']} rows · {len(t['columns'])} columns"
+                         + (f" · filled by {', '.join(fillers)}" if fillers else "")):
             cols, data = st.tabs(["Columns", "Rows"])
             with cols:
                 st.dataframe(pd.DataFrame(t["columns"]), hide_index=True, width="stretch",
@@ -54,16 +78,16 @@ def _browse(tables):
                                             "default": "Default"})
             with data:
                 if t["rows"]:
-                    r = api("GET", f"/api/data/tables/{t['name']}/rows", params={"limit": 100})
+                    r = api("GET", f"{_base(target)}/tables/{t['name']}/rows", params={"limit": 100})
                     st.dataframe(pd.DataFrame(r["rows"], columns=r["columns"]), hide_index=True, width="stretch")
                     if t["rows"] > 100:
                         st.caption("Showing the latest 100 rows - use the SQL console for more.")
                 else:
                     st.caption("No rows yet.")
-            if st.checkbox(f"I want to delete table {t['name']} and all its rows", key=f"drop_ok_{t['name']}") and \
-                    st.button("Delete table", key=f"drop_{t['name']}", disabled=not common.can("delete")):
+            if st.checkbox(f"I want to delete table {t['name']} and all its rows", key=f"drop_ok_{target}_{t['name']}") \
+                    and st.button("Delete table", key=f"drop_{target}_{t['name']}", disabled=not common.can("delete")):
                 try:
-                    api("DELETE", f"/api/data/tables/{t['name']}")
+                    api("DELETE", f"{_base(target)}/tables/{t['name']}")
                 except ApiError as e:
                     st.error(str(e))
                 else:
@@ -71,7 +95,7 @@ def _browse(tables):
                     st.rerun()
 
 
-def _create(types):
+def _create(target, types):
     st.caption("Names use lowercase letters, digits and _. Each table also gets id, transaction_id, partner_code "
                "and stored_at columns (unless you untick that), so stored rows can be traced back to their message.")
     name = st.text_input("Table name", placeholder="e.g. order_lines", key="new_table_name")
@@ -92,16 +116,16 @@ def _create(types):
         columns = [{k: (bool(v) if k in ("nullable", "primary_key") else v) for k, v in row.items()}
                    for row in edited.to_dict("records") if str(row.get("name") or "").strip()]
         try:
-            api("POST", "/api/data/tables", json={"name": name, "columns": columns, "add_tracking": tracking})
+            api("POST", f"{_base(target)}/tables", json={"name": name, "columns": columns, "add_tracking": tracking})
         except ApiError as e:
             st.error(str(e))
             return
         st.session_state.pop("new_table_cols", None)
-        st.toast(f"Created userdata.{name.strip().lower()}", icon="✅")
+        st.toast(f"Created table {name.strip()}", icon="✅")
         st.rerun()
 
 
-def _console(tables):
+def _console(target, tables):
     perms = [p for p in ("read", "write", "delete") if common.can(p)]
     st.caption("One statement at a time, inside the userdata area. SELECT needs **read**; INSERT, UPDATE, CREATE and "
                "ALTER need **write**; DELETE, DROP and TRUNCATE need **delete**. You have: "
@@ -116,7 +140,7 @@ def _console(tables):
     sql_text = st.text_area("SQL", key="sql_text", height=140, placeholder="SELECT * FROM my_table LIMIT 20")
     if st.button("▶ Run", type="primary"):
         try:
-            r = api("POST", "/api/data/query", json={"sql": sql_text})
+            r = api("POST", f"{_base(target)}/query", json={"sql": sql_text})
         except ApiError as e:
             st.error(str(e))
             return

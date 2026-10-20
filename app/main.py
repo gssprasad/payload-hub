@@ -597,6 +597,7 @@ async def set_partner_reply(code: str, req: PartnerReply):
 
 class PartnerStore(BaseModel):
     store_enabled: bool = False
+    store_connection: str | None = None  # None = the built-in data area
     store_table: str | None = None
     store_source: Literal["output", "input"] = "output"
     store_row_path: str | None = None
@@ -608,12 +609,13 @@ async def set_partner_store(code: str, req: PartnerStore):
     """Whether (and how) each completed message is also written into a data table."""
     await _partner_or_404(code)
     if req.store_enabled:
-        tables = {t["name"] for t in await datastore.list_tables()}
+        tables = {t["name"] for t in await _tables_of(req.store_connection)}
         if req.store_table not in tables:
             raise HTTPException(422, "Choose an existing table (create one on the Data page).")
         if not any(v.strip() for v in req.store_columns.values()):
             raise HTTPException(422, "Map at least one column to a field.")
     await db.update_partner(code, store_enabled=req.store_enabled, store_table=req.store_table,
+                            store_connection=req.store_connection or None,
                             store_source=req.store_source, store_row_path=(req.store_row_path or "").strip() or None,
                             store_columns=Jsonb({k: v for k, v in req.store_columns.items() if v and v.strip()}))
     return await db.get_partner(code)
@@ -713,6 +715,80 @@ async def data_query(req: QueryIn, request: Request):
         raise HTTPException(e.status, str(e)) from e
 
 
+# ---------- external databases (database connections) ----------
+
+async def _database(conn_id: str) -> adapters.Database:
+    c = await db.get_connection(conn_id)
+    if not c:
+        raise HTTPException(404, "Connection not found.")
+    if c["type"] != "database":
+        raise HTTPException(422, "That connection isn't a database.")
+    return await connectors.adapter_for(conn_id)
+
+
+async def _tables_of(conn_id: str | None):
+    if not conn_id:
+        return await datastore.list_tables()
+    try:
+        return await (await _database(conn_id)).tables()
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+
+
+@app.get("/api/connections/{conn_id}/tables")
+async def db_tables(conn_id: str):
+    return await _tables_of(conn_id)
+
+
+@app.get("/api/connections/{conn_id}/tables/{name}/rows")
+async def db_table_rows(conn_id: str, name: str, limit: int = 100):
+    try:
+        return await (await _database(conn_id)).table_rows(name, min(limit, 1000))
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+
+
+@app.post("/api/connections/{conn_id}/tables", status_code=201)
+async def db_create_table(conn_id: str, req: TableIn):
+    name = req.name.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name) or \
+            any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", str(c.get("name", ""))) for c in req.columns):
+        raise HTTPException(422, "Table and column names: letters, digits and _, starting with a letter.")
+    try:
+        await (await _database(conn_id)).create_table(name, req.columns, req.add_tracking)
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"created": name}
+
+
+@app.delete("/api/connections/{conn_id}/tables/{name}", status_code=204)
+async def db_drop_table(conn_id: str, name: str):
+    in_use = [p["code"] for p in await db.list_partners()
+              if p.get("store_enabled") and p.get("store_connection") == conn_id and p.get("store_table") == name]
+    if in_use:
+        raise HTTPException(409, "Partners store into this table: " + ", ".join(in_use))
+    try:
+        await (await _database(conn_id)).drop_table(name)
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.post("/api/connections/{conn_id}/query")
+async def db_query(conn_id: str, req: QueryIn, request: Request):
+    """Run one SQL statement on an external database, checked against the user's permissions.
+    Reads are always rolled back. The database's own user rights apply on top."""
+    try:
+        statement, needed = adapters.classify_sql(req.sql)
+    except adapters.AdapterError as e:
+        raise HTTPException(400, str(e)) from e
+    if not auth.allowed(request.state.user, needed):
+        raise HTTPException(403, f"This statement needs {needed} permission.")
+    try:
+        return {**await (await _database(conn_id)).query(statement, needed), "permission": needed}
+    except adapters.AdapterError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @app.post("/api/partners/{code}/api-key")
 async def rotate_partner_api_key(code: str):
     await _partner_or_404(code)
@@ -724,7 +800,7 @@ async def rotate_partner_api_key(code: str):
 
 class ConnectionIn(BaseModel):
     name: str = Field(min_length=2, max_length=80)
-    type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka"]
+    type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka", "database"]
     config: dict = Field(default_factory=dict)
     secret: str | None = None  # write-only; None on update keeps the stored one
 

@@ -13,3 +13,7 @@ aio-pika
 stomp.py
 httpx
 # IBM MQ (optional): needs IBM MQ client libraries installed first, then: pip install ibmmq
+sqlalchemy>=2
+pymysql
+oracledb
+pymssql

@@ -272,16 +272,25 @@ def _value(v):
 
 
 async def store_for(partner: dict, txn: dict):
-    """Store a completed transaction's data into the partner's table (if enabled). Records an event."""
+    """Store a completed transaction's data into the partner's table (if enabled). Records an event.
+    The table is in the built-in data area, or in an external database connection (store_connection)."""
+    from . import adapters, connectors
+
     cfg = {"row_path": partner.get("store_row_path"), "columns": partner.get("store_columns") or {}}
     source = partner.get("store_source") or "output"
     payload = txn["output_payload"] if source == "output" else txn["input_payload"]
     fmt = txn["output_format"] if source == "output" else txn["input_format"]
     txn_id = str(txn["id"])
+    where = f"{partner['store_connection']}:{partner['store_table']}" if partner.get("store_connection") \
+        else f"{SCHEMA}.{partner['store_table']}"
     try:
         data_rows = build_rows(cfg, payload, fmt, txn)
-        n = await insert_rows(partner["store_table"], data_rows, txn_id, partner["code"])
-    except (DataError, TransformError, jmespath.exceptions.JMESPathError) as e:
-        await db.record_event(txn_id, "STORE_FAILED", f"{SCHEMA}.{partner['store_table']}: {e}")
+        if partner.get("store_connection"):
+            adapter = await connectors.adapter_for(partner["store_connection"])
+            n = await adapter.insert_rows(partner["store_table"], data_rows, txn_id, partner["code"])
+        else:
+            n = await insert_rows(partner["store_table"], data_rows, txn_id, partner["code"])
+    except (DataError, TransformError, adapters.AdapterError, jmespath.exceptions.JMESPathError) as e:
+        await db.record_event(txn_id, "STORE_FAILED", f"{where}: {e}")
         return
-    await db.record_event(txn_id, "STORED", f"{n} row(s) into {SCHEMA}.{partner['store_table']}")
+    await db.record_event(txn_id, "STORED", f"{n} row(s) into {where}")

@@ -21,6 +21,7 @@ READ_ONLY_POSTS = (
     re.compile(r"^/api/partners/[^/]+/test$"),
     re.compile(r"^/api/connections/[^/]+/test$"),
     re.compile(r"^/api/data/query$"),  # the statement itself is checked against the user's permissions
+    re.compile(r"^/api/connections/[^/]+/query$"),
     re.compile(r"^/api/partners/[^/]+/store/preview$"),
 )
 

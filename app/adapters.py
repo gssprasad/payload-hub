@@ -10,6 +10,7 @@ Supported: RabbitMQ (AMQP), ActiveMQ / Artemis (STOMP), IBM MQ (needs IBM's MQ c
 HTTP (outbound webhooks) and Kafka (external clusters or topics).
 """
 import asyncio
+import json
 import logging
 import threading
 from typing import Awaitable, Callable
@@ -64,6 +65,24 @@ TYPES = {
             {"key": "auth_header", "label": "Auth header (optional)", "kind": "secret", "default": "",
              "help": "Sent with every request, e.g. 'Authorization: Bearer <token>' or 'X-API-Key: <key>'."},
             {"key": "timeout", "label": "Timeout (seconds)", "kind": "int", "default": 15},
+        ],
+    },
+    "database": {
+        "label": "Database (PostgreSQL, MySQL, SQL Server, Oracle, SQLite)", "icon": "🗄️", "inbound": True,
+        "outbound": True, "target": "Table (inbound: table:key_column)",
+        "fields": [
+            {"key": "engine", "label": "Database type", "kind": "select", "default": "postgresql",
+             "options": ["postgresql", "mysql", "sqlserver", "oracle", "sqlite"]},
+            {"key": "host", "label": "Host", "kind": "text", "default": "localhost"},
+            {"key": "port", "label": "Port", "kind": "int", "default": 5432,
+             "help": "PostgreSQL 5432 · MySQL 3306 · SQL Server 1433 · Oracle 1521 · ignored for SQLite"},
+            {"key": "database", "label": "Database / service name / SQLite file", "kind": "text", "default": ""},
+            {"key": "username", "label": "Username", "kind": "text", "default": ""},
+            {"key": "password", "label": "Password", "kind": "secret", "default": ""},
+            {"key": "options", "label": "Extra options (query string)", "kind": "text", "default": "",
+             "help": "e.g. sslmode=require for hosted PostgreSQL, or charset=utf8mb4 for MySQL."},
+            {"key": "poll_interval", "label": "Inbound poll interval (seconds)", "kind": "int", "default": 10,
+             "help": "How often new rows are checked when this connection is used for inbound messages."},
         ],
     },
     "kafka": {
@@ -526,7 +545,294 @@ class Kafka(Adapter):
         return listener
 
 
-ADAPTERS = {cls.kind: cls for cls in (RabbitMQ, ActiveMQ, IBMMQ, HTTP, Kafka)}
+# ---------- Databases (SQLAlchemy) ----------
+
+DIALECTS = {"postgresql": "postgresql+psycopg", "mysql": "mysql+pymysql", "sqlserver": "mssql+pymssql",
+            "oracle": "oracle+oracledb", "sqlite": "sqlite"}
+READ_KINDS = {"SELECT", "WITH", "SHOW", "EXPLAIN", "VALUES", "TABLE", "DESCRIBE", "DESC"}
+WRITE_KINDS = {"INSERT", "UPDATE", "CREATE", "ALTER", "COMMENT", "MERGE"}
+DELETE_KINDS = {"DELETE", "DROP", "TRUNCATE"}
+SQL_TYPES = {"text": "String", "integer": "Integer", "bigint": "BigInteger", "numeric": "Numeric",
+             "boolean": "Boolean", "date": "Date", "timestamp": "DateTime", "json": "JSON", "uuid": "Uuid"}
+
+
+def classify_sql(statement: str) -> tuple[str, str]:
+    """(clean statement, permission needed: read | write | delete); one statement at a time."""
+    import re
+
+    text = re.sub(r"--[^\n]*", " ", statement)
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S).strip().rstrip(";").strip()
+    if not text:
+        raise AdapterError("Enter a SQL statement.", retryable=False)
+    if ";" in text:
+        raise AdapterError("Run one statement at a time (remove the extra ';').", retryable=False)
+    kind = text.split(None, 1)[0].upper()
+    for kinds, perm in ((READ_KINDS, "read"), (WRITE_KINDS, "write"), (DELETE_KINDS, "delete")):
+        if kind in kinds:
+            return text, perm
+    raise AdapterError(f"{kind} statements aren't allowed here.", retryable=False)
+
+
+class Database(Adapter):
+    kind = "database"
+
+    def __init__(self, config, secret):
+        super().__init__(config, secret)
+        self._engine = None
+
+    def engine(self):
+        import sqlalchemy as sa
+        from urllib.parse import parse_qsl
+
+        if self._engine is None:
+            c = self.config
+            eng = c.get("engine", "postgresql")
+            query = dict(parse_qsl(c.get("options") or ""))
+            if eng == "sqlite":
+                url = sa.engine.URL.create("sqlite", database=c.get("database") or ":memory:")
+            elif eng == "oracle":
+                query.setdefault("service_name", c.get("database") or "")
+                url = sa.engine.URL.create(DIALECTS[eng], username=c.get("username") or None,
+                                           password=self.secret or None, host=c.get("host"),
+                                           port=int(c.get("port") or 1521), query=query)
+            else:
+                url = sa.engine.URL.create(DIALECTS[eng], username=c.get("username") or None,
+                                           password=self.secret or None, host=c.get("host"),
+                                           port=int(c.get("port")) if c.get("port") else None,
+                                           database=c.get("database") or None, query=query)
+            self._engine = sa.create_engine(url, pool_pre_ping=True, pool_size=3, max_overflow=2) \
+                if eng != "sqlite" else sa.create_engine(url)
+        return self._engine
+
+    def _describe(self) -> str:
+        c = self.config
+        if c.get("engine") == "sqlite":
+            return f"SQLite {c.get('database')}"
+        return f"{c.get('engine')} {c.get('host')}:{c.get('port')}/{c.get('database')}"
+
+    async def _run(self, fn):
+        try:
+            return await asyncio.to_thread(fn)
+        except AdapterError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            msg = str(getattr(e, "orig", None) or e).strip().splitlines()[0][:300]
+            raise AdapterError(f"{self._describe()}: {msg}") from e
+
+    async def test(self):
+        import sqlalchemy as sa
+
+        def run():
+            with self.engine().connect() as conn:
+                one = "SELECT 1 FROM DUAL" if self.config.get("engine") == "oracle" else "SELECT 1"
+                conn.execute(sa.text(one))
+                return conn.dialect.server_version_info
+
+        version = await self._run(run)
+        v = ".".join(str(x) for x in version[:3]) if version else ""
+        return f"Connected to {self._describe()}" + (f" (server {v})" if v else "")
+
+    async def tables(self) -> list[dict]:
+        import sqlalchemy as sa
+
+        def run():
+            insp = sa.inspect(self.engine())
+            out = []
+            for name in sorted(insp.get_table_names()):
+                cols = [{"name": c["name"], "type": str(c["type"]).lower(), "nullable": c.get("nullable", True),
+                         "default": c.get("default")} for c in insp.get_columns(name)]
+                with self.engine().connect() as conn:
+                    rows = conn.execute(sa.select(sa.func.count()).select_from(sa.table(name))).scalar()
+                out.append({"name": name, "columns": cols, "rows": rows})
+            return out
+
+        return await self._run(run)
+
+    async def query(self, statement: str, permission: str, max_rows: int = 1000) -> dict:
+        """Run one statement. Reads always roll back, so they can't change anything."""
+        import sqlalchemy as sa
+
+        def run():
+            with self.engine().connect() as conn:
+                trans = conn.begin()
+                try:
+                    result = conn.execute(sa.text(statement))
+                    columns = list(result.keys()) if result.returns_rows else []
+                    rows = [dict(r) for r in result.mappings().fetchmany(max_rows)] if columns else []
+                    count = result.rowcount
+                    if permission == "read":
+                        trans.rollback()
+                    else:
+                        trans.commit()
+                except Exception:
+                    trans.rollback()
+                    raise
+            return {"columns": columns, "rows": rows, "rowcount": count,
+                    "status": f"{statement.split(None, 1)[0].upper()} {count if count >= 0 else ''}".strip(),
+                    "truncated": len(rows) == max_rows}
+
+        return await self._run(run)
+
+    async def create_table(self, name: str, columns: list[dict], add_tracking: bool = True):
+        import sqlalchemy as sa
+
+        def run():
+            md = sa.MetaData()
+            cols = []
+            has_pk = any(c.get("primary_key") for c in columns)
+            if add_tracking and not has_pk:
+                cols.append(sa.Column("id", sa.BigInteger().with_variant(sa.Integer, "sqlite"),
+                                      primary_key=True, autoincrement=True))
+            for c in columns:
+                type_ = getattr(sa, SQL_TYPES.get(c.get("type", "text"), "String"))
+                type_ = type_(255) if type_ is sa.String else type_()
+                cols.append(sa.Column(c["name"], type_, primary_key=bool(c.get("primary_key")),
+                                      nullable=bool(c.get("nullable", True)) or bool(c.get("primary_key"))))
+            if add_tracking:
+                cols += [sa.Column("transaction_id", sa.String(36)), sa.Column("partner_code", sa.String(80)),
+                         sa.Column("stored_at", sa.DateTime, server_default=sa.func.current_timestamp())]
+            sa.Table(name, md, *cols).create(self.engine())
+
+        await self._run(run)
+
+    async def drop_table(self, name: str):
+        import sqlalchemy as sa
+
+        await self._run(lambda: sa.Table(name, sa.MetaData(), autoload_with=self.engine()).drop(self.engine()))
+
+    async def table_rows(self, name: str, limit: int = 100) -> dict:
+        import sqlalchemy as sa
+
+        def run():
+            t = sa.Table(name, sa.MetaData(), autoload_with=self.engine())
+            with self.engine().connect() as conn:
+                order = list(t.primary_key.columns) or [list(t.columns)[0]]
+                result = conn.execute(sa.select(t).order_by(*[c.desc() for c in order]).limit(limit))
+                return {"columns": list(result.keys()), "rows": [dict(r) for r in result.mappings()]}
+
+        return await self._run(run)
+
+    async def insert_rows(self, table: str, rows: list[dict], txn_id: str | None = None,
+                          partner_code: str | None = None) -> int:
+        import sqlalchemy as sa
+
+        def run():
+            t = sa.Table(table, sa.MetaData(), autoload_with=self.engine())
+            names = set(t.columns.keys())
+            prepared = []
+            for row in rows:
+                values = dict(row)
+                if "transaction_id" in names and txn_id and "transaction_id" not in values:
+                    values["transaction_id"] = txn_id
+                if "partner_code" in names and partner_code and "partner_code" not in values:
+                    values["partner_code"] = partner_code
+                unknown = set(values) - names
+                if unknown:
+                    raise AdapterError(f"Table '{table}' has no column(s): {', '.join(sorted(unknown))}",
+                                       retryable=False)
+                prepared.append({k: (json.dumps(v) if isinstance(v, (dict, list)) and
+                                     not isinstance(t.c[k].type, sa.JSON) else v) for k, v in values.items()})
+            if prepared:
+                with self.engine().begin() as conn:
+                    conn.execute(t.insert(), prepared)
+            return len(prepared)
+
+        return await self._run(run)
+
+    async def send(self, target, body, headers, content_type):
+        """Outbound: insert the payload into table `target`; JSON fields go to columns of the same name."""
+        if "json" not in content_type:
+            raise AdapterError("Database delivery needs a JSON payload (set the partner's output format to JSON), "
+                               "or use 'Store in the database' with a column mapping.", retryable=False)
+        data = json.loads(body)
+        rows = data if isinstance(data, list) else [data]
+        if not all(isinstance(r, dict) for r in rows):
+            raise AdapterError("Database delivery needs a JSON object (or a list of objects).", retryable=False)
+        n = await self.insert_rows(target, rows, headers.get("X-Transaction-Id"), headers.get("X-Partner"))
+        return f"inserted {n} row(s) into {self._describe()} table '{target}'"
+
+    async def listen(self, source, handler):
+        """Inbound: poll `table:key_column` for new rows; each row becomes a JSON message."""
+        import sqlalchemy as sa
+
+        table, _, key = source.partition(":")
+        key = key.strip() or "id"
+        table = table.strip()
+        state_key = f"{self.config.get('engine')}|{self.config.get('host')}|{self.config.get('database')}|{source}"
+        interval = max(2, int(self.config.get("poll_interval") or 10))
+
+        def fetch(after):
+            t = sa.Table(table, sa.MetaData(), autoload_with=self.engine())
+            if key not in t.c:
+                raise AdapterError(f"Table '{table}' has no key column '{key}'.", retryable=False)
+            stmt = sa.select(t).order_by(t.c[key]).limit(100)
+            if after is not None:
+                stmt = stmt.where(t.c[key] > after)
+            with self.engine().connect() as conn:
+                return [dict(r) for r in conn.execute(stmt).mappings()]
+
+        await self._run(lambda: fetch(None) and None)  # fail fast if the table/key is wrong
+        stopped = asyncio.Event()
+
+        async def run():
+            from . import db
+
+            last = await db.get_state(state_key)
+            while not stopped.is_set():
+                try:
+                    rows = await self._run(lambda: fetch(_typed(last)))
+                    for row in rows:
+                        await handler(json.dumps(row, default=_json_value).encode(),
+                                      {"headers": {}, "source": f"database:{table}", "format": "json"})
+                        last = str(row[key])
+                        await db.set_state(state_key, last)
+                except Exception:  # noqa: BLE001
+                    log.exception("database poll on %s failed", source)
+                try:
+                    await asyncio.wait_for(stopped.wait(), interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        task = asyncio.create_task(run(), name=f"db-poll-{source}")
+
+        async def stop():
+            stopped.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+        listener = Listener(stop, f"database table '{table}' (new rows by {key}, every {interval} s)")
+        listener.alive = lambda: not task.done()
+        return listener
+
+    async def close(self):
+        if self._engine is not None:
+            await asyncio.to_thread(self._engine.dispose)
+
+
+def _json_value(v):
+    """JSON for database values: decimals stay numbers, dates and times become ISO text."""
+    from decimal import Decimal
+
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def _typed(value):
+    """Stored poll positions are text; compare numbers as numbers."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+ADAPTERS = {cls.kind: cls for cls in (RabbitMQ, ActiveMQ, IBMMQ, HTTP, Kafka, Database)}
 
 for _kind, _spec in TYPES.items():
     if _spec["outbound"]:

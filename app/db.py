@@ -134,6 +134,14 @@ ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_columns jsonb;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS response_payload text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upstream_status int;
 
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS store_connection text REFERENCES connections(id);
+
+CREATE TABLE IF NOT EXISTS adapter_state (
+    key        text PRIMARY KEY,
+    value      text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS users (
     username      text PRIMARY KEY,
     password_hash text NOT NULL,
@@ -162,7 +170,7 @@ PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_form
                   "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
                   "outbound_target", "reply_mode", "reply_connection", "reply_path", "response_format",
                   "response_expression", "store_enabled", "store_table", "store_source", "store_row_path",
-                  "store_columns")
+                  "store_columns", "store_connection")
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
                      "last_test_at, last_test_ok, last_test_detail, created_at, updated_at"
 
@@ -370,7 +378,7 @@ async def list_partners():
             """SELECT p.code, p.name, p.description, p.input_format, p.output_format, p.queue_mode, p.topic_in,
                       p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target,
                       p.reply_mode, p.reply_connection, p.reply_path, p.response_format,
-                      p.store_enabled, p.store_table, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
+                      p.store_enabled, p.store_table, p.store_connection, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
                       p.created_at, p.updated_at,
                       (SELECT count(*) FROM partner_documents d WHERE d.partner_code = p.code) AS documents,
                       (SELECT count(*) FROM transactions t WHERE t.partner_code = p.code) AS transactions
@@ -462,7 +470,7 @@ async def list_connections():
             f"""SELECT {CONNECTION_COLUMNS},
                        (SELECT coalesce(json_agg(code ORDER BY code), '[]') FROM partners p
                         WHERE p.inbound_connection = c.id OR p.outbound_connection = c.id
-                  OR p.reply_connection = c.id) AS used_by
+                  OR p.reply_connection = c.id OR p.store_connection = c.id) AS used_by
                 FROM connections c ORDER BY name"""
         )
         return await cur.fetchall()
@@ -523,6 +531,20 @@ async def set_response(txn_id, response_payload, upstream_status):
         await conn.execute(
             "UPDATE transactions SET response_payload = %s, upstream_status = %s, updated_at = now() WHERE id = %s",
             (response_payload, upstream_status, txn_id))
+
+
+async def get_state(key):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT value FROM adapter_state WHERE key = %s", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else None
+
+
+async def set_state(key, value):
+    async with pool.connection() as conn:
+        await conn.execute(
+            """INSERT INTO adapter_state (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""", (key, value))
 
 
 async def set_delivery(txn_id, status):

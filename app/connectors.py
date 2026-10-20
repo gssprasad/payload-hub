@@ -221,7 +221,14 @@ async def _start(p):
         partner = await db.get_partner(code)
         if partner is None:
             raise RuntimeError(f"partner {code} was removed")
-        await ingest(partner, body.decode("utf-8", errors="replace"), meta["source"], wait=None)
+        text = body.decode("utf-8", errors="replace")
+        if meta.get("format") == "json" and partner["input_format"] == "xml":  # e.g. database rows for an XML partner
+            import json
+
+            import xmltodict
+
+            text = xmltodict.unparse({"row": json.loads(text)}, pretty=True)
+        await ingest(partner, text, meta["source"], wait=None)
 
     try:
         adapter = await adapter_for(conn_id)

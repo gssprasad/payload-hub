@@ -213,6 +213,27 @@ The partner's *API access* view and *Flow & endpoints* tab list every inbound an
 address (HTTP endpoint, MQ listener, forward API, delivery target, storage table) with its retry
 policy.
 
+## Database adapter
+
+*Adapters & Connections → Add a connection → Database* connects PostgreSQL, MySQL/MariaDB,
+SQL Server, Oracle or SQLite (drivers: psycopg, PyMySQL, pymssql, python-oracledb thin mode,
+built-in sqlite3; all through SQLAlchemy). Pick the database type first: the port fills in
+automatically. Then enter host, database (or service name, or file path), user, password and
+optional extra options (e.g. `sslmode=require`). Like other connections it has *Test*, a retry
+policy, and shows which partners use it.
+
+- **Outbound:** choose the database as a partner's outbound connection and a table as the
+  target. A JSON object (or list of objects) is inserted, with each field going to the column of
+  the same name. `transaction_id` and `partner_code` are filled automatically when the table has them.
+- **Inbound:** use `table:key_column` (e.g. `erp_outbox:id`) as the inbound source. New rows (key
+  greater than the last one seen) are polled every *poll interval* seconds and become messages,
+  with no duplicates across restarts. Rows are JSON, or XML (`<row>`) for XML partners.
+- **Store in the database** (per partner) can target any database connection, not just the
+  built-in data area.
+- **Data page:** the *Database* picker switches tables, table creation and the SQL console to any
+  database connection. There, statements run with that connection's database user (whose own
+  rights apply too), and read queries are always rolled back.
+
 ## Data tables and storing partner data
 
 The **Data** page creates tables (column editor with types), browses their rows, and has a SQL

@@ -46,7 +46,8 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
         lines.append('"out" -> "http" [style=dashed, color="#4f46e5", fontcolor="#4f46e5", '
                      'label="transformed payload", constraint=false];')
     if p.get("store_enabled") and p.get("store_table"):
-        lines.append(node("db", f"🗄️ Table\\nuserdata.{p['store_table']}", BLUE, "cylinder"))
+        where = conns.get(p.get("store_connection") or "", {}).get("name") or "userdata"
+        lines.append(node("db", f"🗄️ {where}\\n{p['store_table']}", BLUE, "cylinder"))
         lines.append('"out" -> "db" [label="store"];')
     if p.get("outbound_connection"):
         c = conns.get(p["outbound_connection"], {})
@@ -247,16 +248,26 @@ def _store_form(p):
         if p.get("store_enabled") and st.button("Save (turn storing off)", key=f"store_off_{code}"):
             _save_store(code, {"store_enabled": False})
         return
-    tables = {t["name"]: t for t in api("GET", "/api/data/tables")}
+    dbs = {c["id"]: c for c in api("GET", "/api/connections") if c["type"] == "database"}
+    db_opts = ["", *dbs]
+    where = st.selectbox("Database", db_opts, db_opts.index(p.get("store_connection") or "")
+                         if (p.get("store_connection") or "") in db_opts else 0, key=f"store_db_{code}",
+                         format_func=lambda d: "🏠 Payload Hub data area (built-in)" if not d else f"🗄️ {dbs[d]['name']}")
+    try:
+        tables = {t["name"]: t for t in api("GET", f"/api/connections/{where}/tables" if where else "/api/data/tables")}
+    except ApiError as e:
+        st.error(f"Can't read that database: {e}")
+        return
     if not tables:
-        st.warning("No data tables yet - create one on the **Data** page first.")
+        st.warning("That database has no tables yet - create one on the **Data** page first.")
         if "data" in common.PAGES:
             st.page_link(common.PAGES["data"], label="Open the Data page", icon="🗄️")
         return
     names = list(tables)
     c1, c2 = st.columns(2)
+    prefix = "" if where else "userdata."
     table = c1.selectbox("Table", names, names.index(p["store_table"]) if p.get("store_table") in names else 0,
-                         key=f"store_table_{code}", format_func=lambda t: f"userdata.{t} ({tables[t]['rows']} rows)")
+                         key=f"store_table_{code}_{where}", format_func=lambda t: f"{prefix}{t} ({tables[t]['rows']} rows)")
     source = c2.selectbox("Take values from", ["output", "input"],
                           ["output", "input"].index(p.get("store_source") or "output"), key=f"store_src_{code}",
                           format_func={"output": f"Transformed payload ({p['output_format'].upper()})",
@@ -273,7 +284,8 @@ def _store_form(p):
             "Value from (JMESPath)", help="Evaluated on each row item. Use $root.<path> for the whole payload, or "
                                           "$transaction_id, $partner, $received_at. Empty = leave the column empty.")})
     st.caption("transaction_id, partner_code and stored_at are filled automatically when the table has them.")
-    body = {"store_enabled": True, "store_table": table, "store_source": source, "store_row_path": row_path,
+    body = {"store_enabled": True, "store_connection": where or None, "store_table": table, "store_source": source,
+            "store_row_path": row_path,
             "store_columns": {r["column"]: r["value from"] or "" for r in editor}}
     b1, b2 = st.columns([1, 1])
     if b1.button("Preview rows from the sample", key=f"store_preview_{code}"):
