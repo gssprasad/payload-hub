@@ -135,7 +135,7 @@ _CSS = """<style>
 .ph-hero {margin: 0 0 .9rem 0; padding: 0 0 .7rem 0; border-bottom: 1px solid rgba(128,128,128,.18);}
 .ph-hero h1 {margin: 0; padding: 0; font-size: 1.55rem; font-weight: 650; letter-spacing: -.015em;}
 .ph-hero p {margin: .15rem 0 0 0; opacity: .62; font-size: .9rem;}
-.block-container {padding-top: 2.2rem !important; max-width: 1200px;}
+.block-container {padding-top: 4rem !important; max-width: 1200px;}
 /* Metric cards */
 [data-testid="stMetric"] {background: rgba(99,102,241,.05); border: 1px solid rgba(99,102,241,.13);
   border-radius: .8rem; padding: .6rem .9rem;}
