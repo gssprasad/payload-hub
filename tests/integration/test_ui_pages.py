@@ -6,7 +6,7 @@ from .conftest import ADMIN
 
 pytestmark = pytest.mark.integration
 
-PAGES = ["overview", "partners", "connections", "workflows", "agent", "send", "transactions", "data", "monitoring",
+PAGES = ["overview", "partners", "connections", "ports", "workflows", "schedulers", "agent", "send", "transactions", "data", "monitoring",
          "users"]
 
 SCRIPT = """

@@ -12,6 +12,7 @@ TEST_DATABASE_URL = os.getenv("PAYLOAD_HUB_TEST_DATABASE_URL", "postgresql://loc
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["KAFKA_TOPIC_PREFIX"] = f"pytest-{uuid.uuid4().hex[:8]}."
 os.environ["KAFKA_TOPIC_PARTITIONS"] = "1"
+os.environ["SCHEDULER_TICK_SECONDS"] = "1"
 os.environ["PAYLOAD_HUB_SECRET_KEY"] = Fernet.generate_key().decode()
 os.environ["ADMIN_PASSWORD"] = "test-admin-pass"
 for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GITHUB_TOKEN",

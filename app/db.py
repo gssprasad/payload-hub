@@ -221,6 +221,66 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL
 );
+
+-- Scheduler: tasks that run a workflow, send a message to a partner or call an API on a schedule.
+CREATE TABLE IF NOT EXISTS schedules (
+    id           text PRIMARY KEY,
+    name         text NOT NULL,
+    description  text,
+    enabled      boolean NOT NULL DEFAULT true,
+    schedule     jsonb NOT NULL,
+    action       jsonb NOT NULL,
+    next_run_at  timestamptz,
+    last_run_at  timestamptz,
+    last_status  text,
+    last_detail  text,
+    run_count    integer NOT NULL DEFAULT 0,
+    fail_count   integer NOT NULL DEFAULT 0,
+    running      boolean NOT NULL DEFAULT false,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    id           bigserial PRIMARY KEY,
+    schedule_id  text NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    trigger      text NOT NULL,
+    started_at   timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz,
+    status       text NOT NULL DEFAULT 'RUNNING',
+    detail       text,
+    ref          text,
+    duration_ms  double precision
+);
+CREATE INDEX IF NOT EXISTS schedule_runs_schedule_idx ON schedule_runs (schedule_id, started_at DESC);
+
+-- Ports: inbound listeners defined on their own (file polling on a server folder, or a listener on a
+-- connection), each feeding a partner or a workflow.
+CREATE TABLE IF NOT EXISTS ports (
+    id            text PRIMARY KEY,
+    name          text NOT NULL,
+    type          text NOT NULL,
+    enabled       boolean NOT NULL DEFAULT true,
+    config        jsonb NOT NULL DEFAULT '{}',
+    target_type   text NOT NULL,
+    target_id     text NOT NULL,
+    last_poll_at  timestamptz,
+    last_item     text,
+    last_error    text,
+    ok_count      integer NOT NULL DEFAULT 0,
+    fail_count    integer NOT NULL DEFAULT 0,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS port_events (
+    id        bigserial PRIMARY KEY,
+    port_id   text NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+    at        timestamptz NOT NULL DEFAULT now(),
+    item      text,
+    status    text NOT NULL,
+    detail    text,
+    ref       text
+);
+CREATE INDEX IF NOT EXISTS port_events_port_idx ON port_events (port_id, at DESC);
 """
 
 USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, created_at, last_login_at"
@@ -937,3 +997,143 @@ async def overview_counts():
 async def ping():
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")
+
+
+# ---------- schedules ----------
+
+SCHEDULE_FIELDS = ("name", "description", "enabled", "schedule", "action", "next_run_at", "last_run_at",
+                   "last_status", "last_detail", "run_count", "fail_count", "running")
+
+
+def _jsonb_fields(fields: dict, allowed, json_keys) -> dict:
+    return {k: (Jsonb(v) if k in json_keys else v) for k, v in fields.items() if k in allowed}
+
+
+async def list_schedules():
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM schedules ORDER BY name")
+        return await cur.fetchall()
+
+
+async def get_schedule(sid):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM schedules WHERE id = %s", (sid,))
+        return await cur.fetchone()
+
+
+async def create_schedule(sid, **fields):
+    fields = _jsonb_fields(fields, SCHEDULE_FIELDS, ("schedule", "action"))
+    cols = ["id", *fields]
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"INSERT INTO schedules ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
+            "ON CONFLICT (id) DO NOTHING RETURNING id", (sid, *fields.values()))
+        return (await cur.fetchone()) is not None
+
+
+async def update_schedule(sid, **fields):
+    fields = _jsonb_fields(fields, SCHEDULE_FIELDS, ("schedule", "action"))
+    if fields:
+        sets = ", ".join(f"{k} = %s" for k in fields)
+        async with pool.connection() as conn:
+            await conn.execute(f"UPDATE schedules SET {sets}, updated_at = now() WHERE id = %s", (*fields.values(), sid))
+
+
+async def delete_schedule(sid):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM schedules WHERE id = %s", (sid,))
+
+
+async def claim_due_schedules():
+    """Mark due, enabled, idle tasks as running and return them (safe if several instances poll)."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """UPDATE schedules SET running = true, updated_at = now()
+               WHERE id IN (SELECT id FROM schedules WHERE enabled AND NOT running AND next_run_at <= now()
+                            FOR UPDATE SKIP LOCKED)
+               RETURNING *""")
+        return await cur.fetchall()
+
+
+async def reset_running_schedules():
+    """After a restart nothing is running any more."""
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE schedules SET running = false WHERE running")
+
+
+async def start_schedule_run(sid, trigger) -> int:
+    async with pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO schedule_runs (schedule_id, trigger) VALUES (%s, %s) RETURNING id",
+                                 (sid, trigger))
+        return (await cur.fetchone())["id"]
+
+
+async def finish_schedule_run(run_id, status, detail, ref, duration_ms):
+    async with pool.connection() as conn:
+        await conn.execute("""UPDATE schedule_runs SET finished_at = now(), status = %s, detail = %s, ref = %s,
+                              duration_ms = %s WHERE id = %s""", (status, detail, ref, duration_ms, run_id))
+
+
+async def list_schedule_runs(sid, limit=50):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM schedule_runs WHERE schedule_id = %s ORDER BY started_at DESC LIMIT %s",
+                                 (sid, limit))
+        return await cur.fetchall()
+
+
+# ---------- ports ----------
+
+PORT_FIELDS = ("name", "type", "enabled", "config", "target_type", "target_id", "last_poll_at", "last_item",
+               "last_error", "ok_count", "fail_count")
+
+
+async def list_ports():
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM ports ORDER BY name")
+        return await cur.fetchall()
+
+
+async def get_port(pid):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM ports WHERE id = %s", (pid,))
+        return await cur.fetchone()
+
+
+async def create_port(pid, **fields):
+    fields = _jsonb_fields(fields, PORT_FIELDS, ("config",))
+    cols = ["id", *fields]
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"INSERT INTO ports ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
+            "ON CONFLICT (id) DO NOTHING RETURNING id", (pid, *fields.values()))
+        return (await cur.fetchone()) is not None
+
+
+async def update_port(pid, **fields):
+    fields = _jsonb_fields(fields, PORT_FIELDS, ("config",))
+    if fields:
+        sets = ", ".join(f"{k} = %s" for k in fields)
+        async with pool.connection() as conn:
+            await conn.execute(f"UPDATE ports SET {sets}, updated_at = now() WHERE id = %s", (*fields.values(), pid))
+
+
+async def delete_port(pid):
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM ports WHERE id = %s", (pid,))
+
+
+async def record_port_event(pid, item, status, detail=None, ref=None):
+    ok = status in ("OK", "ACCEPTED")
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO port_events (port_id, item, status, detail, ref) VALUES (%s, %s, %s, %s, %s)",
+                           (pid, item, status, detail, ref))
+        await conn.execute(
+            f"""UPDATE ports SET last_item = %s, {'ok_count = ok_count + 1' if ok else 'fail_count = fail_count + 1'},
+                last_error = {'last_error' if ok else '%s'} WHERE id = %s""",
+            (item, pid) if ok else (item, detail, pid))
+
+
+async def list_port_events(pid, limit=50):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM port_events WHERE port_id = %s ORDER BY at DESC LIMIT %s", (pid, limit))
+        return await cur.fetchall()

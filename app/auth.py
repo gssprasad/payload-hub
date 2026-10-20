@@ -80,6 +80,8 @@ def required_permission(method: str, path: str) -> str:
         return "admin"  # revealing a stored connection password
     if path.startswith("/api/ai/") and method in ("PUT", "POST", "DELETE"):
         return "admin"  # pasting, testing and removing AI keys, and choosing the default model
+    if path.startswith("/api/ports") and method in ("POST", "PUT", "DELETE") and not path.endswith("/poll"):
+        return "admin"  # ports read folders on the server
     if path.startswith("/api/auth/"):
         return "signed_in"
     if method in ("GET", "HEAD", "OPTIONS"):

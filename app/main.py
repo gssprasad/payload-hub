@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import adapters, agent, ai, auth, connectors, datastore, db, mapping_doc, pipeline, vault, workflows
+from . import (adapters, agent, ai, auth, connectors, cron, datastore, db, mapping_doc, pipeline, ports, scheduler,
+               vault, workflows)
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -33,7 +34,11 @@ async def lifespan(_app):
     await pipeline.start()
     await connectors.start()
     await workflows.start()
+    await ports.start()
+    await scheduler.start()
     yield
+    await scheduler.stop()
+    await ports.stop()
     await workflows.stop()
     await connectors.stop()
     await pipeline.stop()
@@ -1519,6 +1524,210 @@ async def queues():
         owners.setdefault(p["topic_in"].rsplit(".", 1)[0], []).append(p["name"])
     for r in rows:
         r["partners"] = ", ".join(owners.get(r["topic"].rsplit(".", 1)[0], [])) or "-"
+    return rows
+
+
+# ---------- scheduler ----------
+
+class ScheduleIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = None
+    enabled: bool = True
+    schedule: dict
+    action: dict
+
+
+def _schedule_view(t: dict) -> dict:
+    return {**t, "schedule_text": cron.describe(t["schedule"]), "action_text": scheduler.describe_action(t["action"])}
+
+
+async def _clean_schedule(req: ScheduleIn) -> dict:
+    try:
+        spec = cron.validate(req.schedule)
+        action = await scheduler.validate_action(req.action)
+    except (cron.ScheduleError, scheduler.ScheduleError) as e:
+        raise HTTPException(422, str(e)) from e
+    nxt = cron.next_run(spec) if req.enabled else None
+    if req.enabled and nxt is None:
+        raise HTTPException(422, "That time has already passed - choose a time in the future.")
+    return {"name": req.name.strip(), "description": req.description, "enabled": req.enabled, "schedule": spec,
+            "action": action, "next_run_at": nxt}
+
+
+@app.get("/api/schedules")
+async def list_schedules():
+    return {"tasks": [_schedule_view(t) for t in await db.list_schedules()], "local_timezone": cron.local_zone(),
+            "workflow_schedules": [{"id": w["id"], "name": w["name"], "active": w["active"],
+                                    "every_minutes": (w["trigger_config"] or {}).get("interval_minutes"),
+                                    "per_row": bool((w["trigger_config"] or {}).get("query")),
+                                    "next_run_at": w.get("next_run_at")}
+                                   for w in await db.list_workflows() if w["trigger_type"] == "schedule"]}
+
+
+@app.post("/api/schedules", status_code=201)
+async def create_schedule(req: ScheduleIn):
+    sid = _slug(req.name)
+    if len(sid) < 2:
+        raise HTTPException(422, "Give the task a name with letters or digits.")
+    if not await db.create_schedule(sid, **await _clean_schedule(req)):
+        raise HTTPException(409, f"A task called '{sid}' already exists.")
+    return _schedule_view(await db.get_schedule(sid))
+
+
+@app.put("/api/schedules/{sid}")
+async def update_schedule(sid: str, req: ScheduleIn):
+    if not await db.get_schedule(sid):
+        raise HTTPException(404, "Task not found.")
+    await db.update_schedule(sid, **await _clean_schedule(req))
+    return _schedule_view(await db.get_schedule(sid))
+
+
+class ScheduleState(BaseModel):
+    enabled: bool
+
+
+@app.put("/api/schedules/{sid}/enabled")
+async def pause_resume_schedule(sid: str, req: ScheduleState):
+    t = await db.get_schedule(sid)
+    if not t:
+        raise HTTPException(404, "Task not found.")
+    nxt = cron.next_run(t["schedule"], last_run=t["last_run_at"] if t["schedule"]["kind"] == "once" else None) \
+        if req.enabled else None
+    if req.enabled and nxt is None:
+        raise HTTPException(422, "This one-off task's time has passed - edit it to choose a new time.")
+    await db.update_schedule(sid, enabled=req.enabled, next_run_at=nxt)
+    return _schedule_view(await db.get_schedule(sid))
+
+
+@app.post("/api/schedules/{sid}/run")
+async def run_schedule_now(sid: str):
+    t = await db.get_schedule(sid)
+    if not t:
+        raise HTTPException(404, "Task not found.")
+    return await scheduler.execute(t, "manual")
+
+
+@app.get("/api/schedules/{sid}/runs")
+async def schedule_runs(sid: str, limit: int = 50):
+    return await db.list_schedule_runs(sid, min(limit, 500))
+
+
+@app.delete("/api/schedules/{sid}", status_code=204)
+async def delete_schedule(sid: str):
+    await db.delete_schedule(sid)
+
+
+# ---------- ports ----------
+
+class PortIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    type: Literal["file", "listener"]
+    enabled: bool = True
+    config: dict = Field(default_factory=dict)
+    target_type: Literal["partner", "workflow"]
+    target_id: str
+
+
+async def _clean_port(req: PortIn) -> dict:
+    try:
+        config = await ports.validate(req.model_dump())
+    except ports.PortError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"name": req.name.strip(), "type": req.type, "enabled": req.enabled, "config": config,
+            "target_type": req.target_type, "target_id": req.target_id}
+
+
+def _port_view(p: dict) -> dict:
+    return {**p, "status": ports.status().get(p["id"], {"state": "stopped" if not p["enabled"] else "starting",
+                                                         "detail": ""})}
+
+
+@app.get("/api/ports")
+async def list_ports():
+    return [_port_view(p) for p in await db.list_ports()]
+
+
+@app.post("/api/ports", status_code=201)
+async def create_port(req: PortIn):
+    pid = _slug(req.name)
+    if len(pid) < 2:
+        raise HTTPException(422, "Give the port a name with letters or digits.")
+    if not await db.create_port(pid, **await _clean_port(req)):
+        raise HTTPException(409, f"A port called '{pid}' already exists.")
+    await ports.sync()
+    return _port_view(await db.get_port(pid))
+
+
+@app.put("/api/ports/{pid}")
+async def update_port(pid: str, req: PortIn):
+    if not await db.get_port(pid):
+        raise HTTPException(404, "Port not found.")
+    await db.update_port(pid, **await _clean_port(req))
+    await ports.sync()
+    return _port_view(await db.get_port(pid))
+
+
+class PortState(BaseModel):
+    enabled: bool
+
+
+@app.put("/api/ports/{pid}/enabled")
+async def enable_port(pid: str, req: PortState):
+    if not await db.get_port(pid):
+        raise HTTPException(404, "Port not found.")
+    await db.update_port(pid, enabled=req.enabled)
+    await ports.sync()
+    return _port_view(await db.get_port(pid))
+
+
+@app.post("/api/ports/{pid}/poll")
+async def poll_port_now(pid: str):
+    if not ports.poll_now(pid):
+        raise HTTPException(409, "Only a running file polling port can be polled now.")
+    return {"polling": True}
+
+
+@app.get("/api/ports/{pid}/events")
+async def port_events(pid: str, limit: int = 50):
+    return await db.list_port_events(pid, min(limit, 500))
+
+
+@app.delete("/api/ports/{pid}", status_code=204)
+async def delete_port(pid: str):
+    await db.delete_port(pid)
+    await ports.sync()
+
+
+@app.get("/api/ports-overview")
+async def ports_overview(request: Request):
+    """Every way data comes in: the HTTP API, partner listeners, workflow triggers and the defined ports."""
+    base = str(request.base_url).rstrip("/")
+    partners_ = await db.list_partners()
+    conns = {c["id"]: c for c in await db.list_connections()}
+    rows = [{"kind": "http", "name": "REST API", "address": base, "target": f"{len(partners_)} partner endpoints "
+             f"(POST /inbound/<code>), the admin API and the test receiver", "state": "running", "managed": "built-in"},
+            {"kind": "ui", "name": "Web console", "address": APP_URL, "target": "this app", "state": "running",
+             "managed": "built-in"}]
+    for code, st_ in connectors.listener_status().items():
+        c = conns.get(st_["connection"], {})
+        rows.append({"kind": c.get("type", "?"), "name": f"Partner {code} inbound", "address": st_["detail"],
+                     "target": f"partner {code}", "state": st_["state"], "managed": "partner"})
+    triggers = workflows.trigger_status()
+    for w in await db.list_workflows():
+        if w["trigger_type"] == "database":
+            t = triggers.get(w["id"], {"state": "stopped", "detail": ""})
+            rows.append({"kind": "database", "name": f"Workflow {w['name']} trigger",
+                         "address": t["detail"] or (w["trigger_config"] or {}).get("source", ""),
+                         "target": f"workflow {w['id']}", "state": t["state"] if w["active"] else "stopped",
+                         "managed": "workflow"})
+    for p in await db.list_ports():
+        v = _port_view(p)
+        cfg = p["config"]
+        address = cfg.get("monitor_dir") if p["type"] == "file" else \
+            f"{conns.get(cfg.get('connection'), {}).get('name', cfg.get('connection'))} → {cfg.get('source')}"
+        rows.append({"kind": "file" if p["type"] == "file" else conns.get(cfg.get("connection"), {}).get("type", "?"),
+                     "name": p["name"], "address": address, "target": f"{p['target_type']} {p['target_id']}",
+                     "state": v["status"]["state"] if p["enabled"] else "disabled", "managed": "port", "id": p["id"]})
     return rows
 
 

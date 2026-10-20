@@ -314,6 +314,58 @@ fails) and lists the recent orders, the No path marks the customer unknown.
 *Invoice on request* runs the same steps for every new row in `invoice_requests`, and *Scheduled
 invoices* (paused) does it hourly for every order with status NEW.
 
+## Ports (how data comes in)
+
+The **📡 Ports** page lists every way data enters the platform, with its status: the REST API (partner
+endpoints `POST /inbound/<code>`), the web console, partner listeners (MQ, Kafka, FTP/SFTP, database),
+workflow database triggers, and the ports defined on the page. Administrators add ports there; each one
+**feeds a partner** (the content is its input payload) or **starts a workflow** (the content is the run's
+`trigger`).
+
+**File polling port** - watches a folder on the server running Payload Hub:
+
+| Setting | Meaning |
+|---------|---------|
+| Monitoring folder | where files arrive (full path) |
+| Work / completion / error folders | default `<monitoring>/.work`, `done`, `error`; must all differ |
+| File name filter | wildcards, several separated by `;` (e.g. `*.json;*.csv`) |
+| Poll every / minimum file age | files changed in the last N seconds are left alone (still being written) |
+| Files per poll / maximum size | limits per poll; bigger files go to the error folder |
+| After success | move to the completion folder (timestamped) or delete |
+
+Each file is first moved to the work folder (so it is picked up once), handed to the target, then moved to
+the completion folder - or to the error folder with a `<file>.error.txt` note saying why. JSON, XML and
+CSV files are read as data: for a workflow, `trigger.file` has `name`, `size`, `content` and `data` (CSV =
+a list of rows); for a partner, CSV rows become `{"rows": [...]}` in the partner's input format. *Poll now*
+checks the folder immediately; *Recent files* shows each file's result, transaction or workflow run.
+Set `FILE_POLLING_ROOTS` (folders separated by `:`) to limit which folders ports may watch.
+
+**Listener port** - listens on any inbound connection (queue, topic, FTP/SFTP folder, or a database table
+as `table:key`), so queues and files can start workflows as well as feed partners.
+
+## Schedulers
+
+The **⏰ Schedulers** page runs tasks on a schedule:
+
+| Task | What it does |
+|------|--------------|
+| ⚙️ Run a workflow | with a fixed JSON input (`trigger`) |
+| 🤝 Send a message to a partner | a given payload or the partner's sample input, through its mapping, queues, route and deliveries |
+| 🌐 Call an API | GET/POST/PUT/PATCH/DELETE on an HTTP connection, e.g. a health check or a report job |
+
+| Runs | Example |
+|------|---------|
+| Every N seconds / minutes / hours | every 15 minutes (at least 5 s apart) |
+| Daily at a time, on chosen weekdays | 09:00 Mon-Fri |
+| Cron expression (`minute hour day month weekday`) | `*/15 * * * *`, `0 9 * * mon-fri`, `30 2 1 * *` |
+| Once | 2026-11-01 09:00 - the task switches itself off afterwards |
+
+Daily, cron and one-off times use the task's time zone (default: the server's), so they stay put across
+daylight-saving changes. Tasks can be paused, resumed, edited and **run now** (which doesn't move the
+schedule); each run is kept in the task's history with its result and the transaction or workflow run it
+produced. If the server was down at a task's time, it runs once when the server is back. Workflow schedules
+set on a workflow's *Trigger* tab are listed on the page too.
+
 ## Retry policy for outbound endpoints
 
 Every outbound-capable connection (HTTP, RabbitMQ, ActiveMQ, IBM MQ, Kafka) has a retry policy on

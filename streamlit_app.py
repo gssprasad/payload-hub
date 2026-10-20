@@ -122,7 +122,8 @@ def _start_backend():
     return server
 
 
-from ui import agent, common, connections, data, monitoring, overview, partners, send, transactions, users, workflows  # noqa: E402
+from ui import (agent, common, connections, data, monitoring, overview, partners, ports, schedulers, send,  # noqa: E402
+                transactions, users, workflows)
 
 common.style()
 
@@ -235,7 +236,9 @@ pages = [
     st.Page(overview.page, title="Overview", icon="📈", url_path="overview", default=True),
     st.Page(partners.page, title="Partners", icon="🤝", url_path="partners"),
     st.Page(connections.page, title="Adapters & Connections", icon="🔌", url_path="connections"),
+    st.Page(ports.page, title="Ports", icon="📡", url_path="ports"),
     st.Page(workflows.page, title="Workflows", icon="⚙️", url_path="workflows"),
+    st.Page(schedulers.page, title="Schedulers", icon="⏰", url_path="schedulers"),
     st.Page(agent.page, title="AI Agent", icon="🤖", url_path="agent"),
     st.Page(send.page, title="Send & Test", icon="▶️", url_path="send"),
     st.Page(transactions.page, title="Transactions", icon="🔎", url_path="transactions"),
