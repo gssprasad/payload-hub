@@ -104,8 +104,17 @@ def main():
     app_password = app_password or secrets.token_urlsafe(9)
     anthropic_key = ask("Anthropic API key for the AI agent (Enter = skip)", hidden=True, required=False)
 
+    from cryptography.fernet import Fernet
+
+    previous = {}
+    if SECRETS_FILE.exists():
+        import tomllib
+
+        previous = tomllib.loads(SECRETS_FILE.read_text())
     env = {
         "EMBED_BACKEND": "true",
+        # encrypts AI keys pasted in the app; keep it the same across deploys or re-paste the keys
+        "PAYLOAD_HUB_SECRET_KEY": previous.get("PAYLOAD_HUB_SECRET_KEY") or Fernet.generate_key().decode(),
         "ADMIN_PASSWORD": app_password,
         "DATABASE_URL": database_url,
         "KAFKA_BOOTSTRAP": bootstrap,

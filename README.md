@@ -87,6 +87,54 @@ export ANTHROPIC_API_KEY=your-key-here
 
 Each agent run is a paid Claude API call (typically a few cents).
 
+## Overview (landing page)
+
+After sign-in the app opens on **📈 Overview**:
+
+- **Status lights:** PostgreSQL, Kafka, pipeline workers, inbound listeners, adapters.
+- **Server:** CPU, memory, disk, the app's memory and uptime.
+- **PostgreSQL:** version, database size, connections.
+- **Kafka:** topics, messages, backlog.
+- **Platform counts:** partners, adapters, workflows, users, data tables.
+- **Today:** transactions, success rate, latency, deliveries, workflow and agent runs.
+- A 24-hour chart and the latest errors.
+
+It refreshes every 10 s (`GET /api/overview`).
+
+## Partner profile
+
+Click a partner (or **📇 Partner profile**) for everything about it, on five tabs:
+
+- **Overview:** identity, input/output formats and Content-Types, Kafka queues, all endpoints.
+- **Inbound:** HTTP URL, Content-Type, auth header, API key, async option, curl, and any listener's
+  adapter, address, folder or queue, username and password.
+- **Outbound & response:** response mode, the forward API with its method, address, content types
+  and response mapping, the delivery adapter, and each adapter's retry policy and last test.
+- **Mapping & data:** mapping, samples, storage table and column mapping, mapping documents.
+- **Activity & files:** statistics and a JSON export of the configuration (without keys or
+  passwords).
+
+Passwords and keys are masked. Administrators can switch on *Show keys and passwords*; writers can
+show the partner's API key.
+
+## AI providers for the agent
+
+The mapping agent can use **Claude** (Opus 5.5 by default, Sonnet 5.5, Haiku 4.5, Fable 5.1),
+**OpenAI**, **Gemini**, **GitHub Models** (GitHub's official API for the model families behind
+Copilot, which has no public app API) or **Azure OpenAI**.
+
+Administrators paste API keys under **AI Agent → 🔑 AI providers**, then:
+
+- **Save and test:** checks the key by listing the provider's models.
+- **Load models:** fetches the provider's current models.
+- **Set default:** sets the default provider and model.
+
+Anyone with write permission can pick another provider or model for a single run. Keys are
+encrypted (Fernet) with `PAYLOAD_HUB_SECRET_KEY`, or with a key generated into `data/secret.key`
+(git-ignored). Only the last 4 characters are ever shown. Environment variables (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`, `AZURE_OPENAI_API_KEY`) still work as a
+fallback. Every agent run records its provider and model.
+
 ## Users and sign-in
 
 Both UIs require signing in. On first start the app creates **Administrator** with the password
@@ -113,7 +161,7 @@ using partner API keys; `/health` and `/metrics` stay open for monitoring tools.
 
 ## Partners
 
-The Streamlit app's pages: **Partners**, **Adapters & Connections**, **Workflows**, **AI Agent**, **Send & Test**,
+The Streamlit app's pages: **Overview** (landing page), **Partners**, **Adapters & Connections**, **Workflows**, **AI Agent**, **Send & Test**,
 **Transactions**, **Data**, **Monitoring** and (administrators) **Users**.
 
 **Onboarding.** On the Partners page, *Onboard a new partner* opens a step-by-step wizard: basics,

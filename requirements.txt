@@ -21,3 +21,7 @@ asyncssh
 # dev only, for scripts/dev_file_servers.py: pyftpdlib
 xhtml2pdf
 streamlit[pdf]
+openai
+google-genai
+cryptography
+psutil

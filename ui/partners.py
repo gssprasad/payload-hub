@@ -31,7 +31,7 @@ def page():
     code = pick.selectbox("Manage partner", codes, key="manage_partner",
                           format_func=lambda c: next(f"{p['name']} ({c})" for p in partners if p["code"] == c))
     p = api("GET", f"/api/partners/{code}")
-    if clicked or access.button("🔑 API access", width="stretch"):
+    if clicked or access.button("📇 Partner profile", width="stretch"):
         api_access_dialog(p)
     flow_tab_, mapping, documents, details = st.tabs(["Flow & endpoints", "Mapping", "Mapping documents", "Details"])
     with flow_tab_:
@@ -53,13 +53,14 @@ def _partner_table(partners):
     df["mapping"] = df.apply(lambda r: ("🤖 AI" if r["mapping_source"] == "agent" else "✍️ Manual")
                              if r["has_mapping"] else "— none", axis=1)
     df["status"] = df["active"].map({True: "Active", False: "Inactive"})
+    has = lambda v: isinstance(v, str) and v != ""  # noqa: E731 - empty cells come back as NaN from pandas
     df["inbound"] = df.apply(lambda r: "HTTP" + (f" + {r['inbound_connection']}:{r['inbound_source']}"
-                                                 if r["inbound_connection"] else ""), axis=1)
-    df["outbound"] = df.apply(lambda r: f"{r['outbound_connection']}:{r['outbound_target'] or ''}"
-                              if r["outbound_connection"] else "store only", axis=1)
-    df["reply"] = df.apply(lambda r: f"↪ {r['reply_connection']}" if r["reply_mode"] == "forward"
+                                                 if has(r["inbound_connection"]) else ""), axis=1)
+    df["outbound"] = df.apply(lambda r: f"{r['outbound_connection']}:{r['outbound_target'] if has(r['outbound_target']) else ''}"
+                              if has(r["outbound_connection"]) else "store only", axis=1)
+    df["reply"] = df.apply(lambda r: f"↪ {r['reply_connection']}" if r["reply_mode"] == "forward" and has(r["reply_connection"])
                            else "transformed", axis=1)
-    st.caption("💡 Click a partner to see its API access details.")
+    st.caption("💡 Click a partner to see its full profile: endpoints, content types, keys, credentials and more.")
     event = st.dataframe(
         df[["name", "code", "status", "formats", "inbound", "queue", "reply", "outbound", "mapping", "documents",
             "transactions"]],
@@ -76,48 +77,164 @@ def _partner_table(partners):
     return selected if selected and selected != previous else None
 
 
-@st.dialog("🔑 API access", width="large")
-def api_access_dialog(p):
-    code = p["code"]
-    url = f"{common.API}/inbound/{code}"
-    ctype = "application/xml" if p["input_format"] == "xml" else "application/json"
-    status = "🟢 Active" if p["active"] else "⏸️ Inactive"
-    if p.get("reply_mode") == "forward":
-        fmt = {"input": p["input_format"].upper() + " (same as the request)", "json": "JSON", "xml": "XML",
-               "unchanged": "the API's own format"}[p.get("response_format") or "input"]
-        reply = f"Forwards to **{p['reply_connection']}**{('/' + p['reply_path']) if p.get('reply_path') else ''} " \
-                f"and returns that API's response as {fmt}"
-    else:
-        reply = f"Returns the transformed payload ({p['output_format'].upper()})"
-    st.markdown(f"### {p['name']} &nbsp; <span class='ph-pill'>{code}</span>", unsafe_allow_html=True)
-    st.html(f"""<div class="ph-kv">
-      <b>Status</b><span>{status}</span>
-      <b>Method</b><span>POST</span>
-      <b>Request body</b><span>{p['input_format'].upper()} ({ctype})</span>
-      <b>Authentication</b><span>Header <code>X-API-Key</code></span>
-      <b>Response</b><span>{reply.replace('**', '')}</span>
-      <b>Async option</b><span><code>?wait=false</code> → 202 + transaction id, then
-        <code>GET /inbound/{code}/transactions/&lt;id&gt;</code></span>
-    </div>""")
-    st.markdown("**Inbound & outbound endpoints**")
-    conns = {c["id"]: c for c in api("GET", "/api/connections")}
-    st.dataframe(common.partner_endpoints(p, conns), hide_index=True, width="stretch")
-    st.markdown("**Endpoint URL**")
-    st.code(url, language="text")
-    reveal = common.can("write") and st.toggle("Show API key", key=f"dlg_reveal_{code}")
-    st.markdown("**API key**")
-    st.code(p["api_key"] if reveal else "•" * 24 + "  (needs write permission to reveal)" * (not common.can("write")),
-            language="text")
-    key = p["api_key"] if reveal else "<api key>"
-    sample = "payload.xml" if p["input_format"] == "xml" else "payload.json"
-    st.markdown("**Try it from a terminal**")
-    st.code("\n".join([f'curl -X POST "{url}" \\',
-                       f'  -H "X-API-Key: {key}" \\',
-                       f'  -H "Content-Type: {ctype}" \\',
-                       f'  --data-binary @{sample}']), language="bash")
-    if common.EMBEDDED:
-        st.info("On Streamlit Cloud this endpoint isn't reachable from outside - use Flow & endpoints → Try it.")
+MIME = {"json": "application/json", "xml": "application/xml"}
 
+
+@st.dialog("📇 Partner profile", width="large")
+def api_access_dialog(p):
+    """Everything about one partner: identity, formats and content types, inbound and outbound addresses,
+    keys and credentials, retry policies, response, mapping, storage, documents and statistics."""
+    code = p["code"]
+    conns = {c["id"]: c for c in api("GET", "/api/connections")}
+    types = api("GET", "/api/connection-types")
+    admin, writer = common.can("admin"), common.can("write")
+    url = f"{common.API}/inbound/{code}"
+    reveal = admin and st.toggle("🔓 Show keys and passwords", key=f"prof_reveal_{code}",
+                                 help="Administrators only. Values are fetched when you switch this on.")
+    st.markdown(f"### {p['name']} &nbsp; <span class='ph-pill'>{code}</span> "
+                f"{'🟢 Active' if p['active'] else '⏸️ Inactive'}", unsafe_allow_html=True)
+    if p.get("description"):
+        st.caption(p["description"])
+
+    ident, inbound, outbound, mapping, more = st.tabs(
+        ["🪪 Overview", "⬇️ Inbound", "⬆️ Outbound & response", "🔀 Mapping & data", "📊 Activity & files"])
+
+    with ident:
+        _kv([("Code", f"<code>{code}</code>"), ("Status", "Active" if p["active"] else "Inactive"),
+             ("Contact", p.get("contact") or "—"),
+             ("Onboarded", str(p["created_at"])[:19].replace("T", " ")),
+             ("Input", f"{p['input_format'].upper()} · Content-Type <code>{MIME[p['input_format']]}</code>"),
+             ("Output", f"{p['output_format'].upper()} · Content-Type <code>{MIME[p['output_format']]}</code>"),
+             ("Kafka queues", f"{'Dedicated' if p['queue_mode'] == 'dedicated' else 'Shared'}: "
+                              f"<code>{p['topic_in']}</code> → <code>{p['topic_out']}</code> · failures <code>{p['topic_dlq']}</code>")])
+        st.markdown("**All endpoints**")
+        st.dataframe(common.partner_endpoints(p, conns), hide_index=True, width="stretch")
+
+    with inbound:
+        st.markdown("**🌐 HTTP endpoint** (always on)")
+        _kv([("URL", f"<code>POST {url}</code>"),
+             ("Content-Type", f"<code>{MIME[p['input_format']]}</code> ({p['input_format'].upper()} body)"),
+             ("Authentication", "Header <code>X-API-Key</code>"),
+             ("Wait for result", "default; returns 200 with the result, 422 on mapping errors"),
+             ("Async", f"<code>?wait=false</code> → 202, then <code>GET {url}/transactions/&lt;id&gt;</code>")])
+        key = p["api_key"] if (reveal or (writer and st.toggle("Show API key", key=f"prof_key_{code}"))) else "•" * 24
+        st.code(key, language="text")
+        st.code("\n".join([f'curl -X POST "{url}" \\', f'  -H "X-API-Key: {key if key[0] != "•" else "<api key>"}" \\',
+                           f'  -H "Content-Type: {MIME[p["input_format"]]}" \\',
+                           f'  --data-binary @payload.{p["input_format"]}']), language="bash")
+        if p.get("inbound_connection") in conns:
+            st.markdown("**📥 Also listening on**")
+            _connection_details(conns[p["inbound_connection"]], types, p.get("inbound_source"), reveal,
+                                role="queue / topic / folder / table to read")
+
+    with outbound:
+        st.markdown("**↩️ Response to the caller**")
+        if p.get("reply_mode") == "forward" and p.get("reply_connection") in conns:
+            rc = conns[p["reply_connection"]]
+            fmt = {"input": p["input_format"], "json": "json", "xml": "xml", "unchanged": None}[p.get("response_format") or "input"]
+            _kv([("Mode", "Forward the transformed payload to another API and return its response"),
+                 ("Forward to", f"<code>{rc['config'].get('method', 'POST')} {common.connection_address(rc, p.get('reply_path'))}</code>"),
+                 ("Sends", f"Content-Type <code>{MIME[p['output_format']]}</code>"),
+                 ("Returns to caller", f"Content-Type <code>{MIME[fmt]}</code>" if fmt else "the API's own content type"),
+                 ("Response mapping", f"<code>{p['response_expression']}</code>" if p.get("response_expression") else "none")])
+            _connection_details(rc, types, p.get("reply_path"), reveal, role="path")
+        else:
+            _kv([("Mode", "Return the transformed payload"),
+                 ("Returns to caller", f"Content-Type <code>{MIME[p['output_format']]}</code>")])
+        st.markdown("**📤 Delivery (asynchronous)**")
+        if p.get("outbound_connection") in conns:
+            oc = conns[p["outbound_connection"]]
+            _kv([("Sends", f"Content-Type <code>{MIME[p['output_format']]}</code>"),
+                 ("Headers", "<code>X-Transaction-Id</code>, <code>X-Partner</code>"),
+                 ("On failure", f"retries, then <code>{p['topic_dlq']}</code>")])
+            _connection_details(oc, types, p.get("outbound_target"), reveal, role="queue / topic / path / folder / table")
+        else:
+            st.caption("None - results are stored and returned to callers only.")
+
+    with mapping:
+        _kv([("Mapping", {"agent": "🤖 generated by the AI agent", "manual": "✍️ written by hand"}.get(
+                 p.get("mapping_source"), "—") if p.get("expression") else "— none yet")])
+        if p.get("expression"):
+            st.code(p["expression"], language="text")
+        e1, e2 = st.columns(2)
+        with e1.expander("Sample input"):
+            st.code(p.get("sample_input") or "—", language=lang(p["input_format"]))
+        with e2.expander("Expected output"):
+            st.code(p.get("expected_output") or "—", language=lang(p["output_format"]))
+        st.markdown("**🗄️ Store in the database**")
+        if p.get("store_enabled"):
+            sc = conns.get(p.get("store_connection") or "")
+            _kv([("Database", sc["name"] if sc else "Built-in data area (userdata)"),
+                 ("Table", f"<code>{p['store_table']}</code>"),
+                 ("From", f"the {p.get('store_source') or 'output'} payload"
+                          + (f", one row per <code>{p['store_row_path']}</code>" if p.get("store_row_path") else ""))])
+            st.dataframe([{"Column": k, "Value from": v} for k, v in (p.get("store_columns") or {}).items()],
+                         hide_index=True, width="stretch")
+            if sc:
+                _connection_details(sc, types, p["store_table"], reveal, role="table")
+        else:
+            st.caption("Off.")
+        docs = p.get("documents") or []
+        st.markdown(f"**📄 Mapping documents** ({len(docs)})")
+        for d in docs:
+            st.caption(f"{d['filename']} · {d['size'] / 1024:.1f} KB · {str(d['uploaded_at'])[:16].replace('T', ' ')}")
+
+    with more:
+        stats = next((r for r in api("GET", "/api/stats/partners") if r["partner_code"] == code), None)
+        if stats:
+            m = st.columns(4)
+            m[0].metric("Transactions", stats["total"])
+            done = stats["completed"] + stats["failed"]
+            m[1].metric("Success", f"{stats['completed'] / done * 100:.0f}%" if done else "–")
+            m[2].metric("Avg ms", stats["avg_ms"] if stats["avg_ms"] is not None else "–")
+            m[3].metric("Delivered", stats["delivered"], help=f"{stats['delivery_failed']} failed")
+            st.caption(f"Last transaction: {str(stats['last_seen'])[:19].replace('T', ' ') if stats['last_seen'] else 'never'}")
+        export = {k: v for k, v in p.items() if k not in ("api_key", "documents")}
+        export["connections"] = {cid: {k: v for k, v in conns[cid].items() if k not in ("used_by",)}
+                                 for cid in {p.get("inbound_connection"), p.get("outbound_connection"),
+                                             p.get("reply_connection"), p.get("store_connection")} if cid in conns}
+        st.download_button("⬇️ Download configuration (JSON, without keys or passwords)",
+                           __import__("json").dumps(export, indent=2, default=str), file_name=f"partner-{code}.json",
+                           mime="application/json", key=f"prof_export_{code}")
+    if common.EMBEDDED:
+        st.info("On Streamlit Cloud the HTTP endpoint isn't reachable from outside - use Flow & endpoints → Try it.")
+
+
+def _kv(rows):
+    st.html('<div class="ph-kv">' + "".join(f"<b>{k}</b><span>{v}</span>" for k, v in rows) + "</div>")
+
+
+def _connection_details(c, types, target, reveal, role):
+    """A connection's address, credentials and retry policy, as used by this partner."""
+    spec = types.get(c["type"], {})
+    cfg = c["config"]
+    secret = ""
+    if reveal and c.get("has_secret"):
+        secret = api("GET", f"/api/connections/{c['id']}/secret")["secret"]
+    rows = [("Adapter", f"{spec.get('icon', '')} {c['name']} <code>{c['id']}</code> · {spec.get('label', c['type'])}"),
+            ("Address", f"<code>{common.connection_address(c, target)}</code>"),
+            (role[0].upper() + role[1:], f"<code>{target or '—'}</code>")]
+    if cfg.get("username"):
+        rows.append(("Username", f"<code>{cfg['username']}</code>"))
+    secret_label = "Auth header" if c["type"] == "http" else "Password"
+    if c.get("has_secret"):
+        rows.append((secret_label, f"<code>{secret}</code>" if reveal else "•••••••• (stored)"))
+    elif c["type"] != "http":
+        rows.append((secret_label, "none"))
+    extra = {"http": [("Method", cfg.get("method")), ("Timeout", f"{cfg.get('timeout', 15)} s")],
+             "ftp": [("Protocol", cfg.get("protocol")), ("File pattern", cfg.get("file_pattern")),
+                     ("After reading", cfg.get("after_read")), ("Output file name", cfg.get("filename_pattern"))],
+             "database": [("Database type", cfg.get("engine")), ("Poll interval", f"{cfg.get('poll_interval', 10)} s")],
+             "kafka": [("Security", cfg.get("security_protocol"))],
+             "activemq": [("Queue prefix", cfg.get("destination_prefix"))],
+             "rabbitmq": [("Virtual host", cfg.get("vhost"))]}.get(c["type"], [])
+    rows += [(k, f"<code>{v}</code>") for k, v in extra if v]
+    if spec.get("outbound"):
+        rows.append(("Retry policy", common.retry_summary(c)))
+    status = "🟢 connected" if c["last_test_ok"] else "🔴 failing" if c["last_test_ok"] is False else "⚪ not tested"
+    rows.append(("Last test", f"{status} · {c.get('last_test_detail') or ''}"))
+    with st.container(border=True):
+        _kv(rows)
 
 
 def _details_tab(p):

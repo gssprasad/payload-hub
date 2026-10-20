@@ -140,7 +140,9 @@ _CSS = """<style>
 /* Metric cards */
 [data-testid="stMetric"] {background: rgba(99,102,241,.06); border: 1px solid rgba(99,102,241,.16);
   border-radius: .9rem; padding: .8rem 1rem;}
-[data-testid="stMetricLabel"] p {font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; opacity: .75;}
+[data-testid="stMetricLabel"] p {font-size: .74rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75;}
+[data-testid="stMetricValue"] {font-size: 1.45rem !important;}
+[data-testid="stMetricValue"] > div {overflow: visible !important; text-overflow: clip !important;}
 /* Bordered containers as cards */
 [data-testid="stVerticalBlockBorderWrapper"] {border-radius: 1rem;}
 /* Tabs */

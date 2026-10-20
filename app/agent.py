@@ -8,10 +8,7 @@ import logging
 import re
 import time
 
-import anthropic
-from anthropic import beta_async_tool
-
-from . import db
+from . import ai, db
 from .transform import TransformError, parse, transform
 
 log = logging.getLogger("agent")
@@ -59,42 +56,51 @@ in the payload, or a calculation the functions cannot do), say so plainly instea
 approximate mapping."""
 
 
-def _client() -> anthropic.AsyncAnthropic:
-    return anthropic.AsyncAnthropic()
+TOOLS = [
+    {"name": "inspect_input", "description": "Parse the user's sample payload and return its structure as JSON.",
+     "parameters": {"type": "object", "properties": {"input_format": {"type": "string", "enum": ["json", "xml"]}},
+                    "required": ["input_format"], "additionalProperties": False}},
+    {"name": "test_mapping",
+     "description": "Run a mapping against the sample payload with the real transformer and return the output.",
+     "parameters": {"type": "object", "properties": {
+         "expression": {"type": "string", "description": "JMESPath expression to apply."},
+         "input_format": {"type": "string", "enum": ["json", "xml"]},
+         "output_format": {"type": "string", "enum": ["json", "xml"]}},
+         "required": ["expression", "input_format", "output_format"], "additionalProperties": False}},
+    {"name": "save_mapping",
+     "description": "Save a tested mapping so the pipeline and UI can use it. Re-tests it before saving.",
+     "parameters": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Short kebab-case identifier, e.g. order-to-shipment."},
+         "label": {"type": "string", "description": "Human-readable label, e.g. Order (JSON) -> Shipment (XML)."},
+         "expression": {"type": "string", "description": "The final JMESPath expression."},
+         "input_format": {"type": "string", "enum": ["json", "xml"]},
+         "output_format": {"type": "string", "enum": ["json", "xml"]}},
+         "required": ["name", "label", "expression", "input_format", "output_format"], "additionalProperties": False}},
+]
 
 
 async def run(request: str, payload: str, input_format: str | None, mapping_doc: dict | None = None,
-              partner_code: str | None = None):
-    """Run the agent for one request and return its result (also logged to agent_runs)."""
+              partner_code: str | None = None, provider: str | None = None, model: str | None = None):
+    """Run the agent for one request and return its result (also logged to agent_runs).
+    provider/model default to the active choice set under AI providers."""
     started = time.perf_counter()
     steps: list[dict] = []
     saved: dict = {}
+    if not provider:
+        provider, default_model = await ai.active()
+        model = model or default_model
+    model = model or ai.PROVIDERS.get(provider, {}).get("default_model", "")
 
-    @beta_async_tool
     async def inspect_input(input_format: str) -> str:
-        """Parse the user's sample payload and return its structure as JSON.
-
-        Args:
-            input_format: "json" or "xml".
-        """
         try:
             data = parse(payload, input_format)
         except TransformError as e:
             steps.append({"tool": "inspect_input", "input_format": input_format, "ok": False, "result": str(e)})
             return f"Error: {e}"
-        text = json.dumps(data, indent=2, ensure_ascii=False)
         steps.append({"tool": "inspect_input", "input_format": input_format, "ok": True})
-        return text[:MAX_PREVIEW]
+        return json.dumps(data, indent=2, ensure_ascii=False)[:MAX_PREVIEW]
 
-    @beta_async_tool
     async def test_mapping(expression: str, input_format: str, output_format: str) -> str:
-        """Run a mapping against the sample payload with the real transformer and return the output.
-
-        Args:
-            expression: JMESPath expression to apply.
-            input_format: "json" or "xml".
-            output_format: "json" or "xml".
-        """
         try:
             out = transform(payload, input_format, expression, output_format)
             steps.append({"tool": "test_mapping", "expression": expression, "ok": True, "result": out[:2000]})
@@ -103,17 +109,7 @@ async def run(request: str, payload: str, input_format: str | None, mapping_doc:
             steps.append({"tool": "test_mapping", "expression": expression, "ok": False, "result": str(e)})
             return f"Error: {e}"
 
-    @beta_async_tool
     async def save_mapping(name: str, label: str, expression: str, input_format: str, output_format: str) -> str:
-        """Save a tested mapping so the pipeline and UI can use it. Re-tests it before saving.
-
-        Args:
-            name: Short kebab-case identifier, e.g. "order-to-shipment".
-            label: Human-readable label, e.g. "Order (JSON) -> Shipment (XML)".
-            expression: The final JMESPath expression.
-            input_format: "json" or "xml".
-            output_format: "json" or "xml".
-        """
         name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:60] or "agent-mapping"
         try:
             preview = transform(payload, input_format, expression, output_format)
@@ -131,6 +127,17 @@ async def run(request: str, payload: str, input_format: str | None, mapping_doc:
         steps.append({"tool": "save_mapping", "name": name, "ok": True})
         return f"Saved as '{name}'."
 
+    impl = {"inspect_input": inspect_input, "test_mapping": test_mapping, "save_mapping": save_mapping}
+
+    async def call_tool(name: str, args: dict) -> str:
+        fn = impl.get(name)
+        if fn is None:
+            return f"Error: unknown tool '{name}'."
+        try:
+            return await fn(**{k: v for k, v in (args or {}).items() if k in fn.__code__.co_varnames})
+        except TypeError as e:
+            return f"Error: wrong arguments for {name}: {e}"
+
     hint = f"The payload is {input_format.upper()}." if input_format else "Work out whether the payload is JSON or XML."
     parts = []
     if mapping_doc:
@@ -138,52 +145,23 @@ async def run(request: str, payload: str, input_format: str | None, mapping_doc:
     parts.append(f"<request>\n{request or 'Build the mapping described in the mapping document.'}\n</request>")
     parts.append(hint)
     parts.append(f"<sample_payload>\n{payload[:MAX_PREVIEW]}\n</sample_payload>")
-    messages = [{"role": "user", "content": "\n\n".join(parts)}]
 
-    result = {"status": "FAILED", "mapping": None, "explanation": None, "steps": steps}
+    result = {"status": "FAILED", "mapping": None, "explanation": None, "steps": steps,
+              "provider": provider, "model": model}
     usage = {"input_tokens": 0, "output_tokens": 0}
     try:
-        runner = _client().beta.messages.tool_runner(
-            model=MODEL,
-            max_tokens=16000,
-            system=SYSTEM_PROMPT,
-            tools=[inspect_input, test_mapping, save_mapping],
-            messages=messages,
-            output_config={"effort": "medium"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            max_iterations=15,
-        )
-        final = None
-        async for message in runner:
-            final = message
-            usage["input_tokens"] += message.usage.input_tokens
-            usage["output_tokens"] += message.usage.output_tokens
-
-        if final is None:
-            result["explanation"] = "The agent returned no response."
-        elif final.stop_reason == "refusal":
-            result["explanation"] = "The model declined this request."
-        else:
-            result["explanation"] = "".join(b.text for b in final.content if b.type == "text").strip()
-            if saved:
-                result.update(status="SAVED", mapping=saved)
-            else:
-                result["status"] = "NOT_SAVED"
-    except anthropic.AuthenticationError:
-        result["explanation"] = "No valid Anthropic API key. Set ANTHROPIC_API_KEY and restart the server."
-    except anthropic.RateLimitError:
-        result["explanation"] = "Rate limited by the Anthropic API - try again shortly."
-    except anthropic.APIStatusError as e:
-        result["explanation"] = f"Anthropic API error {e.status_code}: {e.message}"
-    except anthropic.APIConnectionError:
-        result["explanation"] = "Could not reach the Anthropic API - check the network connection."
-    except Exception as e:  # noqa: BLE001 - includes missing-credential errors raised at request time
-        if "authentication method" in str(e):
-            result["explanation"] = "No Anthropic API key configured. Set ANTHROPIC_API_KEY and restart the server."
-        else:
-            log.exception("agent run failed")
-            result["explanation"] = f"Agent failed: {e}"
+        out = await ai.run_agent(provider, model, SYSTEM_PROMPT, "\n\n".join(parts), TOOLS, call_tool)
+        usage = out["usage"]
+        result["explanation"] = out["text"] or ("The model declined this request." if out["refused"] else "")
+        if saved:
+            result.update(status="SAVED", mapping=saved)
+        elif not out["refused"]:
+            result["status"] = "NOT_SAVED"
+    except ai.AIError as e:
+        result["explanation"] = str(e)
+    except Exception as e:  # noqa: BLE001
+        log.exception("agent run failed")
+        result["explanation"] = f"Agent failed: {e}"
 
     result["usage"] = usage
     result["duration_ms"] = round((time.perf_counter() - started) * 1000)

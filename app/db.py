@@ -181,6 +181,23 @@ CREATE TABLE IF NOT EXISTS workflow_files (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS ai_providers (
+    provider    text PRIMARY KEY,
+    api_key_enc text,
+    key_hint    text,
+    config      jsonb NOT NULL DEFAULT '{}',
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        text PRIMARY KEY,
+    value      jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS provider text;
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS model text;
+
 CREATE TABLE IF NOT EXISTS users (
     username      text PRIMARY KEY,
     password_hash text NOT NULL,
@@ -368,12 +385,14 @@ async def log_agent_run(request, result, mapping_doc=None, partner_code=None):
     async with pool.connection() as conn:
         cur = await conn.execute(
             """INSERT INTO agent_runs (request, status, mapping_name, tool_calls, input_tokens, output_tokens,
-                                       duration_ms, explanation, steps, mapping_doc_name, mapping_doc, partner_code)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                                       duration_ms, explanation, steps, mapping_doc_name, mapping_doc, partner_code,
+                                       provider, model)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (request, result["status"], (result["mapping"] or {}).get("name"), len(result["steps"]),
              result["usage"]["input_tokens"], result["usage"]["output_tokens"], result["duration_ms"],
              result["explanation"], Jsonb(result["steps"]),
-             mapping_doc and mapping_doc["filename"], mapping_doc and mapping_doc["text"], partner_code),
+             mapping_doc and mapping_doc["filename"], mapping_doc and mapping_doc["text"], partner_code,
+             result.get("provider"), result.get("model")),
         )
         return (await cur.fetchone())["id"]
 
@@ -382,7 +401,8 @@ async def list_agent_runs(limit=20):
     async with pool.connection() as conn:
         cur = await conn.execute(
             """SELECT id, created_at, request, status, mapping_name, tool_calls, input_tokens, output_tokens,
-                      duration_ms, explanation, mapping_doc_name, partner_code FROM agent_runs ORDER BY id DESC LIMIT %s""",
+                      duration_ms, explanation, mapping_doc_name, partner_code, provider, model
+               FROM agent_runs ORDER BY id DESC LIMIT %s""",
             (limit,),
         )
         return await cur.fetchall()
@@ -813,6 +833,95 @@ async def due_workflows():
         cur = await conn.execute(
             "SELECT * FROM workflows WHERE active AND trigger_type = 'schedule' AND (next_run_at IS NULL OR next_run_at <= now())")
         return await cur.fetchall()
+
+
+# ---------- AI providers and settings ----------
+
+async def get_ai_provider(provider):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM ai_providers WHERE provider = %s", (provider,))
+        return await cur.fetchone()
+
+
+async def list_ai_providers():
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT provider, key_hint, api_key_enc IS NOT NULL AS has_key, config, updated_at "
+                                 "FROM ai_providers")
+        return {r["provider"]: r for r in await cur.fetchall()}
+
+
+async def save_ai_provider(provider, api_key_enc=None, key_hint=None, config=None, clear_key=False):
+    """api_key_enc=None keeps the stored key unless clear_key is set."""
+    async with pool.connection() as conn:
+        await conn.execute(
+            """INSERT INTO ai_providers (provider, api_key_enc, key_hint, config) VALUES (%s, %s, %s, %s)
+               ON CONFLICT (provider) DO UPDATE SET
+                 api_key_enc = CASE WHEN %s THEN NULL ELSE coalesce(EXCLUDED.api_key_enc, ai_providers.api_key_enc) END,
+                 key_hint = CASE WHEN %s THEN NULL ELSE coalesce(EXCLUDED.key_hint, ai_providers.key_hint) END,
+                 config = coalesce(%s, ai_providers.config), updated_at = now()""",
+            (provider, api_key_enc, key_hint, Jsonb(config or {}), clear_key, clear_key,
+             Jsonb(config) if config is not None else None))
+
+
+async def get_setting(key):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else None
+
+
+async def set_setting(key, value):
+    async with pool.connection() as conn:
+        await conn.execute(
+            """INSERT INTO app_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""", (key, Jsonb(value)))
+
+
+async def overview_counts():
+    async with pool.connection() as conn:
+        cur = await conn.execute("""
+            SELECT
+              (SELECT version()) AS pg_version,
+              (SELECT pg_database_size(current_database())) AS db_bytes,
+              (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()) AS db_connections,
+              (SELECT count(*) FROM partners) AS partners,
+              (SELECT count(*) FROM partners WHERE active) AS partners_active,
+              (SELECT count(*) FROM connections) AS connections,
+              (SELECT count(*) FROM connections WHERE last_test_ok IS FALSE) AS connections_failing,
+              (SELECT count(*) FROM workflows) AS workflows,
+              (SELECT count(*) FROM workflows WHERE active AND trigger_type <> 'manual') AS workflows_automatic,
+              (SELECT count(*) FROM users WHERE active) AS users,
+              (SELECT count(*) FROM information_schema.tables WHERE table_schema = 'userdata') AS data_tables,
+              (SELECT count(*) FROM transactions) AS txn_total,
+              (SELECT count(*) FROM transactions WHERE created_at > now() - interval '1 hour') AS txn_hour,
+              (SELECT count(*) FROM transactions WHERE created_at > date_trunc('day', now())) AS txn_today,
+              (SELECT count(*) FROM transactions WHERE created_at > date_trunc('day', now()) AND status = 'FAILED') AS txn_failed_today,
+              (SELECT round(avg(total_ms)::numeric, 1) FROM transactions
+                WHERE created_at > date_trunc('day', now()) AND status = 'COMPLETED') AS txn_avg_ms_today,
+              (SELECT count(*) FROM transactions WHERE created_at > date_trunc('day', now()) AND delivery_status = 'DELIVERED') AS delivered_today,
+              (SELECT count(*) FROM transactions WHERE created_at > date_trunc('day', now()) AND delivery_status = 'DELIVERY_FAILED') AS delivery_failed_today,
+              (SELECT count(*) FROM workflow_runs WHERE started_at > date_trunc('day', now())) AS wf_runs_today,
+              (SELECT count(*) FROM workflow_runs WHERE started_at > date_trunc('day', now()) AND status = 'FAILED') AS wf_failed_today,
+              (SELECT count(*) FROM agent_runs WHERE created_at > date_trunc('day', now())) AS agent_runs_today
+        """)
+        counts = await cur.fetchone()
+        cur = await conn.execute("""
+            SELECT to_char(h, 'HH24:00') AS hour,
+                   count(t.id) FILTER (WHERE t.status = 'COMPLETED') AS completed,
+                   count(t.id) FILTER (WHERE t.status = 'FAILED') AS failed
+            FROM generate_series(date_trunc('hour', now()) - interval '23 hours', date_trunc('hour', now()), interval '1 hour') h
+            LEFT JOIN transactions t ON date_trunc('hour', t.created_at) = h
+            GROUP BY h ORDER BY h""")
+        counts["per_hour"] = await cur.fetchall()
+        cur = await conn.execute("""
+            (SELECT 'transaction' AS kind, created_at AS at, coalesce(partner_code, mapping_name) AS what, error AS detail
+               FROM transactions WHERE status = 'FAILED' OR delivery_status = 'DELIVERY_FAILED' ORDER BY created_at DESC LIMIT 5)
+            UNION ALL
+            (SELECT 'workflow', started_at, workflow_id, error FROM workflow_runs WHERE status = 'FAILED'
+               ORDER BY started_at DESC LIMIT 5)
+            ORDER BY at DESC LIMIT 8""")
+        counts["recent_errors"] = await cur.fetchall()
+        return counts
 
 
 async def ping():

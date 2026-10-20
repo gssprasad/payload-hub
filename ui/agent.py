@@ -1,4 +1,5 @@
-"""AI Agent page: build mappings with Claude from a mapping document and/or instructions."""
+"""AI Agent page: build mappings with Claude, Gemini, OpenAI, GitHub Models or Azure OpenAI from a mapping
+document and/or instructions; administrators paste provider API keys here."""
 import pandas as pd
 import streamlit as st
 
@@ -9,24 +10,121 @@ from .common import ApiError, api, lang, show_agent_result, show_agent_steps, st
 def page():
     common.hero("🤖 AI Agent", "The agent reads your mapping document and instructions, inspects a sample payload, writes the mapping, tests it with the real transformer, and saves it.")
 
-    status = api("GET", "/api/agent/status")
-    if status["configured"]:
-        st.success(f"Agent ready · model `{status['model']}`", icon="🟢")
-    else:
-        st.warning("No Anthropic API key is configured, so the agent can't run yet. Locally, start the backend "
-                   "with `ANTHROPIC_API_KEY` set; on Streamlit Cloud, add `ANTHROPIC_API_KEY` to the app's secrets. "
-                   "Everything else in Payload Hub works without it.", icon="🟠")
+    info = api("GET", "/api/ai/providers")
+    providers = {p["id"]: p for p in info["providers"]}
+    if common.can("admin"):
+        _providers_panel(providers, info["active"])
+    choice = _model_picker(providers, info["active"])
+    ready = choice["ready"]
+    st.session_state.agent_choice = {"provider": choice["provider"], "model": choice["model"]}
 
     target = st.radio("Build a mapping", ["For a partner", "New standalone mapping"], horizontal=True,
                       help="For a partner: uses the partner's sample input and documents and saves the mapping on the "
                            "partner. Standalone: saved as a reusable mapping you can pick on Send & Test (ad-hoc).")
     if target == "For a partner":
-        _for_partner(status["configured"])
+        _for_partner(ready)
     else:
-        _standalone(status["configured"])
+        _standalone(ready)
 
     st.divider()
     _history()
+
+
+def _model_picker(providers: dict, active: dict) -> dict:
+    """Provider and model for the next run (defaults to the active choice)."""
+    usable = [pid for pid, p in providers.items() if p["has_key"] or p["from_env"]]
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 1.4])
+        options = list(providers)
+        default = active["provider"] if active["provider"] in options else options[0]
+        pid = c1.selectbox("AI provider", options, options.index(default), key="agent_provider",
+                           format_func=lambda i: f"{providers[i]['icon']} {providers[i]['label']}"
+                           + ("" if i in usable else "  - no key"))
+        p = providers[pid]
+        loaded = st.session_state.get(f"models_{pid}") or []
+        suggestions = list(dict.fromkeys(([active["model"]] if pid == active["provider"] else []) + p["models"] + loaded))
+        if suggestions:
+            model = c2.selectbox("Model", suggestions + ["(type another…)"], key=f"agent_model_{pid}")
+            if model == "(type another…)":
+                model = c2.text_input("Model name", key=f"agent_model_typed_{pid}")
+        else:
+            model = c2.text_input("Model", key=f"agent_model_typed_{pid}",
+                                  placeholder="e.g. a model id - or Load models under AI providers")
+        if pid not in usable:
+            st.warning(f"{p['label']} has no API key yet." + (" Paste one under **🔑 AI providers** above." if
+                                                             common.can("admin") else " Ask an administrator to add one."))
+        elif not model:
+            st.info("Choose or type a model.")
+        else:
+            st.caption(f"🟢 The agent will use **{p['label']}** · `{model}`"
+                       + ("  (the default)" if pid == active["provider"] and model == active["model"] else ""))
+    return {"provider": pid, "model": model, "ready": bool(pid in usable and model)}
+
+
+def _providers_panel(providers: dict, active: dict):
+    with st.expander("🔑 AI providers - paste API keys, load models, choose the default"):
+        st.caption("Keys are encrypted before they're stored and never shown again - only their last 4 characters. "
+                   "Only administrators see this panel.")
+        for pid, p in providers.items():
+            with st.container(border=True):
+                head, state = st.columns([3, 2])
+                head.markdown(f"**{p['icon']} {p['label']}**")
+                if p["has_key"]:
+                    state.markdown(f"🟢 Key saved `{p['key_hint']}`")
+                elif p["from_env"]:
+                    state.markdown("🟢 Key from environment variable")
+                else:
+                    state.markdown("⚪ No key")
+                st.caption(p["key_help"])
+                with st.form(f"ai_key_{pid}", clear_on_submit=True):
+                    key = st.text_input("API key" if pid != "github" else "GitHub token", type="password",
+                                        placeholder="paste to add or replace - leave empty to keep the saved key")
+                    config = {}
+                    for f in p["fields"]:
+                        config[f["key"]] = st.text_input(f["label"], p["config"].get(f["key"], f["default"]),
+                                                         key=f"ai_cfg_{pid}_{f['key']}")
+                    if st.form_submit_button("Save and test", type="primary"):
+                        try:
+                            api("PUT", f"/api/ai/providers/{pid}", json={"api_key": key or None,
+                                                                         "config": config if p["fields"] else None})
+                            r = api("POST", f"/api/ai/providers/{pid}/test", timeout=60)
+                        except ApiError as e:
+                            st.error(str(e))
+                        else:
+                            if r.get("models"):
+                                st.session_state[f"models_{pid}"] = r["models"]
+                            st.session_state[f"ai_test_{pid}"] = r
+                            st.rerun()
+                if r := st.session_state.get(f"ai_test_{pid}"):
+                    (st.success if r["ok"] else st.error)(r["detail"])
+                b1, b2, b3 = st.columns(3)
+                if b1.button("Load models", key=f"ai_models_{pid}", disabled=not (p["has_key"] or p["from_env"])):
+                    try:
+                        st.session_state[f"models_{pid}"] = api("GET", f"/api/ai/providers/{pid}/models", timeout=60)["models"]
+                        st.toast(f"{len(st.session_state[f'models_{pid}'])} models loaded", icon="📋")
+                    except ApiError as e:
+                        st.error(str(e))
+                if p["has_key"] and b2.button("Remove key", key=f"ai_rm_{pid}"):
+                    api("DELETE", f"/api/ai/providers/{pid}/key")
+                    st.session_state.pop(f"ai_test_{pid}", None)
+                    st.rerun()
+                if pid == active["provider"]:
+                    b3.markdown(f"⭐ Default · `{active['model']}`")
+        st.markdown("**Default for all agent runs**")
+        d1, d2, d3 = st.columns([1, 1.3, 0.7], vertical_alignment="bottom")
+        dp = d1.selectbox("Provider", list(providers), list(providers).index(active["provider"]), key="ai_default_p",
+                          format_func=lambda i: f"{providers[i]['icon']} {providers[i]['label']}")
+        opts = list(dict.fromkeys(providers[dp]["models"] + (st.session_state.get(f"models_{dp}") or [])))
+        dm = d2.selectbox("Model", opts, key=f"ai_default_m_{dp}") if opts else \
+            d2.text_input("Model", active["model"] if dp == active["provider"] else "", key=f"ai_default_mt_{dp}")
+        if d3.button("Set default", key="ai_set_default"):
+            try:
+                api("PUT", "/api/ai/active", json={"provider": dp, "model": dm})
+            except ApiError as e:
+                st.error(str(e))
+            else:
+                st.toast("Default model saved", icon="⭐")
+                st.rerun()
 
 
 def _for_partner(ready: bool):
@@ -73,7 +171,7 @@ def _for_partner(ready: bool):
         with st.spinner("Agent is reading the documents, writing and testing the mapping… (usually 15–60 s)"):
             try:
                 r = api("POST", f"/api/partners/{code}/agent", timeout=600,
-                        json={"instructions": instructions, "document_ids": chosen})
+                        json={"instructions": instructions, "document_ids": chosen, **st.session_state.agent_choice})
             except ApiError as e:
                 st.error(str(e))
                 return
@@ -122,6 +220,7 @@ def _standalone(ready: bool):
             try:
                 r = api("POST", "/api/agent", timeout=600, json={
                     "request": instructions, "payload": payload, "input_format": input_format,
+                    **st.session_state.agent_choice,
                     "mapping_doc": {"filename": doc["filename"], "text": doc["text"]} if doc else None})
             except ApiError as e:
                 st.error(str(e))
@@ -147,10 +246,11 @@ def _history():
     df["partner"] = df["partner_code"].map(lambda c: names.get(c, c) if c else "Standalone")
     df["seconds"] = df["duration_ms"] / 1000
     event = st.dataframe(
-        df[["created_at", "partner", "mapping_doc_name", "status", "mapping_name", "tool_calls", "input_tokens",
+        df[["created_at", "partner", "provider", "model", "mapping_doc_name", "status", "mapping_name", "tool_calls",
+            "input_tokens",
             "output_tokens", "seconds"]],
         hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
-        column_config={"created_at": "Time", "partner": "For", "mapping_doc_name": "Documents", "status": "Status",
+        column_config={"created_at": "Time", "partner": "For", "provider": "Provider", "model": "Model", "mapping_doc_name": "Documents", "status": "Status",
                        "mapping_name": "Saved as", "tool_calls": "Tool calls", "input_tokens": "Tokens in",
                        "output_tokens": "Tokens out",
                        "seconds": st.column_config.NumberColumn("Duration (s)", format="%.1f")})

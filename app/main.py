@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import adapters, agent, auth, connectors, datastore, db, mapping_doc, pipeline, workflows
+from . import adapters, agent, ai, auth, connectors, datastore, db, mapping_doc, pipeline, vault, workflows
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -252,6 +252,8 @@ class AgentRequest(BaseModel):
     payload: str = Field(min_length=1)
     input_format: Literal["json", "xml"] | None = None
     mapping_doc: MappingDoc | None = None
+    provider: str | None = None  # default: the active provider and model
+    model: str | None = None
 
 
 @app.post("/api/mapping-doc")
@@ -272,7 +274,8 @@ async def run_agent(req: AgentRequest):
     if len(req.request.strip()) < 3 and not req.mapping_doc:
         raise HTTPException(422, "Describe the transformation or attach a mapping document.")
     doc = req.mapping_doc.model_dump() if req.mapping_doc else None
-    return await agent.run(req.request.strip(), req.payload, req.input_format, doc)
+    return await agent.run(req.request.strip(), req.payload, req.input_format, doc,
+                           provider=req.provider, model=req.model)
 
 
 @app.get("/api/agent/runs")
@@ -290,9 +293,88 @@ async def agent_run(run_id: int):
 
 @app.get("/api/agent/status")
 async def agent_status():
-    """Whether the agent can call Claude. Never returns the key itself."""
-    configured = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
-    return {"configured": configured, "model": agent.MODEL}
+    """Whether the agent can run with the active provider and model. Never returns a key."""
+    provider, model = await ai.active()
+    key, _ = await ai.credentials(provider)
+    return {"configured": bool(key and model), "provider": provider, "model": model,
+            "label": ai.PROVIDERS[provider]["label"]}
+
+
+# ---------- AI providers (keys pasted in the UI, stored encrypted) ----------
+
+class AIProviderIn(BaseModel):
+    api_key: str | None = Field(default=None, max_length=1000)  # None keeps the stored key
+    config: dict | None = None
+
+
+class AIActiveIn(BaseModel):
+    provider: str
+    model: str = Field(min_length=1, max_length=200)
+
+
+def _provider_or_404(provider: str):
+    if provider not in ai.PROVIDERS:
+        raise HTTPException(404, "Unknown AI provider.")
+
+
+@app.get("/api/ai/providers")
+async def ai_providers():
+    saved = await db.list_ai_providers()
+    provider, model = await ai.active()
+    out = []
+    for pid, spec in ai.PROVIDERS.items():
+        row = saved.get(pid) or {}
+        from_env = bool(os.getenv(spec["env"]) or (pid == "gemini" and os.getenv("GOOGLE_API_KEY")))
+        out.append({"id": pid, **{k: spec[k] for k in ("label", "icon", "key_help", "fields", "models", "default_model")},
+                    "has_key": bool(row.get("has_key")), "key_hint": row.get("key_hint"),
+                    "from_env": from_env and not row.get("has_key"), "config": row.get("config") or {}})
+    return {"providers": out, "active": {"provider": provider, "model": model}}
+
+
+@app.put("/api/ai/providers/{provider}")
+async def ai_save_provider(provider: str, req: AIProviderIn):
+    _provider_or_404(provider)
+    key = (req.api_key or "").strip()
+    await db.save_ai_provider(provider, vault.encrypt(key) if key else None, f"…{key[-4:]}" if key else None,
+                              req.config)
+    return {"saved": True}
+
+
+@app.delete("/api/ai/providers/{provider}/key", status_code=204)
+async def ai_remove_key(provider: str):
+    _provider_or_404(provider)
+    await db.save_ai_provider(provider, clear_key=True)
+
+
+@app.post("/api/ai/providers/{provider}/test")
+async def ai_test_provider(provider: str):
+    """Check the key by listing the provider's models (no tokens are used)."""
+    _provider_or_404(provider)
+    try:
+        models = await ai.list_models(provider)
+    except ai.AIError as e:
+        if provider == "azure" and "deployment" in str(e):
+            key, cfg = await ai.credentials(provider)
+            return {"ok": bool(key and cfg.get("endpoint")), "detail": "Key and endpoint saved. Azure is checked on the "
+                                                                     "first agent run with your deployment name."}
+        return {"ok": False, "detail": str(e)}
+    return {"ok": True, "detail": f"Key works - {len(models)} models available.", "models": models[:200]}
+
+
+@app.get("/api/ai/providers/{provider}/models")
+async def ai_models(provider: str):
+    _provider_or_404(provider)
+    try:
+        return {"models": await ai.list_models(provider)}
+    except ai.AIError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.put("/api/ai/active")
+async def ai_set_active(req: AIActiveIn):
+    _provider_or_404(req.provider)
+    await db.set_setting("agent_model", {"provider": req.provider, "model": req.model.strip()})
+    return {"provider": req.provider, "model": req.model.strip()}
 
 
 @app.post("/api/transform")
@@ -509,6 +591,8 @@ async def delete_partner_document(code: str, doc_id: int):
 class PartnerAgentRequest(BaseModel):
     instructions: str = Field(default="", max_length=4000)
     document_ids: list[int] | None = None  # default: all of the partner's documents
+    provider: str | None = None
+    model: str | None = None
 
 
 @app.post("/api/partners/{code}/agent")
@@ -532,7 +616,7 @@ async def partner_agent(code: str, req: PartnerAgentRequest):
     if p["expected_output"]:
         context += f"\nThe partner expects output like this example:\n{p['expected_output']}"
     return await agent.run(f"{context}\n\n{instructions}".strip(), p["sample_input"], p["input_format"],
-                           combined, partner_code=code)
+                           combined, partner_code=code, provider=req.provider, model=req.model)
 
 
 def _new_api_key() -> str:
@@ -1000,6 +1084,62 @@ async def mock_customer_api(customer_id: str):
     return {"customer_id": customer_id, "segment": segments[seed % 3], "credit_limit": 25000 + (seed % 7) * 5000,
             "discount_percent": [10, 5, 0][seed % 3], "payment_terms_days": [45, 30, 15][seed % 3],
             "account_manager": ["Priya Nair", "Karthik Rao", "Sara Thomas"][seed % 3]}
+
+
+# ---------- server overview (landing page) ----------
+
+_STARTED_AT = __import__("time").time()
+
+
+@app.get("/api/overview")
+async def overview():
+    """Server and platform statistics for the landing page."""
+    import platform
+    import socket
+    import time as _time
+
+    import psutil
+
+    proc = psutil.Process()
+    vm, disk = psutil.virtual_memory(), psutil.disk_usage("/")
+    try:
+        load = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        load = None
+    counts = await db.overview_counts()
+    try:
+        queues = await pipeline.queue_stats()
+        kafka = {"up": True, "topics": len(queues), "messages": sum(q["messages"] for q in queues),
+                 "backlog": sum(q["backlog"] or 0 for q in queues), "bootstrap": pipeline.BOOTSTRAP}
+    except Exception as e:  # noqa: BLE001
+        kafka = {"up": False, "error": str(e) or type(e).__name__, "bootstrap": pipeline.BOOTSTRAP}
+    listeners = connectors.listener_status()
+    return {
+        "server": {"host": socket.gethostname(), "os": f"{platform.system()} {platform.release()}",
+                   "python": platform.python_version(), "cpu_count": psutil.cpu_count(),
+                   "cpu_percent": psutil.cpu_percent(interval=0.2), "load": load,
+                   "memory_used": vm.used, "memory_total": vm.total, "memory_percent": vm.percent,
+                   "disk_used": disk.used, "disk_total": disk.total, "disk_percent": disk.percent,
+                   "app_memory": proc.memory_info().rss, "app_threads": proc.num_threads(),
+                   "uptime_seconds": round(_time.time() - _STARTED_AT)},
+        "postgres": {"version": counts.pop("pg_version").split(" on ")[0], "db_bytes": counts.pop("db_bytes"),
+                     "connections": counts.pop("db_connections"), "database": db.DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]},
+        "kafka": kafka,
+        "consumers": {t.get_name(): ("running" if not t.done() else "stopped") for t in pipeline._tasks},
+        "listeners": {"running": sum(1 for v in listeners.values() if v["state"] == "running"),
+                      "failing": sum(1 for v in listeners.values() if v["state"] == "error")},
+        "workflow_triggers": workflows.trigger_status(),
+        "counts": counts,
+    }
+
+
+@app.get("/api/connections/{conn_id}/secret")
+async def connection_secret(conn_id: str):
+    """Administrators only: the stored password/secret of a connection, for the partner profile."""
+    c = await db.get_connection(conn_id, with_secret=True)
+    if not c:
+        raise HTTPException(404, "Connection not found.")
+    return {"secret": c.get("secret") or ""}
 
 
 # ---------- Payload Hub's own tables, read-only (administrators) ----------
