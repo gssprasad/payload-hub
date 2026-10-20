@@ -75,6 +75,36 @@ def transform(payload: str, input_format: str, expression: str, output_format: s
     return serialise(mapped, output_format)
 
 
+def convert_response(body: str, content_type: str, expression: str | None, response_format: str,
+                     request_format: str) -> tuple[str, str]:
+    """Turn an upstream API's response into the format the original caller expects.
+
+    response_format: 'input' (same as the caller's request format), 'json', 'xml' or 'unchanged'.
+    Returns (body, format) where format is 'json', 'xml' or 'unchanged'.
+    """
+    if response_format == "unchanged" and not expression:
+        return body, "unchanged"
+    target = request_format if response_format == "input" else response_format
+    if target == "unchanged":
+        target = "json"
+    ctype = (content_type or "").lower()
+    order = ["xml", "json"] if "xml" in ctype else ["json", "xml"]
+    data = None
+    for fmt in order:
+        try:
+            data = parse(body, fmt)
+            break
+        except TransformError:
+            continue
+    if data is None:
+        data = {"response": body}  # plain text: wrap it so it can still be returned as JSON or XML
+    if expression and expression.strip():
+        data = apply_mapping(data, expression)
+        if data is None:
+            raise TransformError("Response mapping produced no output - check the field paths match the API's response")
+    return serialise(data, target), target
+
+
 SAMPLES = {
     "order-to-invoice": {
         "label": "Order (JSON) → Invoice (JSON)",

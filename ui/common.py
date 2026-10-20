@@ -127,3 +127,48 @@ def show_agent_steps(steps: list[dict]):
             st.markdown(f"{i}. {'✅' if s['ok'] else '❌'} `{s['tool']}` - {detail}")
             if s["tool"] == "test_mapping" and s.get("expression"):
                 st.code(s["expression"], language="text")
+
+
+_CSS = """<style>
+/* Page header */
+.ph-hero {padding: 1.15rem 1.4rem; border-radius: 1rem; margin: 0 0 .6rem 0; color: #fff;
+  background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #0891b2 100%);
+  box-shadow: 0 10px 30px -12px rgba(79, 70, 229, .55);}
+.ph-hero h1 {margin: 0; padding: 0; color: #fff; font-size: 1.65rem; font-weight: 700; letter-spacing: -.01em;}
+.ph-hero p {margin: .25rem 0 0 0; color: rgba(255,255,255,.85); font-size: .92rem;}
+/* Metric cards */
+[data-testid="stMetric"] {background: rgba(99,102,241,.06); border: 1px solid rgba(99,102,241,.16);
+  border-radius: .9rem; padding: .8rem 1rem;}
+[data-testid="stMetricLabel"] p {font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; opacity: .75;}
+/* Bordered containers as cards */
+[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 1rem;}
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {gap: .35rem;}
+.stTabs [data-baseweb="tab"] {padding: .45rem .9rem; border-radius: .6rem .6rem 0 0; font-weight: 500;}
+/* Tables and buttons */
+[data-testid="stDataFrame"] {border-radius: .8rem; overflow: hidden;}
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {font-weight: 600;
+  transition: transform .08s ease, box-shadow .15s ease;}
+.stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {transform: translateY(-1px);
+  box-shadow: 0 6px 16px -8px rgba(79,70,229,.6);}
+/* Sidebar navigation */
+[data-testid="stSidebarNav"] a {border-radius: .6rem; font-weight: 500;}
+/* API access card */
+.ph-kv {display: grid; grid-template-columns: 9rem 1fr; gap: .35rem .8rem; font-size: .9rem; align-items: baseline;}
+.ph-kv b {opacity: .7; font-weight: 600;}
+.ph-pill {display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600;
+  background: rgba(99,102,241,.12); color: #4f46e5;}
+</style>"""
+
+
+def style():
+    """Apply the Payload Hub look. Call once per run, before any page renders."""
+    st.html(_CSS)
+
+
+def hero(title: str, subtitle: str = ""):
+    """Gradient page header. title may start with an emoji."""
+    import html
+
+    sub = f"<p>{html.escape(subtitle)}</p>" if subtitle else ""
+    st.html(f'<div class="ph-hero"><h1>{html.escape(title)}</h1>{sub}</div>')

@@ -389,7 +389,7 @@ class HTTP(Adapter):
 
         url = self._url("")
         try:
-            async with httpx.AsyncClient(timeout=int(self.config.get("timeout", 15))) as client:
+            async with httpx.AsyncClient(timeout=int(self.config.get("timeout", 15)), follow_redirects=True) as client:
                 r = await client.request("HEAD", url, headers=self._headers())
         except Exception as e:  # noqa: BLE001
             raise AdapterError(f"Can't reach {url}: {str(e) or type(e).__name__}") from e
@@ -397,20 +397,25 @@ class HTTP(Adapter):
             raise AdapterError(f"{url} answered HTTP {r.status_code}")
         return f"Reached {url} (HTTP {r.status_code})"
 
-    async def send(self, target, body, headers, content_type):
+    async def request(self, target, body, headers, content_type) -> tuple[int, str, str, str]:
+        """Call the endpoint and return (status, content_type, body, url) - used for request/reply forwarding."""
         import httpx
 
         url = self._url(target)
         try:
-            async with httpx.AsyncClient(timeout=int(self.config.get("timeout", 15))) as client:
+            async with httpx.AsyncClient(timeout=int(self.config.get("timeout", 15)), follow_redirects=True) as client:
                 r = await client.request(self.config.get("method", "POST").upper(), url, content=body,
-                                         headers={"Content-Type": content_type, **self._headers(),
-                                                  **{k: str(v) for k, v in headers.items()}})
+                                         headers={"Content-Type": content_type, "Accept": content_type,
+                                                  **self._headers(), **{k: str(v) for k, v in headers.items()}})
         except Exception as e:  # noqa: BLE001
             raise AdapterError(f"Can't reach {url}: {str(e) or type(e).__name__}") from e
-        if r.status_code >= 300:
-            raise AdapterError(f"{url} answered HTTP {r.status_code}: {r.text[:200]}")
-        return f"{self.config.get('method', 'POST').upper()} {url} → HTTP {r.status_code}"
+        return r.status_code, r.headers.get("content-type", ""), r.text, url
+
+    async def send(self, target, body, headers, content_type):
+        status, _, text, url = await self.request(target, body, headers, content_type)
+        if status >= 300:
+            raise AdapterError(f"{url} answered HTTP {status}: {text[:200]}")
+        return f"{self.config.get('method', 'POST').upper()} {url} → HTTP {status}"
 
 
 # ---------- Kafka (external cluster or topic) ----------

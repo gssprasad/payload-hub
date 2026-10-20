@@ -17,9 +17,7 @@ PRESETS = {
 
 
 def page():
-    st.title("🔌 Connections")
-    st.caption("Adapters to message brokers and HTTP endpoints. Partners use them to receive messages "
-               "(inbound) and to deliver transformed results (outbound).")
+    common.hero("🔌 Connections", "Adapters to message brokers and HTTP endpoints. Partners use them to receive messages (inbound) and to deliver transformed results (outbound).")
     types = api("GET", "/api/connection-types")
     conns = api("GET", "/api/connections")
 

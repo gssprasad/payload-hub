@@ -6,8 +6,7 @@ from .common import ApiError, api, lang, queue_label, show_events, status_label
 
 
 def page():
-    st.title("▶️ Send & Test")
-    st.caption("Send a payload through the Kafka pipeline and see the transformed result.")
+    common.hero("▶️ Send & Test", "Send a payload through the Kafka pipeline and see the transformed result.")
     mode = st.radio("Send as", ["Partner", "Ad-hoc mapping"], horizontal=True,
                     help="Partner uses the partner's mapping and its shared or dedicated queue.")
     if mode == "Partner":
@@ -81,7 +80,17 @@ def _show_result(t):
     m1.metric("Status", status_label(t["status"]))
     m2.metric("Transform", f"{t['transform_ms']:.1f} ms" if t["transform_ms"] is not None else "–")
     m3.metric("End-to-end", f"{t['total_ms']:.1f} ms" if t["total_ms"] is not None else "–")
-    if t.get("output_payload"):
+    if reply := t.get("reply"):
+        if reply.get("ok") or reply.get("body"):
+            st.markdown(f"**↩️ Response for the caller** - from the target API (HTTP {reply['status']}), "
+                        f"as {reply.get('format', '').upper()}")
+            body = reply.get("body") or ""
+            st.code(body, language="xml" if body.lstrip().startswith("<") else "json")
+        else:
+            st.error(reply.get("error", "Forwarding failed"))
+        with st.expander("Transformed payload sent to the target API"):
+            st.code(t.get("output_payload") or "", language=lang(t["output_format"]))
+    elif t.get("output_payload"):
         st.code(t["output_payload"], language=lang(t["output_format"]))
     elif t.get("error"):
         st.error(t["error"])

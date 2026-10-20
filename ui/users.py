@@ -14,8 +14,7 @@ PERMISSIONS = {
 
 
 def page():
-    st.title("👥 Users")
-    st.caption("Who can sign in, and what each person may do.")
+    common.hero("👥 Users", "Who can sign in, and what each person may do.")
     users = api("GET", "/api/users")
     _table(users)
     _add_user()

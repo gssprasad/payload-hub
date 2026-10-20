@@ -7,9 +7,7 @@ from .common import ApiError, api, lang, show_agent_result, show_agent_steps, st
 
 
 def page():
-    st.title("🤖 AI Agent")
-    st.caption("The agent reads your mapping document and instructions, inspects a sample payload, "
-               "writes the mapping, tests it with the real transformer, and saves it.")
+    common.hero("🤖 AI Agent", "The agent reads your mapping document and instructions, inspects a sample payload, writes the mapping, tests it with the real transformer, and saves it.")
 
     status = api("GET", "/api/agent/status")
     if status["configured"]:

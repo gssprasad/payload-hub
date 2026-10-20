@@ -13,11 +13,13 @@ import uuid
 from datetime import datetime, timezone
 
 from . import adapters, db, pipeline
+from .transform import TransformError, convert_response
 
 log = logging.getLogger("connectors")
 
 DELIVERY_ATTEMPTS = 3
 SUPERVISE_SECONDS = 15
+SYNC_SOURCES = ("HTTP", "UI")  # callers waiting for a reply; others (MQ, Kafka) get the forward done in the background
 
 _adapters: dict[str, tuple[str, adapters.Adapter]] = {}  # connection id -> (updated_at, adapter)
 _listeners: dict[str, dict] = {}  # partner code -> {"listener", "key", "state", "detail", "since"}
@@ -63,7 +65,7 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
     msg = {"mapping_name": partner["code"], "input_format": partner["input_format"],
            "output_format": partner["output_format"], "expression": partner["expression"],
            "topic_in": partner["topic_in"], "topic_out": partner["topic_out"], "topic_dlq": partner["topic_dlq"],
-           "partner_code": partner["code"]}
+           "partner_code": partner["code"], "source": source}
     txn_id = str(uuid.uuid4())
     await db.create_transaction(txn_id, msg["mapping_name"], msg["input_format"], msg["output_format"],
                                 msg["expression"], payload, msg["partner_code"], msg["topic_in"], source)
@@ -71,15 +73,64 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
     return txn_id, result
 
 
+# ---------- forward to another API and reply ----------
+
+async def forward(partner: dict, txn: dict) -> dict:
+    """Send a completed transaction's output to the partner's reply API and convert the API's response
+    into the caller's agreed format. Returns {"ok", "status", "body", "format", "error"}."""
+    txn_id = str(txn["id"])
+    content_type = "application/xml" if txn["output_format"] == "xml" else "application/json"
+    started = time.perf_counter()
+    try:
+        adapter = await adapter_for(partner["reply_connection"])
+        if not isinstance(adapter, adapters.HTTP):
+            raise adapters.AdapterError("The reply target must be an HTTP connection.")
+        status, ctype, body, url = await adapter.request(
+            partner["reply_path"] or "", txn["output_payload"].encode(),
+            {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}, content_type)
+    except Exception as e:  # noqa: BLE001
+        error = str(e) or type(e).__name__
+        await db.record_event(txn_id, "FORWARD_FAILED", error)
+        await db.set_response(txn_id, None, None)
+        return {"ok": False, "status": 502, "error": f"Upstream API unreachable: {error}"}
+    ms = (time.perf_counter() - started) * 1000
+    await db.record_event(txn_id, "FORWARDED", f"POST {url} → HTTP {status} in {ms:.0f} ms")
+    try:
+        converted, fmt = convert_response(body, ctype, partner["response_expression"], partner["response_format"],
+                                          txn["input_format"])
+    except TransformError as e:
+        await db.record_event(txn_id, "RESPONSE_FAILED", f"could not convert the API's response: {e}")
+        await db.set_response(txn_id, body, status)
+        return {"ok": False, "status": 502, "error": f"Could not convert the upstream response: {e}"}
+    await db.set_response(txn_id, converted, status)
+    await db.record_event(txn_id, "RESPONDED", f"{len(converted)} bytes of {fmt.upper()} for the caller "
+                                               f"(upstream HTTP {status})")
+    return {"ok": status < 400, "status": status, "body": converted, "format": fmt}
+
+
+async def reply_for(partner: dict, txn_id: str, result: dict | None) -> dict | None:
+    """What a waiting caller gets back: the transformed payload, or (forward mode) the upstream API's response."""
+    if not result or result["status"] != "COMPLETED" or partner.get("reply_mode") != "forward":
+        return None
+    return await forward(partner, result)
+
+
 # ---------- outbound delivery ----------
 
 async def deliver(msg: dict):
-    """Called when a transaction completes: send the output to the partner's outbound adapter."""
+    """Called when a transaction completes: forward it in the background for MQ/Kafka sources (in forward
+    mode), then send the output to the partner's outbound adapter."""
     code = msg.get("partner_code")
     if not code:
         return
     partner = await db.get_partner(code)
-    if not partner or not partner["outbound_connection"]:
+    if not partner:
+        return
+    if partner.get("reply_mode") == "forward" and msg.get("source") not in SYNC_SOURCES:
+        txn = await db.get_transaction(msg["id"])
+        if txn:
+            await forward(partner, txn)
+    if not partner["outbound_connection"]:
         return
     txn_id = msg["id"]
     content_type = "application/xml" if msg["output_format"] == "xml" else "application/json"

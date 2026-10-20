@@ -4,7 +4,7 @@ import streamlit as st
 from . import common
 from .common import ApiError, api
 
-STEPS = ["Basics", "Payloads & mapping", "Kafka queues", "Inbound", "Outbound", "Review"]
+STEPS = ["Basics", "Payloads & mapping", "Kafka queues", "Inbound", "Response & outbound", "Review"]
 QUEUE_HELP = {
     "shared": "**Shared** - uses the common queues `payload.in` / `payload.out` / `payload.dlq`. "
               "Quick to set up; fine for low volume.",
@@ -15,7 +15,8 @@ QUEUE_HELP = {
 
 DEFAULTS = {"name": "", "code": "", "description": "", "contact": "", "input_format": "json", "output_format": "json",
             "sample_input": "", "expected_output": "", "expression": "", "queue_mode": "shared",
-            "inbound_connection": "", "inbound_source": "", "outbound_connection": "", "outbound_target": ""}
+            "inbound_connection": "", "inbound_source": "", "outbound_connection": "", "outbound_target": "",
+            "reply_mode": "transformed", "reply_connection": "", "reply_path": "", "response_format": "input"}
 
 
 def _k(field: str) -> str:
@@ -79,6 +80,8 @@ def _validate(step, wiz):
         return "Enter the partner name."
     if step == 3 and wiz.get("inbound_connection") and not (wiz.get("inbound_source") or "").strip():
         return "Enter the queue or topic to listen on, or choose 'HTTP endpoint only'."
+    if step == 4 and wiz.get("reply_mode") == "forward" and not wiz.get("reply_connection"):
+        return "Choose the target API, or return the transformed payload instead."
     return None
 
 
@@ -131,6 +134,28 @@ def _inbound(wiz):
 
 
 def _outbound(wiz):
+    st.markdown("**↩️ Response to the caller**")
+    st.radio("When a caller sends a message", ["transformed", "forward"], key=_k("reply_mode"), horizontal=True,
+             format_func={"transformed": "Return the transformed payload",
+                          "forward": "Forward to another API and return its response"}.get)
+    if wiz["reply_mode"] == "forward":
+        http = [c for c in api("GET", "/api/connections") if c["type"] == "http"]
+        if not http:
+            st.warning("Add an HTTP connection for the target API on the Connections page first.")
+        else:
+            ids = [c["id"] for c in http]
+            if st.session_state[_k("reply_connection")] not in ids:
+                st.session_state[_k("reply_connection")] = ids[0]
+            c1, c2 = st.columns(2)
+            c1.selectbox("Target API (HTTP connection)", ids, key=_k("reply_connection"),
+                         format_func=lambda i: next(f"🌐 {c['name']}" for c in http if c["id"] == i))
+            c2.text_input("Path (optional)", key=_k("reply_path"), placeholder="e.g. orders/v1/submit")
+            st.selectbox("Send the API's response back as", ["input", "json", "xml", "unchanged"],
+                         key=_k("response_format"),
+                         format_func={"input": "Same as the request (the caller's agreed format)", "json": "JSON",
+                                      "xml": "XML", "unchanged": "Unchanged"}.get)
+    st.divider()
+    st.markdown("**📤 Also deliver the transformed payload (asynchronous)**")
     conns = [c for c in api("GET", "/api/connections") if _types()[c["type"]]["outbound"]]
     options = [""] + [c["id"] for c in conns]
     names = {c["id"]: f"{_types()[c['type']]['icon']} {c['name']} ({_types()[c['type']]['label']})" for c in conns}
@@ -164,13 +189,17 @@ def _review(wiz):
     c2.markdown(f"**Kafka:** {wiz['queue_mode']} queues  \n"
                 f"**Inbound:** HTTP" + (f" + `{wiz['inbound_connection']}` → `{wiz['inbound_source']}`"
                                          if wiz.get("inbound_connection") else "") + "  \n"
+                f"**Response:** " + (f"forward to `{wiz['reply_connection']}` and return its response"
+                                     if wiz.get("reply_mode") == "forward" else "transformed payload") + "  \n"
                 f"**Outbound:** " + (f"`{wiz['outbound_connection']}` → `{wiz.get('outbound_target', '')}`"
                                      if wiz.get("outbound_connection") else "store only"))
     if st.button("✅ Create partner", type="primary", disabled=not common.can("write")):
         body = {k: (wiz.get(k) or None) for k in ("name", "code", "description", "contact", "sample_input",
                                                   "expected_output", "expression", "inbound_connection",
-                                                  "inbound_source", "outbound_connection", "outbound_target")}
-        body.update(input_format=wiz["input_format"], output_format=wiz["output_format"], queue_mode=wiz["queue_mode"])
+                                                  "inbound_source", "outbound_connection", "outbound_target",
+                                                  "reply_connection", "reply_path")}
+        body.update(input_format=wiz["input_format"], output_format=wiz["output_format"], queue_mode=wiz["queue_mode"],
+                    reply_mode=wiz["reply_mode"], response_format=wiz["response_format"])
         try:
             p = api("POST", "/api/partners", json=body)
             if st.session_state.get("wiz_doc"):

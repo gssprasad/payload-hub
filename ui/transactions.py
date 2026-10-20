@@ -9,7 +9,7 @@ from .common import STATUSES, api, lang, show_events, status_label
 
 
 def page():
-    st.title("🔎 Transactions")
+    common.hero("🔎 Transactions", "Find any message by ID, partner or content, and see every step it went through.")
     partner_names = {p["code"]: p["name"] for p in common.partners()}
     with st.form("search"):
         c1, c2, c3 = st.columns([3, 1.4, 1])
@@ -77,5 +77,9 @@ def page():
     a.code(t["input_payload"], language=lang(t["input_format"]))
     b.markdown("**Output**")
     b.code(t.get("output_payload") or "–", language=lang(t["output_format"]))
+    if t.get("response_payload") or t.get("upstream_status"):
+        st.markdown(f"**↩️ Response returned to the caller** (target API answered HTTP {t.get('upstream_status') or '–'})")
+        body = t.get("response_payload") or "–"
+        st.code(body, language="xml" if body.lstrip().startswith("<") else "json")
     st.markdown("**Mapping expression**")
     st.code(t["expression"], language="text")

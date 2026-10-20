@@ -124,6 +124,8 @@ def _start_backend():
 
 from ui import agent, common, connections, monitoring, partners, send, transactions, users  # noqa: E402
 
+common.style()
+
 if EMBED_BACKEND:
     if problem := _setup_problem():
         st.title("🔀 Payload Hub - setup needed")
@@ -162,10 +164,9 @@ def _login_page():
         st.info("Sign in to see the menu: Partners, Connections, AI Agent, Send & Test, Transactions, "
                 "Monitoring and Users.")
     st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
-    _, middle, _ = st.columns([1, 1.2, 1])
+    _, middle, _ = st.columns([1, 1.7, 1])
     with middle:
-        st.title("🔀 Payload Hub")
-        st.caption("Kafka payload transformation · partner adapters · AI mapping agent")
+        common.hero("🔀 Payload Hub", "Kafka payload transformation · partner adapters · AI mapping agent")
         if message := st.session_state.pop("login_message", None):
             st.info(message)
         with st.form("login"):
@@ -243,7 +244,8 @@ if common.can("admin"):
 nav = st.navigation(pages)
 
 with st.sidebar:
-    st.caption("Kafka payload transformation · PostgreSQL log · AI mapping agent")
+    st.markdown("### 🔀 Payload Hub")
+    st.caption("Integration hub · Kafka · MQ · HTTP")
     st.markdown("**Health**")
     _health()
     if not EMBED_BACKEND:

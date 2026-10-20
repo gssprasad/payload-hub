@@ -32,6 +32,19 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
     lines.append(node("out", f"Kafka\\n{p['topic_out']}", GREY, "cylinder"))
     lines.append(node("dlq", f"Failures\\n{p['topic_dlq']}", RED, "cylinder"))
     lines.append('"in" -> "xf"; "xf" -> "out"; "xf" -> "dlq" [style=dashed, label="error"];')
+    if p.get("reply_mode") == "forward" and p.get("reply_connection"):
+        c = conns.get(p["reply_connection"], {})
+        ok = c.get("last_test_ok")
+        fill = GREEN if ok else RED if ok is False else GREY
+        path = f"/{p['reply_path']}" if p.get("reply_path") else ""
+        fmt = {"input": p["input_format"].upper(), "json": "JSON", "xml": "XML", "unchanged": "as-is"}.get(
+            p.get("response_format") or "input")
+        lines.append(node("api", f"↪ {c.get('name', p['reply_connection'])}{path}\n(target API)", fill))
+        lines.append(f'"out" -> "api" [label="forward"]; "api" -> "http" [style=dashed, color="#4f46e5", '
+                     f'fontcolor="#4f46e5", label="response as {fmt}", constraint=false];')
+    else:
+        lines.append('"out" -> "http" [style=dashed, color="#4f46e5", fontcolor="#4f46e5", '
+                     'label="transformed payload", constraint=false];')
     if p.get("outbound_connection"):
         c = conns.get(p["outbound_connection"], {})
         ok = c.get("last_test_ok")
@@ -54,6 +67,8 @@ def flow_tab(p: dict):
         st.error(f"Inbound listener problem: {lst['detail']}")
 
     _http_endpoint(p)
+    st.divider()
+    _response_form(p, conns)
     st.divider()
     _adapters_form(p, conns, listeners)
     st.divider()
@@ -95,9 +110,70 @@ def _http_endpoint(p):
                 st.error(f"Request failed: {e}")
                 return
             ok = r.status_code < 300
-            (st.success if ok else st.error)(f"HTTP {r.status_code} · transaction {r.headers.get('X-Transaction-Id', '-')}")
+            extra = f" · upstream HTTP {r.headers['X-Upstream-Status']}" if r.headers.get("X-Upstream-Status") else ""
+            (st.success if ok else st.error)(f"HTTP {r.status_code} · {r.headers.get('X-Status', '')}{extra} · "
+                                             f"transaction {r.headers.get('X-Transaction-Id', '-')}")
             is_xml = "xml" in r.headers.get("content-type", "")
             st.code(r.text, language="xml" if is_xml else "json")
+
+
+RESPONSE_FORMATS = {
+    "input": "Same as the request (the caller's agreed format)",
+    "json": "JSON",
+    "xml": "XML",
+    "unchanged": "Unchanged (whatever the API returns)",
+}
+
+
+def _response_form(p, conns):
+    code = p["code"]
+    st.subheader("↩️ Response to the caller")
+    http_conns = [c for c in conns if conns[c]["type"] == "http"]
+    modes = {"transformed": "Return the transformed payload",
+             "forward": "Forward to another API and return its response"}
+    mode = st.radio("When a caller sends a message", list(modes), format_func=modes.get, horizontal=True,
+                    index=list(modes).index(p.get("reply_mode") or "transformed"), key=f"reply_mode_{code}")
+    if mode == "transformed":
+        st.caption(f"The caller gets the transformed {p['output_format'].upper()} straight back.")
+        if (p.get("reply_mode") or "transformed") != "transformed" and \
+                st.button("Save", type="primary", key=f"reply_save_t_{code}", disabled=not common.can("write")):
+            _save_reply(code, {"reply_mode": "transformed"})
+        return
+    if not http_conns:
+        st.warning("Add an HTTP connection for the target API on the **Connections** page first.")
+        return
+    with st.form(f"reply_{code}"):
+        c1, c2 = st.columns(2)
+        cur = p.get("reply_connection") if p.get("reply_connection") in http_conns else http_conns[0]
+        conn = c1.selectbox("Target API (HTTP connection)", http_conns, http_conns.index(cur),
+                            format_func=lambda c: f"🌐 {conns[c]['name']} · {conns[c]['config'].get('base_url', '')}")
+        path = c2.text_input("Path (appended to the base URL)", p.get("reply_path") or "",
+                             placeholder="e.g. orders/v1/submit")
+        fmt = st.selectbox("Send the API's response back as", list(RESPONSE_FORMATS),
+                           list(RESPONSE_FORMATS).index(p.get("response_format") or "input"),
+                           format_func=lambda f: RESPONSE_FORMATS[f].replace(
+                               "the caller's agreed format", f"{p['input_format'].upper()}, the caller's agreed format"))
+        expr = st.text_area("Response mapping (optional, JMESPath on the API's response)",
+                            p.get("response_expression") or "", height=90,
+                            placeholder="e.g. {confirmation: {reference: reference, state: status}}")
+        st.caption("Flow: caller → transform → POST the transformed payload to the target API → convert the API's "
+                   "response → caller. The API's HTTP status is passed through; if it can't be reached the caller "
+                   "gets 502. Messages from MQ or Kafka are forwarded too, and the response is kept on the "
+                   "transaction.")
+        if st.form_submit_button("Save response settings", type="primary", disabled=not common.can("write")):
+            _save_reply(code, {"reply_mode": "forward", "reply_connection": conn, "reply_path": path,
+                               "response_format": fmt, "response_expression": expr})
+
+
+def _save_reply(code, body):
+    try:
+        api("PUT", f"/api/partners/{code}/reply", json=body)
+    except ApiError as e:
+        st.error(str(e))
+        return
+    common.partners.clear()
+    st.toast("Response settings saved", icon="↩️")
+    st.rerun()
 
 
 def _adapters_form(p, conns, listeners):

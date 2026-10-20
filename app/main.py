@@ -299,7 +299,11 @@ async def submit_transform(req: TransformRequest):
             txn_id, result = await connectors.ingest(p, req.payload, "UI")
         except connectors.IngestError as e:
             raise HTTPException(e.status, str(e)) from e
-        return result or await db.get_transaction(txn_id)
+        reply = await connectors.reply_for(p, txn_id, result)
+        txn = await db.get_transaction(txn_id)
+        if reply:
+            txn["reply"] = reply
+        return txn
     else:
         if not (req.input_format and req.output_format and req.expression):
             raise HTTPException(422, "Give a partner_code, or input_format, output_format and expression.")
@@ -330,6 +334,11 @@ class PartnerIn(BaseModel):
     inbound_source: str | None = None
     outbound_connection: str | None = None
     outbound_target: str | None = None
+    reply_mode: Literal["transformed", "forward"] = "transformed"
+    reply_connection: str | None = None
+    reply_path: str | None = None
+    response_format: Literal["input", "json", "xml", "unchanged"] = "input"
+    response_expression: str | None = None
 
 
 class PartnerUpdate(BaseModel):
@@ -377,7 +386,12 @@ async def onboard_partner(req: PartnerIn):
         raise HTTPException(422, "Partner code must have at least 2 letters or digits.")
     topics = await _topics_for(code, req.queue_mode)
     fields = req.model_dump(exclude={"code", "inbound_connection", "inbound_source", "outbound_connection",
-                                     "outbound_target"})
+                                     "outbound_target", "reply_connection"})
+    if req.reply_mode == "forward":
+        c = await db.get_connection(req.reply_connection or "")
+        if not c or c["type"] != "http":
+            raise HTTPException(422, "Forwarding needs an HTTP connection for the target API.")
+    fields["reply_connection"] = req.reply_connection if req.reply_mode == "forward" else None
     fields["mapping_source"] = "manual" if req.expression else None
     fields["api_key"] = _new_api_key()
     await _check_adapters(req.inbound_connection, req.inbound_source, req.outbound_connection)
@@ -552,6 +566,32 @@ async def set_partner_adapters(code: str, req: PartnerAdapters):
     return await db.get_partner(code)
 
 
+class PartnerReply(BaseModel):
+    reply_mode: Literal["transformed", "forward"] = "transformed"
+    reply_connection: str | None = None
+    reply_path: str | None = None
+    response_format: Literal["input", "json", "xml", "unchanged"] = "input"
+    response_expression: str | None = None
+
+
+@app.put("/api/partners/{code}/reply")
+async def set_partner_reply(code: str, req: PartnerReply):
+    """What callers get back: the transformed payload, or the response of another API the payload is forwarded to."""
+    await _partner_or_404(code)
+    if req.reply_mode == "forward":
+        c = await db.get_connection(req.reply_connection or "")
+        if not c:
+            raise HTTPException(422, "Choose the HTTP connection of the API to forward to.")
+        if c["type"] != "http":
+            raise HTTPException(422, "Forwarding needs an HTTP connection (an API endpoint).")
+    await db.update_partner(code, reply_mode=req.reply_mode,
+                            reply_connection=req.reply_connection if req.reply_mode == "forward" else None,
+                            reply_path=(req.reply_path or "").strip() or None,
+                            response_format=req.response_format,
+                            response_expression=(req.response_expression or "").strip() or None)
+    return await db.get_partner(code)
+
+
 @app.post("/api/partners/{code}/api-key")
 async def rotate_partner_api_key(code: str):
     await _partner_or_404(code)
@@ -685,6 +725,14 @@ async def inbound(code: str, request: Request, wait: bool = True,
     except connectors.IngestError as e:
         raise HTTPException(e.status, str(e)) from e
     headers = {"X-Transaction-Id": txn_id}
+    if result and result["status"] == "COMPLETED" and p["reply_mode"] == "forward":
+        reply = await connectors.reply_for(p, txn_id, result)
+        if not reply["ok"] and "body" not in reply:
+            return JSONResponse({"transaction_id": txn_id, "status": "FORWARD_FAILED", "error": reply["error"]},
+                                status_code=502, headers=headers)
+        media = {"xml": "application/xml", "json": "application/json"}.get(reply.get("format"), "text/plain")
+        return Response(reply["body"], status_code=reply["status"], media_type=media,
+                        headers={**headers, "X-Status": "RESPONDED", "X-Upstream-Status": str(reply["status"])})
     if result and result["status"] == "COMPLETED":
         media = "application/xml" if p["output_format"] == "xml" else "application/json"
         return Response(result["output_payload"], media_type=media, headers={**headers, "X-Status": "COMPLETED"})
@@ -702,7 +750,8 @@ async def inbound_status(code: str, txn_id: uuid.UUID, request: Request,
     t = await db.get_transaction(txn_id)
     if not t or t["partner_code"] != code:
         raise HTTPException(404, "Transaction not found.")
-    return {k: t[k] for k in ("id", "status", "delivery_status", "output_payload", "error", "created_at")}
+    return {k: t[k] for k in ("id", "status", "delivery_status", "output_payload", "response_payload",
+                              "upstream_status", "error", "created_at")}
 
 
 # ---------- built-in test receiver (a webhook target for demos) ----------
@@ -713,11 +762,14 @@ _received: deque = deque(maxlen=100)
 @app.api_route("/test-receiver/{name:path}", methods=["POST", "PUT"], tags=["test receiver"])
 async def test_receiver(name: str, request: Request):
     body = (await request.body()).decode("utf-8", errors="replace")
-    _received.appendleft({"at": _now_iso(), "name": name, "method": request.method,
+    at = _now_iso()
+    _received.appendleft({"at": at, "name": name, "method": request.method,
                           "headers": {k: v for k, v in request.headers.items()
                                       if k.lower().startswith(("x-", "content-type"))},
                           "body": body})
-    return {"received": True}
+    # A realistic acknowledgement, so forwarding demos have a response to convert and return.
+    return {"status": "ACCEPTED", "reference": f"TR-{secrets.token_hex(4).upper()}",
+            "receivedAt": at, "bytes": len(body), "transactionId": request.headers.get("x-transaction-id")}
 
 
 @app.get("/api/test-receiver")

@@ -164,6 +164,20 @@ Passwords are write-only: the API never returns them. A built-in **test receiver
 *Try it* button. It returns the transformed output (200) or the error (422). With `?wait=false`
 it returns 202 and a transaction id to poll at `/inbound/<code>/transactions/<id>`.
 
+**API access.** Click a partner in the Partners table (or *🔑 API access*) for its endpoint URL,
+API key, request format, what the caller gets back, and a ready-to-run curl command.
+
+**Response to the caller.** Per partner, choose what an HTTP caller receives:
+
+| Mode | What happens |
+|------|--------------|
+| Return the transformed payload | The caller gets the transformed output straight back (default) |
+| Forward to another API and return its response | The transformed payload is POSTed to a configured HTTP connection (plus optional path). That API's response is converted to the caller's agreed format (same as the request, JSON, XML, or unchanged), optionally reshaped with a JMESPath *response mapping*, and returned with the API's HTTP status. If the API is unreachable, the caller gets 502 |
+
+Messages from MQ or Kafka in forward mode are forwarded in the background, and the converted
+response is stored on the transaction. Response headers: `X-Transaction-Id`, `X-Status`
+(`COMPLETED` or `RESPONDED`) and `X-Upstream-Status`.
+
 **Inbound and outbound per partner.** On *Flow & endpoints* (or in the onboarding wizard), pick
 a connection and queue/topic to listen on, and where to deliver results. Deliveries are retried 3
 times, then parked on the partner's failure queue. The tab shows the whole flow as a diagram with

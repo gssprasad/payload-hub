@@ -6,8 +6,7 @@ from . import common, flow, onboarding
 from .common import ApiError, api, lang, queue_label
 
 def page():
-    st.title("🤝 Partners")
-    st.caption("Onboard partners, set up each one's mapping, documents, HTTP endpoint, MQ adapters and Kafka queues.")
+    common.hero("🤝 Partners", "Onboard partners, set up each one's mapping, documents, HTTP endpoint, MQ adapters and Kafka queues.")
     partners = common.partners()
 
     if st.session_state.get("onboarding") or not partners:
@@ -20,17 +19,20 @@ def page():
         st.session_state.onboarding = True
         st.rerun()
 
-    _partner_table(partners)
+    clicked = _partner_table(partners)
     st.divider()
     codes = [p["code"] for p in partners]
-    requested = st.session_state.pop("select_partner", None)  # e.g. a partner that was just onboarded
+    requested = st.session_state.pop("select_partner", None) or clicked  # just onboarded, or clicked in the table
     if requested in codes:
         st.session_state.manage_partner = requested
     elif st.session_state.get("manage_partner") not in codes:
         st.session_state.manage_partner = codes[0]
-    code = st.selectbox("Manage partner", codes, key="manage_partner",
-                        format_func=lambda c: next(f"{p['name']} ({c})" for p in partners if p["code"] == c))
+    pick, access = st.columns([4, 1], vertical_alignment="bottom")
+    code = pick.selectbox("Manage partner", codes, key="manage_partner",
+                          format_func=lambda c: next(f"{p['name']} ({c})" for p in partners if p["code"] == c))
     p = api("GET", f"/api/partners/{code}")
+    if clicked or access.button("🔑 API access", width="stretch"):
+        api_access_dialog(p)
     flow_tab_, mapping, documents, details = st.tabs(["Flow & endpoints", "Mapping", "Mapping documents", "Details"])
     with flow_tab_:
         flow.flow_tab(p)
@@ -55,12 +57,63 @@ def _partner_table(partners):
                                                  if r["inbound_connection"] else ""), axis=1)
     df["outbound"] = df.apply(lambda r: f"{r['outbound_connection']}:{r['outbound_target'] or ''}"
                               if r["outbound_connection"] else "store only", axis=1)
-    st.dataframe(df[["name", "code", "status", "formats", "inbound", "queue", "outbound", "mapping", "documents",
-                     "transactions"]],
-                 hide_index=True, width="stretch",
-                 column_config={"name": "Partner", "code": "Code", "status": "Status", "formats": "Formats",
-                                "inbound": "Inbound", "queue": "Kafka queue", "outbound": "Outbound",
-                                "mapping": "Mapping", "documents": "Docs", "transactions": "Transactions"})
+    df["reply"] = df.apply(lambda r: f"↪ {r['reply_connection']}" if r["reply_mode"] == "forward"
+                           else "transformed", axis=1)
+    st.caption("💡 Click a partner to see its API access details.")
+    event = st.dataframe(
+        df[["name", "code", "status", "formats", "inbound", "queue", "reply", "outbound", "mapping", "documents",
+            "transactions"]],
+        hide_index=True, width="stretch", on_select="rerun", selection_mode=["single-row", "single-cell"],
+        key="partner_table",
+        column_config={"name": "Partner", "code": "Code", "status": "Status", "formats": "Formats",
+                       "inbound": "Inbound", "queue": "Kafka queue", "reply": "Response", "outbound": "Outbound",
+                       "mapping": "Mapping", "documents": "Docs", "transactions": "Transactions"})
+    rows = list(event.selection.rows) + [cell[0] for cell in getattr(event.selection, "cells", [])]
+    selected = partners[rows[0]]["code"] if rows else None
+    # open the dialog only when the selection changes, not on every rerun while a row stays selected
+    previous = st.session_state.get("partner_table_last")
+    st.session_state.partner_table_last = selected
+    return selected if selected and selected != previous else None
+
+
+@st.dialog("🔑 API access", width="large")
+def api_access_dialog(p):
+    code = p["code"]
+    url = f"{common.API}/inbound/{code}"
+    ctype = "application/xml" if p["input_format"] == "xml" else "application/json"
+    status = "🟢 Active" if p["active"] else "⏸️ Inactive"
+    if p.get("reply_mode") == "forward":
+        fmt = {"input": p["input_format"].upper() + " (same as the request)", "json": "JSON", "xml": "XML",
+               "unchanged": "the API's own format"}[p.get("response_format") or "input"]
+        reply = f"Forwards to **{p['reply_connection']}**{('/' + p['reply_path']) if p.get('reply_path') else ''} " \
+                f"and returns that API's response as {fmt}"
+    else:
+        reply = f"Returns the transformed payload ({p['output_format'].upper()})"
+    st.markdown(f"### {p['name']} &nbsp; <span class='ph-pill'>{code}</span>", unsafe_allow_html=True)
+    st.html(f"""<div class="ph-kv">
+      <b>Status</b><span>{status}</span>
+      <b>Method</b><span>POST</span>
+      <b>Request body</b><span>{p['input_format'].upper()} ({ctype})</span>
+      <b>Authentication</b><span>Header <code>X-API-Key</code></span>
+      <b>Response</b><span>{reply.replace('**', '')}</span>
+      <b>Async option</b><span><code>?wait=false</code> → 202 + transaction id, then
+        <code>GET /inbound/{code}/transactions/&lt;id&gt;</code></span>
+    </div>""")
+    st.markdown("**Endpoint URL**")
+    st.code(url, language="text")
+    reveal = common.can("write") and st.toggle("Show API key", key=f"dlg_reveal_{code}")
+    st.markdown("**API key**")
+    st.code(p["api_key"] if reveal else "•" * 24 + "  (needs write permission to reveal)" * (not common.can("write")),
+            language="text")
+    key = p["api_key"] if reveal else "<api key>"
+    sample = "payload.xml" if p["input_format"] == "xml" else "payload.json"
+    st.markdown("**Try it from a terminal**")
+    st.code("\n".join([f'curl -X POST "{url}" \\',
+                       f'  -H "X-API-Key: {key}" \\',
+                       f'  -H "Content-Type: {ctype}" \\',
+                       f'  --data-binary @{sample}']), language="bash")
+    if common.EMBEDDED:
+        st.info("On Streamlit Cloud this endpoint isn't reachable from outside - use Flow & endpoints → Try it.")
 
 
 

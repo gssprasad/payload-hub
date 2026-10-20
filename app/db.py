@@ -121,6 +121,14 @@ UPDATE partners SET api_key = 'ph_' || md5(random()::text || code) WHERE api_key
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS delivery_status text;
 
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_mode text NOT NULL DEFAULT 'transformed';
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_connection text REFERENCES connections(id);
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS reply_path text;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'input';
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS response_expression text;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS response_payload text;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upstream_status int;
+
 CREATE TABLE IF NOT EXISTS users (
     username      text PRIMARY KEY,
     password_hash text NOT NULL,
@@ -147,7 +155,8 @@ USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, cre
 PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_format", "sample_input",
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
                   "topic_dlq", "active", "api_key", "inbound_connection", "inbound_source", "outbound_connection",
-                  "outbound_target")
+                  "outbound_target", "reply_mode", "reply_connection", "reply_path", "response_format",
+                  "response_expression")
 CONNECTION_COLUMNS = "id, name, type, config, secret IS NOT NULL AND secret <> '' AS has_secret, " \
                      "last_test_at, last_test_ok, last_test_detail, created_at, updated_at"
 
@@ -353,7 +362,8 @@ async def list_partners():
     async with pool.connection() as conn:
         cur = await conn.execute(
             """SELECT p.code, p.name, p.description, p.input_format, p.output_format, p.queue_mode, p.topic_in,
-                      p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
+                      p.active, p.inbound_connection, p.inbound_source, p.outbound_connection, p.outbound_target,
+                      p.reply_mode, p.reply_connection, p.reply_path, p.response_format, p.expression IS NOT NULL AND p.expression <> '' AS has_mapping, p.mapping_source,
                       p.created_at, p.updated_at,
                       (SELECT count(*) FROM partner_documents d WHERE d.partner_code = p.code) AS documents,
                       (SELECT count(*) FROM transactions t WHERE t.partner_code = p.code) AS transactions
@@ -444,7 +454,8 @@ async def list_connections():
         cur = await conn.execute(
             f"""SELECT {CONNECTION_COLUMNS},
                        (SELECT coalesce(json_agg(code ORDER BY code), '[]') FROM partners p
-                        WHERE p.inbound_connection = c.id OR p.outbound_connection = c.id) AS used_by
+                        WHERE p.inbound_connection = c.id OR p.outbound_connection = c.id
+                  OR p.reply_connection = c.id) AS used_by
                 FROM connections c ORDER BY name"""
         )
         return await cur.fetchall()
@@ -498,6 +509,13 @@ async def partners_with_inbound_adapters():
                WHERE active AND inbound_connection IS NOT NULL AND coalesce(inbound_source, '') <> ''"""
         )
         return await cur.fetchall()
+
+
+async def set_response(txn_id, response_payload, upstream_status):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE transactions SET response_payload = %s, upstream_status = %s, updated_at = now() WHERE id = %s",
+            (response_payload, upstream_status, txn_id))
 
 
 async def set_delivery(txn_id, status):

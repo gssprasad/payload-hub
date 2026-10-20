@@ -9,7 +9,7 @@ from .common import CRITICAL, GOOD, api, status_label
 
 
 def page():
-    st.title("📊 Monitoring")
+    common.hero("📊 Monitoring", "Throughput, latency, failures and deliveries - overall, per partner, per adapter and per Kafka queue.")
     partner_names = {p["code"]: p["name"] for p in common.partners()}
     c1, c2 = st.columns([2, 1])
     scope = c1.selectbox("Show", ["", "-", *partner_names],

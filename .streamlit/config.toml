@@ -3,3 +3,46 @@ toolbarMode = "auto"  # full menu (Settings, Rerun, Clear cache...) locally; tri
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 15
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+showWidgetBorder = true
+showSidebarBorder = true
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+metricValueFontWeight = 650
+chartCategoricalColors = ["#16a34a", "#dc2626", "#4f46e5", "#0891b2", "#d97706"]
+
+[theme.light]
+primaryColor = "#4f46e5"
+backgroundColor = "#f7f8fc"
+secondaryBackgroundColor = "#eef0f8"
+textColor = "#111827"
+borderColor = "#e3e6f0"
+linkColor = "#4f46e5"
+codeBackgroundColor = "#f1f3fa"
+dataframeHeaderBackgroundColor = "#eef0f8"
+
+[theme.light.sidebar]
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f1f2fb"
+borderColor = "#e3e6f0"
+
+[theme.dark]
+primaryColor = "#818cf8"
+backgroundColor = "#0d1020"
+secondaryBackgroundColor = "#171b30"
+textColor = "#e5e7f2"
+borderColor = "#262b45"
+linkColor = "#a5b4fc"
+codeBackgroundColor = "#141831"
+dataframeHeaderBackgroundColor = "#171b30"
+
+[theme.dark.sidebar]
+backgroundColor = "#11142a"
+secondaryBackgroundColor = "#1a1e38"
+borderColor = "#262b45"
