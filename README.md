@@ -264,9 +264,14 @@ The **⚙️ Workflows** page chains steps where each step can use the results o
 Every run has a context: `trigger` (the record that started it) plus each step's result under its
 *Save result as* name.
 
-**Building:** the *Steps* tab is a visual builder. Add steps from the palette, edit each one in its
-card, move it up or down, duplicate it, switch it off (skipped when running) or remove it. The
-*Flow diagram* view draws the workflow with its branches; *JSON* shows the saved definition.
+**Designing:** the *🎨 Design* tab is a canvas with a palette on the right. The canvas shows the
+flow from ▶ Start to ■ End, with each branch's **Yes** and **No** paths side by side. Click a
+connector in the palette (Data: DB connector, SQL query, SQL update · Systems: API call, Deliver ·
+Logic: If / else, Stop if, Map · Documents: PDF) to add it after the selected step, or after
+*＋ add here* inside a branch path. Click a step to set it up in the panel under the palette: move,
+duplicate, switch off, remove, and retry settings. *💾 Save* keeps the changes; *🧾 More* has the
+diagram, the JSON definition and delete. **➕ New workflow** starts blank or as a copy of an existing
+one, e.g. the *customer-followup* sample.
 
 | Step | Does |
 |------|------|

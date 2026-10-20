@@ -1,4 +1,4 @@
-"""Workflows page: build multi-step workflows (database, API, transform, condition, PDF, deliver) and run them."""
+"""Workflows page: a canvas with a connector palette on the right to design workflows, and run them."""
 import json
 
 import pandas as pd
@@ -42,81 +42,278 @@ NEW_STEP = {
 }
 
 
+PALETTE = [("Data", ["db", "db_query", "db_update"]),
+           ("Systems", ["api_call", "deliver"]),
+           ("Logic", ["branch", "condition", "transform"]),
+           ("Documents", ["pdf"])]
+PALETTE_LABEL = {"db": "🧱 DB", "db_query": "🗄️ SQL", "db_update": "✏️ SQL upd.", "api_call": "🌐 API",
+                 "deliver": "📤 Deliver", "branch": "🔱 If / else", "condition": "❓ Stop if", "transform": "🔀 Map",
+                 "pdf": "📄 PDF"}
+SAMPLE = "customer-followup"  # the sample that shows a workflow's structure (DB connector, branch, retry)
+
+
 def page():
-    common.hero("⚙️ Workflows", "Chain database queries, API calls, updates and PDF creation - each step can use "
-                                "the results of the steps before it.")
+    common.hero("⚙️ Workflows", "Design a flow on the canvas: pick connectors from the palette on the right, "
+                                "click a step to set it up.")
     data = api("GET", "/api/workflows")
     wfs, triggers = data["workflows"], data["triggers"]
-    m = st.columns(4)
-    m[0].metric("Workflows", len(wfs))
-    m[1].metric("Runs", sum(w["runs"] for w in wfs))
-    m[2].metric("Completed", sum(w["completed"] for w in wfs))
-    m[3].metric("Failed", sum(w["failed"] for w in wfs))
-
-    _new_workflow()
+    names = {w["id"]: w for w in wfs}
+    if pending := st.session_state.pop("wf_pick_pending", None):
+        st.session_state.wf_pick = pending
+    if st.session_state.get("wf_pick") not in names and wfs:
+        st.session_state.wf_pick = SAMPLE if SAMPLE in names else wfs[0]["id"]
+    top = st.columns([3, 1], vertical_alignment="bottom")
+    if wfs:
+        wf_id = top[0].selectbox("Workflow", list(names), key="wf_pick", format_func=lambda i: _wf_label(names[i], triggers))
+    with top[1].popover("➕ New workflow", width="stretch", disabled=not common.can("write")):
+        _new_workflow(wfs)
     if not wfs:
-        st.info("No workflows yet - create one above.")
+        st.info("No workflows yet - create one with **➕ New workflow**.")
         return
-    selected = _table(wfs, triggers)
-    ids = [w["id"] for w in wfs]
-    if selected:
-        st.session_state.wf_pick = selected
-    if st.session_state.get("wf_pick") not in ids:
-        st.session_state.wf_pick = ids[0]
-    wf_id = st.selectbox("Workflow", ids, key="wf_pick",
-                         format_func=lambda i: next(w["name"] for w in wfs if w["id"] == i))
     wf = api("GET", f"/api/workflows/{wf_id}")
-    if wf.get("description"):
-        st.caption(wf["description"])
-    run_tab, steps_tab, trigger_tab, runs_tab = st.tabs(["▶️ Run", "🧩 Steps", "⏱️ Trigger", "📜 Runs"])
+    w = names[wf_id]
+    done = w["completed"] + w["failed"]
+    st.caption((wf.get("description") or "") + f"  ·  {w['runs']} runs"
+               + (f", {w['completed'] / done * 100:.0f}% succeeded" if done else ""))
+    design_tab, run_tab, runs_tab, trigger_tab = st.tabs(["🎨 Design", "▶️ Run", "📜 Runs", "⏱️ Trigger"])
+    with design_tab:
+        _design(wf)
     with run_tab:
         _run(wf)
-    with steps_tab:
-        _steps(wf)
-    with trigger_tab:
-        _trigger(wf, triggers.get(wf_id))
     with runs_tab:
         _runs(wf)
+    with trigger_tab:
+        _trigger(wf, triggers.get(wf_id))
 
 
-# ---------- list ----------
-
-def _table(wfs, triggers):
-    rows = []
-    for w in wfs:
-        trig = {"manual": "▶️ Manual / API", "schedule": f"⏱️ Every {w['trigger_config'].get('interval_minutes', '?')} min",
-                "database": f"🗄️ New rows in {w['trigger_config'].get('source', '?')}"}[w["trigger_type"]]
-        if w["trigger_type"] == "database" and (t := triggers.get(w["id"])):
-            trig += " 🟢" if t["state"] == "running" else " 🔴"
-        done = w["completed"] + w["failed"]
-        rows.append({"Workflow": w["name"], "Trigger": trig, "Steps": w["step_count"],
-                     "Active": "✅" if w["active"] else "⏸️", "Runs": w["runs"],
-                     "Success": (w["completed"] / done * 100) if done else None,
-                     "Last run": pd.to_datetime(w["last_run"]).tz_convert(None).strftime("%Y-%m-%d %H:%M")
-                     if w["last_run"] else "never"})
-    st.caption("💡 Click a workflow to open it.")
-    event = st.dataframe(rows, hide_index=True, width="stretch", on_select="rerun",
-                         selection_mode=["single-row", "single-cell"], key="wf_table",
-                         column_config={"Success": st.column_config.ProgressColumn("Success", format="%.0f%%",
-                                                                                   min_value=0, max_value=100)})
-    picked = list(event.selection.rows) + [c[0] for c in getattr(event.selection, "cells", [])]
-    return wfs[picked[0]]["id"] if picked else None
+def _wf_label(w, triggers) -> str:
+    trig = {"manual": "▶️", "schedule": "⏱️", "database": "🗄️"}[w["trigger_type"]]
+    state = "" if w["active"] else " · paused"
+    return f"{trig} {w['name']} · {w['step_count']} steps{state}"
 
 
-def _new_workflow():
-    with st.expander("➕ New workflow"):
-        with st.form("new_wf", clear_on_submit=True):
-            name = st.text_input("Name *", placeholder="e.g. Order invoice")
-            desc = st.text_input("Description", placeholder="What it does, in one line")
-            if st.form_submit_button("Create", type="primary", disabled=not common.can("write")):
-                try:
-                    w = api("POST", "/api/workflows", json={"name": name, "description": desc, "steps": []})
-                except ApiError as e:
-                    st.error(str(e))
-                    return
-                st.session_state.wf_pick = w["id"]
-                st.toast(f"Created {w['name']} - add its steps on the Steps tab", icon="⚙️")
+def _new_workflow(wfs):
+    name = st.text_input("Name *", placeholder="e.g. Order invoice", key="new_wf_name")
+    desc = st.text_input("Description", placeholder="What it does, in one line", key="new_wf_desc")
+    starts = {"": "⬜ Blank"} | {w["id"]: f"📋 Copy of {w['name']}" + (" (sample)" if w["id"] == SAMPLE else "")
+                                for w in wfs}
+    start = st.selectbox("Start from", list(starts), format_func=starts.get, key="new_wf_from")
+    if st.button("Create", type="primary", key="new_wf_create"):
+        steps = api("GET", f"/api/workflows/{start}")["steps"] if start else []
+        try:
+            w = api("POST", "/api/workflows", json={"name": name, "description": desc, "steps": steps})
+        except ApiError as e:
+            st.error(str(e))
+            return
+        st.session_state.wf_pick_pending = w["id"]
+        st.toast(f"Created {w['name']}", icon="⚙️")
+        st.rerun()
+
+
+# ---------- design: canvas + palette + properties ----------
+
+def _design(wf):
+    key = f"wf_steps_{wf['id']}"
+    if key not in st.session_state or st.session_state.get(f"{key}_ver") != wf["updated_at"]:
+        st.session_state[key] = _with_uids(json.loads(json.dumps(wf["steps"])))
+        st.session_state[f"{key}_ver"] = wf["updated_at"]
+    steps = st.session_state[key]
+    sel_key = f"wf_sel_{wf['id']}"
+    ctx = {"wf_id": wf["id"], "all": steps, "conns": _connections(), "write": common.can("write"), "sel": sel_key}
+    saved = _clean(steps) == json.loads(json.dumps(wf["steps"]))
+
+    bar = st.columns([1, 1, 1, 2], vertical_alignment="center")
+    if bar[0].button("💾 Save", type="primary", disabled=not ctx["write"] or saved, key=f"save_{wf['id']}",
+                     width="stretch"):
+        body = {k: wf[k] for k in ("name", "description", "trigger_type", "trigger_config", "active")}
+        try:
+            api("PUT", f"/api/workflows/{wf['id']}", json={**body, "steps": _clean(steps)})
+        except ApiError as e:
+            st.error(str(e))
+        else:
+            st.toast("Workflow saved", icon="💾")
+            st.rerun()
+    if bar[1].button("↩️ Discard", key=f"discard_{wf['id']}", disabled=saved, width="stretch"):
+        st.session_state.pop(key, None)
+        st.session_state.pop(sel_key, None)
+        st.rerun()
+    with bar[2].popover("🧾 More", width="stretch"):
+        st.markdown("**Diagram**")
+        st.graphviz_chart(_diagram(steps), width="content")
+        st.markdown("**Definition (JSON)**")
+        st.code(json.dumps(_clean(steps), indent=2), language="json")
+        st.divider()
+        if st.checkbox(f"Delete '{wf['name']}' and its run history", key=f"del_ok_{wf['id']}") \
+                and st.button("Delete workflow", key=f"del_{wf['id']}", disabled=not common.can("delete")):
+            api("DELETE", f"/api/workflows/{wf['id']}")
+            st.session_state.pop("wf_pick", None)
+            st.rerun()
+    bar[3].caption("✅ All changes saved" if saved else "✏️ Unsaved changes - press **Save**")
+
+    canvas, side = st.columns([3, 2], gap="large")
+    with side:  # filled first, so edits made in the panel show on the canvas in the same run
+        _palette_panel(ctx)
+        st.divider()
+        _properties(ctx)
+    with canvas:
+        _canvas(steps, ctx)
+
+
+def _locate(steps, target):
+    """(list, index) of a step uid, or of the end of a branch path ('end:<uid>:then')."""
+    if target and target.startswith("end:"):
+        _, uid, side = target.split(":")
+        for x in _walk(steps):
+            if x.get("_uid") == uid:
+                return x.setdefault(side, []), len(x[side])
+        return None, None
+    for lst in _lists(steps):
+        for i, x in enumerate(lst):
+            if x.get("_uid") == target:
+                return lst, i
+    return None, None
+
+
+def _lists(steps):
+    yield steps
+    for x in steps:
+        if x.get("type") == "branch":
+            yield from _lists(x.setdefault("then", []))
+            yield from _lists(x.setdefault("else", []))
+
+
+def _summary(s) -> str:
+    t, bits = s["type"], []
+    if t == "db":
+        bits.append(f"{DB_OPS.get(s.get('operation'), '')[2:].lower()} · {s.get('table') or 'no table yet'}")
+    elif t in ("db_query", "db_update"):
+        bits.append((s.get("sql") or "").strip().split("\n")[0][:40])
+    elif t == "api_call":
+        bits.append(f"{s.get('method') or 'GET'} /{(s.get('path') or '').lstrip('/')}")
+    elif t in ("branch", "condition", "transform"):
+        bits.append((s.get("expression") or "")[:40])
+    elif t == "pdf":
+        bits.append(s.get("filename") or "")
+    elif t == "deliver":
+        bits.append(f"{s.get('file') or '?'} → {s.get('target') or '?'}")
+    if s.get("save_as"):
+        bits.append(f"→ {s['save_as']}")
+    if (s.get("retry_attempts") or 1) > 1:
+        bits.append(f"🔁 {s['retry_attempts']} tries")
+    if s.get("on_error") == "continue":
+        bits.append("↷ continues on error")
+    return " · ".join(b for b in bits if b)
+
+
+def _canvas(steps, ctx):
+    st.markdown('<div style="text-align:center"><span style="background:#dcfce7;border:1px solid #16a34a;'
+                'border-radius:999px;padding:4px 14px;font-size:0.9rem">▶ Start · <code>trigger</code></span></div>',
+                unsafe_allow_html=True)
+    if not steps:
+        _arrow()
+        st.info("Empty workflow - pick a connector from the palette on the right →")
+    _canvas_list(steps, ctx, "", 0)
+    _arrow()
+    st.markdown('<div style="text-align:center"><span style="background:#e2e8f0;border:1px solid #64748b;'
+                'border-radius:999px;padding:4px 14px;font-size:0.9rem">■ End</span></div>', unsafe_allow_html=True)
+
+
+def _arrow():
+    st.markdown('<div style="text-align:center;color:#94a3b8;line-height:1;margin:-6px 0">↓</div>',
+                unsafe_allow_html=True)
+
+
+def _canvas_list(steps, ctx, prefix, depth):
+    sel = st.session_state.get(ctx["sel"])
+    for i, s in enumerate(steps):
+        num = f"{prefix}{i + 1}"
+        _arrow()
+        icon, name = STEP_TYPES[s["type"]].split(" ", 1)
+        label = f"{'⏸️ ' if s.get('disabled') else ''}{icon}  {num}. {s.get('label') or name}"
+        if st.button(label, key=f"blk_{s['_uid']}", width="stretch",
+                     type="primary" if sel == s["_uid"] else "secondary", help=f"{name} - click to set it up"):
+            st.session_state[ctx["sel"]] = s["_uid"]
+            st.rerun()
+        if summary := _summary(s):
+            import html
+
+            st.markdown(f'<div style="text-align:center;font-size:0.8rem;opacity:0.65;margin-top:-8px">'
+                        f'{html.escape(summary)}</div>', unsafe_allow_html=True)
+        if s["type"] == "branch":
+            sides = (("then", "✅ Yes"), ("else", "❌ No"))
+            cols = st.columns(2) if depth == 0 else [st.container(), st.container()]
+            for col, (side, title) in zip(cols, sides):
+                with col, st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    _canvas_list(s.setdefault(side, []), ctx, f"{num}{'✓' if side == 'then' else '✗'}.", depth + 1)
+                    target = f"end:{s['_uid']}:{side}"
+                    if st.button("＋ add here", key=f"addhere_{s['_uid']}_{side}", width="stretch",
+                                 type="primary" if sel == target else "tertiary",
+                                 help="Then pick a connector from the palette"):
+                        st.session_state[ctx["sel"]] = target
+                        st.rerun()
+
+
+def _palette_panel(ctx):
+    steps, sel = ctx["all"], st.session_state.get(ctx["sel"])
+    st.markdown("#### 🧰 Connectors")
+    lst, i = _locate(steps, sel) if sel else (None, None)
+    if lst is None:
+        where = "at the end"
+    elif sel.startswith("end:"):
+        where = f"into the **{'Yes' if sel.endswith(':then') else 'No'}** path of the selected branch"
+    else:
+        where = f"after **{lst[i].get('label') or lst[i]['type']}**"
+    st.caption(f"Click to add {where}.")
+    for group, types in PALETTE:
+        st.caption(group.upper())
+        cols = st.columns(2)
+        for j, t in enumerate(types):
+            if cols[j % 2].button(PALETTE_LABEL[t], key=f"pal_{ctx['wf_id']}_{t}", width="stretch",
+                                  disabled=not ctx["write"], help=STEP_TYPES[t].split(" ", 1)[1]):
+                new = _new_step(t, steps)
+                if lst is None:
+                    steps.append(new)
+                elif sel.startswith("end:"):
+                    lst.append(new)
+                else:
+                    lst.insert(i + 1, new)
+                st.session_state[ctx["sel"]] = new["_uid"]
                 st.rerun()
+
+
+def _properties(ctx):
+    steps, sel = ctx["all"], st.session_state.get(ctx["sel"])
+    lst, i = _locate(steps, sel) if sel and not sel.startswith("end:") else (None, None)
+    if lst is None:
+        st.caption("👈 Click a step on the canvas to set it up.")
+        return
+    s = lst[i]
+    st.markdown(f"#### {STEP_TYPES[s['type']]}")
+    b = st.columns(5)
+    if b[0].button("⬆️", key=f"up_{sel}", disabled=i == 0, help="Move up", width="stretch"):
+        lst[i - 1], lst[i] = lst[i], lst[i - 1]
+        st.rerun()
+    if b[1].button("⬇️", key=f"down_{sel}", disabled=i == len(lst) - 1, help="Move down", width="stretch"):
+        lst[i + 1], lst[i] = lst[i], lst[i + 1]
+        st.rerun()
+    if b[2].button("⧉", key=f"dup_{sel}", help="Duplicate", width="stretch"):
+        lst.insert(i + 1, _copy(s, steps))
+        st.session_state[ctx["sel"]] = lst[i + 1]["_uid"]
+        st.rerun()
+    if b[3].button("▶️" if s.get("disabled") else "⏸️", key=f"off_{sel}", width="stretch",
+                   help="Switch on" if s.get("disabled") else "Switch off (skipped when the workflow runs)"):
+        s["disabled"] = not s.get("disabled")
+        st.rerun()
+    if b[4].button("🗑️", key=f"rm_{sel}", help="Remove" + (" (with its Yes/No steps)" if s["type"] == "branch" else ""),
+                   width="stretch"):
+        lst.pop(i)
+        st.session_state.pop(ctx["sel"], None)
+        st.rerun()
+    _step_form(ctx, f"{ctx['wf_id']}_{sel}", s)
+    if s["type"] in RETRYABLE:
+        _retry_form(f"{ctx['wf_id']}_{sel}", s)
+    st.caption("Changes show on the canvas straight away; press **💾 Save** to keep them.")
 
 
 # ---------- run ----------
@@ -339,130 +536,6 @@ def _diagram(steps) -> str:
         edge(e, "finish")
     out.append('finish [label="■ done" shape=oval fillcolor="#e2e8f0" color="#64748b"];}')
     return "\n".join(out)
-
-
-def _steps(wf):
-    key = f"wf_steps_{wf['id']}"
-    if key not in st.session_state or st.session_state.get(f"{key}_ver") != wf["updated_at"]:
-        st.session_state[key] = _with_uids(json.loads(json.dumps(wf["steps"])))
-        st.session_state[f"{key}_ver"] = wf["updated_at"]
-    steps = st.session_state[key]
-    ctx = {"wf_id": wf["id"], "all": steps, "conns": _connections(), "write": common.can("write")}
-    saved = _clean(steps) == json.loads(json.dumps(wf["steps"]))
-
-    view = st.segmented_control("View", ["🧩 Builder", "🗺️ Flow diagram", "🧾 JSON"], default="🧩 Builder",
-                                key=f"wf_view_{wf['id']}", label_visibility="collapsed") or "🧩 Builder"
-    if view == "🗺️ Flow diagram":
-        st.graphviz_chart(_diagram(steps), width="content")
-        st.caption("Diamonds are branches (yes / no paths), red hexagons stop the run, dashed steps are switched off.")
-    elif view == "🧾 JSON":
-        st.code(json.dumps(_clean(steps), indent=2), language="json")
-    else:
-        st.caption("Values from earlier steps: `{{ trigger.order_id }}` (the starting record) or `{{ order.customer_id }}` "
-                   "(a step saved as *order*). Branches and Transform use JMESPath over all results, e.g. "
-                   "``order.total > `1000` ``.")
-        if not steps:
-            st.info("No steps yet - pick one from the palette below to start.")
-        _step_list(steps, ctx, "")
-        st.markdown("**➕ Add a step**")
-        _palette(steps, ctx, f"top_{wf['id']}")
-
-    st.divider()
-    s1, s2, s3 = st.columns([1, 1, 2], vertical_alignment="center")
-    if s1.button("💾 Save workflow", type="primary", disabled=not ctx["write"] or saved, key=f"save_{wf['id']}"):
-        body = {k: wf[k] for k in ("name", "description", "trigger_type", "trigger_config", "active")}
-        try:
-            api("PUT", f"/api/workflows/{wf['id']}", json={**body, "steps": _clean(steps)})
-        except ApiError as e:
-            st.error(str(e))
-            return
-        st.toast("Workflow saved", icon="💾")
-        st.rerun()
-    if s2.button("↩️ Discard changes", key=f"discard_{wf['id']}", disabled=saved):
-        st.session_state.pop(key, None)
-        st.rerun()
-    s3.caption("✅ All changes saved" if saved else "✏️ Unsaved changes")
-    with st.expander("Danger zone"):
-        if st.checkbox(f"I want to delete the workflow '{wf['name']}' and its run history", key=f"del_ok_{wf['id']}") \
-                and st.button("Delete workflow", key=f"del_{wf['id']}", disabled=not common.can("delete")):
-            api("DELETE", f"/api/workflows/{wf['id']}")
-            st.session_state.pop("wf_pick", None)
-            st.rerun()
-
-
-def _palette(target: list, ctx, key: str, compact: bool = False):
-    """Buttons (or a compact picker inside branches) that append a new step to `target`."""
-    if compact:
-        a1, a2 = st.columns([3, 1], vertical_alignment="bottom")
-        t = a1.selectbox("Add a step here", list(STEP_TYPES), format_func=STEP_TYPES.get, key=f"pal_{key}",
-                         label_visibility="collapsed")
-        if a2.button("➕ Add", key=f"paladd_{key}", width="stretch"):
-            target.append(_new_step(t, ctx["all"]))
-            st.rerun()
-        return
-    cols = st.columns(5)
-    for i, t in enumerate(STEP_TYPES):
-        if cols[i % 5].button(STEP_TYPES[t], key=f"pal_{key}_{t}", width="stretch"):
-            target.append(_new_step(t, ctx["all"]))
-            st.rerun()
-
-
-def _step_list(steps: list, ctx, prefix: str):
-    for i, s in enumerate(steps):
-        _card(steps, i, s, ctx, f"{prefix}{i + 1}")
-
-
-def _card(steps: list, i: int, s: dict, ctx, num: str):
-    uid, t = s["_uid"], s["type"]
-    k = f"{ctx['wf_id']}_{uid}"
-    with st.container(border=True):
-        badges = []
-        if s.get("disabled"):
-            badges.append("⏸️ *switched off*")
-        if (s.get("retry_attempts") or 1) > 1:
-            badges.append(f"🔁 {s['retry_attempts']} tries")
-        if s.get("on_error") == "continue":
-            badges.append("↷ continues on error")
-        if t == "db" and s.get("table"):
-            badges.append(f"`{DB_OPS.get(s.get('operation'), '')[2:]}` on `{s['table']}`")
-        if t == "branch":
-            badges.append(f"if `{s.get('expression', '')}`")
-        h1, h2 = st.columns([6, 1], vertical_alignment="center")
-        h1.markdown(f"**{num}. {s.get('label') or STEP_TYPES[t]}** · {STEP_TYPES[t]}"
-                    + (f" → `{s['save_as']}`" if s.get("save_as") else "")
-                    + ("  \n" + " · ".join(badges) if badges else ""))
-        editing = h2.toggle("Edit", key=f"open_{uid}")
-        if editing:
-            _step_form(ctx, k, s)
-            if t in RETRYABLE:
-                _retry_form(k, s)
-        b = st.columns(5)
-        if b[0].button("⬆️", key=f"up_{uid}", disabled=i == 0, help="Move up", width="stretch"):
-            steps[i - 1], steps[i] = steps[i], steps[i - 1]
-            st.rerun()
-        if b[1].button("⬇️", key=f"down_{uid}", disabled=i == len(steps) - 1, help="Move down", width="stretch"):
-            steps[i + 1], steps[i] = steps[i], steps[i + 1]
-            st.rerun()
-        if b[2].button("⧉", key=f"dup_{uid}", help="Duplicate", width="stretch"):
-            steps.insert(i + 1, _copy(s, ctx["all"]))
-            st.rerun()
-        if b[3].button("▶️" if s.get("disabled") else "⏸️", key=f"off_{uid}", width="stretch",
-                       help="Switch on" if s.get("disabled") else "Switch off (skipped when the workflow runs)"):
-            s["disabled"] = not s.get("disabled")
-            st.rerun()
-        if b[4].button("🗑️", key=f"rm_{uid}", help="Remove", width="stretch"):
-            steps.pop(i)
-            st.rerun()
-        if t == "branch":
-            for side, title in (("then", "✅ **Yes** - when the condition is true"),
-                                ("else", "❌ **No** - otherwise")):
-                s.setdefault(side, [])
-                with st.container(border=True):
-                    st.markdown(title)
-                    if not s[side]:
-                        st.caption("No steps - the run carries on after the branch.")
-                    _step_list(s[side], ctx, f"{num}{'✓' if side == 'then' else '✗'}.")
-                    _palette(s[side], ctx, f"{uid}_{side}", compact=True)
 
 
 def _retry_form(k: str, s: dict):
