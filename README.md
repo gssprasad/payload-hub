@@ -234,6 +234,38 @@ policy, and shows which partners use it.
   database connection. There, statements run with that connection's database user (whose own
   rights apply too), and read queries are always rolled back.
 
+## FTP / FTPS / SFTP adapter (files)
+
+*Adapters & Connections → Add a connection → FTP / FTPS / SFTP*. Pick the protocol first (the port
+fills in: SFTP 22, FTP/FTPS 21). Then set host, user, password, base folder, inbound file pattern
+(e.g. `*.xml`), what happens after reading (move to an archive subfolder, or delete), the outbound
+file name pattern (`{partner}_{timestamp}_{txn}.{ext}`, also `{date}`), the poll interval, passive
+mode, and the retry policy.
+
+- **Inbound:** use a folder as the partner's inbound source. Matching files are picked up once
+  their size is stable for one poll (so half-uploaded files are skipped), become messages, and are
+  then archived (`processed/<time>_<name>`) or deleted.
+- **Outbound:** use a folder as the outbound target. Each transformed payload is written as a new
+  file, via a temporary `.part` name and a rename, so readers never see half a file.
+- **📂 Files** on the connection card: browse folders, view files, and upload a file (e.g. to drop
+  a test message into a partner's inbound folder).
+
+SFTP host keys aren't checked yet (fine for trusted networks; pin host keys before production use).
+
+Local test servers (development only): `.venv/bin/python scripts/dev_file_servers.py` runs FTP on
+127.0.0.1:2121 and SFTP on 127.0.0.1:2222, both with user `demo` / `demo123`, serving `data/ftp`
+and `data/sftp`. Needs `pip install pyftpdlib`.
+
+## Table designer
+
+Data → **🧱 Table designer** works on the built-in area and on every database connection, e.g. the
+**Local PostgreSQL (default)** connection to the server's `postgres` database. Design columns in a
+grid: 🔑 PK (tick several for a composite key), name, type (varchar/text/integer/bigint/numeric/
+boolean/date/timestamp/json/uuid), length, precision/scale, can-be-empty, unique, auto-increment
+and default (a value, `now`, `true`/`false`). The SQL preview updates live in the selected
+database's dialect. **🛠️ Modify a table** adds or drops columns, sets or removes the primary key,
+and adds or removes unique constraints (SQLite can't change keys on an existing table).
+
 ## Data tables and storing partner data
 
 The **Data** page creates tables (column editor with types), browses their rows, and has a SQL

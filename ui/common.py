@@ -190,6 +190,11 @@ def connection_address(c: dict, target: str = "") -> str:
         return f"{cfg.get('queue_manager')} @ {cfg.get('host')}({cfg.get('port')}) channel {cfg.get('channel')} → queue {t}"
     if c["type"] == "kafka":
         return f"kafka://{cfg.get('bootstrap')} → topic {t}"
+    if c["type"] == "ftp":
+        import posixpath
+
+        return f"{cfg.get('protocol')}://{cfg.get('host')}:{cfg.get('port')}" \
+               f"{posixpath.join(cfg.get('base_dir') or '/', t)} (files {cfg.get('file_pattern') or '*'})"
     if c["type"] == "database":
         where = cfg.get("database") if cfg.get("engine") == "sqlite" else \
             f"{cfg.get('host')}:{cfg.get('port')}/{cfg.get('database')}"

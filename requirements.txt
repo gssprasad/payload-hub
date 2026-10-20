@@ -17,3 +17,5 @@ sqlalchemy>=2
 pymysql
 oracledb
 pymssql
+asyncssh
+# dev only, for scripts/dev_file_servers.py: pyftpdlib

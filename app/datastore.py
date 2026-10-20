@@ -59,6 +59,27 @@ async def init():
             role_ok = False
 
 
+_builtin = None
+
+
+def builtin():
+    """A Database adapter for the built-in data area: same PostgreSQL server, locked to the userdata schema and
+    (when available) the restricted role, so the table designer works here exactly as on other databases."""
+    global _builtin
+    if _builtin is None:
+        from sqlalchemy.engine import make_url
+
+        from .adapters import Database
+
+        url = make_url(db.DATABASE_URL)
+        options = f"-c search_path={SCHEMA}" + (f" -c role={ROLE}" if role_ok else "")
+        _builtin = Database({"engine": "postgresql", "host": url.host or "localhost", "port": url.port or 5432,
+                             "database": url.database, "username": url.username or "",
+                             "options": "&".join(f"{k}={v}" for k, v in url.query.items()),
+                             "_connect_args": {"options": options}}, url.password or "")
+    return _builtin
+
+
 async def _scope(conn, read_only: bool = False):
     """Inside a transaction: switch to the restricted role and schema, with a time limit."""
     if read_only:

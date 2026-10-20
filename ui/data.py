@@ -49,18 +49,20 @@ def page():
     c[1].metric("Rows stored", sum(t["rows"] for t in tables))
     c[2].metric("Partners storing", sum(1 for p in common.partners() if p.get("store_enabled")))
 
-    browse, create, console = st.tabs(["📋 Tables", "➕ Create a table", "🧮 SQL console"])
+    browse, design, modify, console = st.tabs(["📋 Tables", "🧱 Table designer", "🛠️ Modify a table", "🧮 SQL console"])
     with browse:
         _browse(target, tables)
-    with create:
-        _create(target, status["types"])
+    with design:
+        _designer(target)
+    with modify:
+        _modify(target, tables)
     with console:
         _console(target, tables)
 
 
 def _browse(target, tables):
     if not tables:
-        st.info("No tables yet - create one on the **Create a table** tab.")
+        st.info("No tables yet - create one on the **Table designer** tab.")
         return
     users_of = {}
     for p in common.partners():
@@ -95,34 +97,148 @@ def _browse(target, tables):
                     st.rerun()
 
 
-def _create(target, types):
-    st.caption("Names use lowercase letters, digits and _. Each table also gets id, transaction_id, partner_code "
-               "and stored_at columns (unless you untick that), so stored rows can be traced back to their message.")
-    name = st.text_input("Table name", placeholder="e.g. order_lines", key="new_table_name")
-    if "new_table_cols" not in st.session_state:
-        st.session_state.new_table_cols = pd.DataFrame(
-            [{"name": "order_id", "type": "text", "nullable": False, "primary_key": False},
-             {"name": "sku", "type": "text", "nullable": True, "primary_key": False},
-             {"name": "quantity", "type": "integer", "nullable": True, "primary_key": False},
-             {"name": "amount", "type": "numeric", "nullable": True, "primary_key": False}])
+DESIGN_TYPES = ["varchar", "text", "integer", "bigint", "numeric", "boolean", "date", "timestamp", "json", "uuid"]
+STARTER = [
+    {"name": "id", "type": "bigint", "length": None, "precision": None, "scale": None, "primary_key": True,
+     "auto_increment": True, "nullable": False, "unique": False, "default": ""},
+    {"name": "order_id", "type": "varchar", "length": 40, "precision": None, "scale": None, "primary_key": False,
+     "auto_increment": False, "nullable": False, "unique": True, "default": ""},
+    {"name": "amount", "type": "numeric", "length": None, "precision": 12, "scale": 2, "primary_key": False,
+     "auto_increment": False, "nullable": True, "unique": False, "default": "0"},
+    {"name": "created_at", "type": "timestamp", "length": None, "precision": None, "scale": None,
+     "primary_key": False, "auto_increment": False, "nullable": False, "unique": False, "default": "now"},
+]
+
+
+def _designer_target(target: str) -> str:
+    return "builtin" if target == BUILTIN else target
+
+
+def _designer(target):
+    st.caption("Design the columns, tick **PK** for the primary key (tick several for a composite key), and watch "
+               "the SQL update below. Length applies to varchar; precision/scale to numeric. Default can be a value, "
+               "`now` or `true`/`false`.")
+    c1, c2 = st.columns([2, 1])
+    name = c1.text_input("Table name", placeholder="e.g. customer_orders", key=f"design_name_{target}")
+    tracking = c2.toggle("Add tracking columns", value=False, key=f"design_tracking_{target}",
+                         help="Adds transaction_id, partner_code and stored_at (and an id key if you have none), "
+                              "so rows stored by partners can be traced back to their message.")
+    if f"design_cols_{target}" not in st.session_state:
+        st.session_state[f"design_cols_{target}"] = pd.DataFrame(STARTER)
     edited = st.data_editor(
-        st.session_state.new_table_cols, num_rows="dynamic", hide_index=True, width="stretch", key="new_table_editor",
-        column_config={"name": st.column_config.TextColumn("Column name", required=True),
-                       "type": st.column_config.SelectboxColumn("Type", options=types, required=True),
-                       "nullable": st.column_config.CheckboxColumn("Can be empty"),
-                       "primary_key": st.column_config.CheckboxColumn("Primary key")})
-    tracking = st.checkbox("Add tracking columns (id, transaction_id, partner_code, stored_at)", value=True)
-    if st.button("Create table", type="primary", disabled=not common.can("write")):
-        columns = [{k: (bool(v) if k in ("nullable", "primary_key") else v) for k, v in row.items()}
-                   for row in edited.to_dict("records") if str(row.get("name") or "").strip()]
+        st.session_state[f"design_cols_{target}"], num_rows="dynamic", hide_index=True, width="stretch",
+        key=f"design_editor_{target}",
+        column_order=["primary_key", "name", "type", "length", "precision", "scale", "nullable", "unique",
+                      "auto_increment", "default"],
+        column_config={
+            "primary_key": st.column_config.CheckboxColumn("🔑 PK", help="Part of the primary key", width="small"),
+            "name": st.column_config.TextColumn("Column", required=True),
+            "type": st.column_config.SelectboxColumn("Type", options=DESIGN_TYPES, required=True, default="varchar"),
+            "length": st.column_config.NumberColumn("Length", min_value=1, max_value=10000, step=1),
+            "precision": st.column_config.NumberColumn("Precision", min_value=1, max_value=38, step=1),
+            "scale": st.column_config.NumberColumn("Scale", min_value=0, max_value=30, step=1),
+            "nullable": st.column_config.CheckboxColumn("Can be empty", default=True),
+            "unique": st.column_config.CheckboxColumn("Unique"),
+            "auto_increment": st.column_config.CheckboxColumn("Auto ++", help="Auto-numbering (integer/bigint PK)"),
+            "default": st.column_config.TextColumn("Default"),
+        })
+    columns = []
+    for row in edited.to_dict("records"):
+        if not str(row.get("name") or "").strip():
+            continue
+        col = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        for flag in ("primary_key", "nullable", "unique", "auto_increment"):
+            col[flag] = bool(col.get(flag))
+        columns.append(col)
+    pk = [c["name"] for c in columns if c["primary_key"]]
+    st.markdown("**Primary key:** " + (" + ".join(f"`{c}`" for c in pk) if pk else
+                                       "_none_" + (" (an `id` key will be added)" if tracking else "")))
+    spec = {"name": name or "new_table", "columns": columns, "add_tracking": tracking}
+    preview = api("POST", f"/api/db/{_designer_target(target)}/ddl", json=spec)
+    st.markdown("**SQL that will run**")
+    if preview.get("sql"):
+        st.code(preview["sql"], language="sql")
+    else:
+        st.warning(preview.get("error"))
+    if st.button("Create table", type="primary", disabled=not (common.can("write") and name and preview.get("sql")),
+                 key=f"design_create_{target}"):
         try:
-            api("POST", f"{_base(target)}/tables", json={"name": name, "columns": columns, "add_tracking": tracking})
+            api("POST", f"/api/db/{_designer_target(target)}/tables", json=spec)
         except ApiError as e:
             st.error(str(e))
             return
-        st.session_state.pop("new_table_cols", None)
-        st.toast(f"Created table {name.strip()}", icon="✅")
+        st.session_state.pop(f"design_cols_{target}", None)
+        st.toast(f"Created table {name}", icon="✅")
         st.rerun()
+
+
+def _modify(target, tables):
+    if not tables:
+        st.info("No tables yet - create one in the Table designer.")
+        return
+    t = st.selectbox("Table", [x["name"] for x in tables], key=f"modify_table_{target}")
+    dt = _designer_target(target)
+    try:
+        sc = api("GET", f"/api/db/{dt}/tables/{t}/schema")
+    except ApiError as e:
+        st.error(str(e))
+        return
+    st.dataframe([{"🔑": "🔑" if c["primary_key"] else "", "column": c["name"], "type": c["type"],
+                   "can be empty": c["nullable"], "default": c["default"]} for c in sc["columns"]],
+                 hide_index=True, width="stretch")
+    st.caption("Primary key: " + (" + ".join(sc["primary_key"]["columns"]) or "none")
+               + (" · Unique: " + "; ".join("+".join(u["columns"]) for u in sc["unique"]) if sc["unique"] else ""))
+    names = [c["name"] for c in sc["columns"]]
+
+    def run(body, ok):
+        try:
+            r = api("POST", f"/api/db/{dt}/tables/{t}/alter", json=body)
+        except ApiError as e:
+            st.error(str(e))
+            return
+        st.toast(ok, icon="🛠️")
+        st.caption(f"Ran: `{r['ran']}`")
+        st.rerun()
+
+    a, b = st.columns(2)
+    with a.form(f"add_col_{target}_{t}"):
+        st.markdown("**➕ Add a column**")
+        cname = st.text_input("Name")
+        ctype = st.selectbox("Type", DESIGN_TYPES)
+        x1, x2 = st.columns(2)
+        length = x1.number_input("Length (varchar)", 1, 10000, 255)
+        nullable = x2.checkbox("Can be empty", True)
+        default = st.text_input("Default (optional)")
+        if st.form_submit_button("Add column", disabled=not common.can("write")):
+            run({"action": "add_column", "column": {"name": cname, "type": ctype, "length": length,
+                                                    "nullable": nullable, "default": default}}, f"Added {cname}")
+    with b.form(f"pk_{target}_{t}"):
+        st.markdown("**🔑 Primary key**")
+        new_pk = st.multiselect("Columns (in order)", names, default=sc["primary_key"]["columns"])
+        k1, k2 = st.columns(2)
+        if k1.form_submit_button("Set primary key", disabled=not common.can("write")):
+            run({"action": "set_primary_key", "columns": new_pk}, "Primary key updated")
+        if k2.form_submit_button("Remove primary key", disabled=not common.can("delete")):
+            run({"action": "drop_primary_key"}, "Primary key removed")
+    c, d = st.columns(2)
+    with c.form(f"uq_{target}_{t}"):
+        st.markdown("**Unique constraint**")
+        uq = st.multiselect("Columns that must be unique together", names)
+        if st.form_submit_button("Add unique", disabled=not common.can("write")):
+            run({"action": "add_unique", "columns": uq}, "Unique constraint added")
+        if sc["unique"]:
+            drop_uq = st.selectbox("Remove", [u["name"] for u in sc["unique"]])
+            if st.form_submit_button("Remove unique", disabled=not common.can("delete")):
+                run({"action": "drop_unique", "name": drop_uq}, "Unique constraint removed")
+    with d.form(f"drop_col_{target}_{t}"):
+        st.markdown("**🗑️ Drop a column**")
+        col = st.selectbox("Column", names)
+        sure = st.checkbox("I understand the column's data is deleted")
+        if st.form_submit_button("Drop column", disabled=not common.can("delete")):
+            if sure:
+                run({"action": "drop_column", "column": col}, f"Dropped {col}")
+            else:
+                st.warning("Tick the confirmation first.")
 
 
 def _console(target, tables):

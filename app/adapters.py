@@ -85,6 +85,29 @@ TYPES = {
              "help": "How often new rows are checked when this connection is used for inbound messages."},
         ],
     },
+    "ftp": {
+        "label": "FTP / FTPS / SFTP (files)", "icon": "📁", "inbound": True, "outbound": True,
+        "target": "Folder (relative to the base folder)",
+        "fields": [
+            {"key": "protocol", "label": "Protocol", "kind": "select", "default": "sftp", "options": ["sftp", "ftp", "ftps"]},
+            {"key": "host", "label": "Host", "kind": "text", "default": "localhost"},
+            {"key": "port", "label": "Port", "kind": "int", "default": 22, "help": "SFTP 22 · FTP/FTPS 21"},
+            {"key": "username", "label": "Username", "kind": "text", "default": ""},
+            {"key": "password", "label": "Password", "kind": "secret", "default": ""},
+            {"key": "base_dir", "label": "Base folder", "kind": "text", "default": "/",
+             "help": "Inbound/outbound folders are relative to this."},
+            {"key": "file_pattern", "label": "Inbound file pattern", "kind": "text", "default": "*",
+             "help": "Which files to pick up, e.g. *.xml or orders_*.json"},
+            {"key": "after_read", "label": "After reading a file", "kind": "select", "default": "archive",
+             "options": ["archive", "delete"]},
+            {"key": "archive_dir", "label": "Archive subfolder", "kind": "text", "default": "processed"},
+            {"key": "filename_pattern", "label": "Outbound file name", "kind": "text",
+             "default": "{partner}_{timestamp}_{txn}.{ext}",
+             "help": "Placeholders: {partner} {txn} {timestamp} {date} {ext}"},
+            {"key": "poll_interval", "label": "Inbound poll interval (seconds)", "kind": "int", "default": 15},
+            {"key": "passive", "label": "Passive mode (FTP/FTPS)", "kind": "bool", "default": True},
+        ],
+    },
     "kafka": {
         "label": "Kafka", "icon": "🟧", "inbound": True, "outbound": True, "target": "Topic",
         "fields": [
@@ -545,6 +568,244 @@ class Kafka(Adapter):
         return listener
 
 
+# ---------- Files over FTP / FTPS / SFTP ----------
+
+class FileTransfer(Adapter):
+    """Reads files from and writes files to an FTP, FTPS or SFTP server."""
+
+    kind = "ftp"
+
+    def _path(self, *parts) -> str:
+        import posixpath
+
+        return posixpath.normpath(posixpath.join(self.config.get("base_dir") or "/", *[p for p in parts if p]))
+
+    def _describe(self) -> str:
+        c = self.config
+        return f"{c.get('protocol', 'sftp')}://{c.get('host')}:{c.get('port')}"
+
+    # -- low-level operations: one session per call (simple and robust for polling) --
+
+    async def _ftp(self, fn):
+        """Run fn(ftp) in a thread with a fresh FTP/FTPS session."""
+        import ftplib
+
+        c = self.config
+
+        def run():
+            ftp = ftplib.FTP_TLS(timeout=20) if c.get("protocol") == "ftps" else ftplib.FTP(timeout=20)
+            try:
+                ftp.connect(c.get("host"), int(c.get("port") or 21))
+                ftp.login(c.get("username") or "anonymous", self.secret or "")
+                if c.get("protocol") == "ftps":
+                    ftp.prot_p()
+                ftp.set_pasv(bool(c.get("passive", True)))
+                return fn(ftp)
+            finally:
+                try:
+                    ftp.quit()
+                except Exception:  # noqa: BLE001
+                    ftp.close()
+
+        try:
+            return await asyncio.to_thread(run)
+        except AdapterError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise AdapterError(f"{self._describe()}: {str(e) or type(e).__name__}") from e
+
+    async def _sftp(self, fn):
+        """Run async fn(sftp) with a fresh SFTP session."""
+        import asyncssh
+
+        c = self.config
+        try:
+            async with asyncssh.connect(c.get("host"), port=int(c.get("port") or 22), username=c.get("username"),
+                                        password=self.secret or None, known_hosts=None,
+                                        connect_timeout=20) as conn:
+                async with conn.start_sftp_client() as sftp:
+                    return await fn(sftp)
+        except AdapterError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise AdapterError(f"{self._describe()}: {str(e) or type(e).__name__}") from e
+
+    async def list_dir(self, folder: str = "") -> list[dict]:
+        path = self._path(folder)
+        if self.config.get("protocol") == "sftp":
+            async def run(sftp):
+                out = []
+                for e in await sftp.readdir(path):
+                    if e.filename in (".", ".."):
+                        continue
+                    out.append({"name": e.filename, "size": e.attrs.size or 0,
+                                "is_dir": e.attrs.type == 2, "modified": e.attrs.mtime})
+                return out
+            entries = await self._sftp(run)
+        else:
+            def run(ftp):
+                try:
+                    return [{"name": n, "size": int(f.get("size", 0) or 0), "is_dir": f.get("type") == "dir",
+                             "modified": f.get("modify")}
+                            for n, f in ftp.mlsd(path, facts=["type", "size", "modify"]) if f.get("type") in ("file", "dir")]
+                except Exception:  # noqa: BLE001 - servers without MLSD
+                    out = []
+                    for full in ftp.nlst(path):
+                        n = full.rsplit("/", 1)[-1]
+                        try:
+                            out.append({"name": n, "size": ftp.size(f"{path}/{n}") or 0, "is_dir": False, "modified": None})
+                        except Exception:  # noqa: BLE001
+                            out.append({"name": n, "size": 0, "is_dir": True, "modified": None})
+                    return out
+            entries = await self._ftp(run)
+        return sorted(entries, key=lambda e: (not e["is_dir"], e["name"]))
+
+    async def read_file(self, path: str, max_bytes: int | None = None) -> bytes:
+        full = self._path(path)
+        if self.config.get("protocol") == "sftp":
+            async def run(sftp):
+                async with sftp.open(full, "rb") as f:
+                    return await f.read(max_bytes if max_bytes else -1)
+            return await self._sftp(run)
+
+        def run(ftp):
+            import io
+
+            buf = io.BytesIO()
+            ftp.retrbinary(f"RETR {full}", buf.write)
+            return buf.getvalue()[:max_bytes] if max_bytes else buf.getvalue()
+        return await self._ftp(run)
+
+    async def write_file(self, folder: str, name: str, body: bytes) -> str:
+        """Write via a temporary .part name, then rename, so readers never see half a file."""
+        import posixpath
+
+        folder_path = self._path(folder)
+        final, temp = posixpath.join(folder_path, name), posixpath.join(folder_path, f".{name}.part")
+        if self.config.get("protocol") == "sftp":
+            async def run(sftp):
+                if not await sftp.exists(folder_path):
+                    await sftp.makedirs(folder_path, exist_ok=True)
+                async with sftp.open(temp, "wb") as f:
+                    await f.write(body)
+                if await sftp.exists(final):
+                    await sftp.remove(final)
+                await sftp.rename(temp, final)
+            await self._sftp(run)
+        else:
+            def run(ftp):
+                import io
+
+                try:
+                    ftp.mkd(folder_path)
+                except Exception:  # noqa: BLE001 - already exists
+                    pass
+                ftp.storbinary(f"STOR {temp}", io.BytesIO(body))
+                try:
+                    ftp.delete(final)
+                except Exception:  # noqa: BLE001
+                    pass
+                ftp.rename(temp, final)
+            await self._ftp(run)
+        return final
+
+    async def finish(self, folder: str, name: str):
+        """After a file was processed: move it to the archive subfolder, or delete it."""
+        import posixpath
+
+        src = self._path(folder, name)
+        archive_dir = self._path(folder, self.config.get("archive_dir") or "processed")
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%dT%H%M%S")
+        dst = posixpath.join(archive_dir, f"{stamp}_{name}")
+        delete = self.config.get("after_read") == "delete"
+        if self.config.get("protocol") == "sftp":
+            async def run(sftp):
+                if delete:
+                    await sftp.remove(src)
+                    return
+                await sftp.makedirs(archive_dir, exist_ok=True)
+                await sftp.rename(src, dst)
+            await self._sftp(run)
+        else:
+            def run(ftp):
+                if delete:
+                    ftp.delete(src)
+                    return
+                try:
+                    ftp.mkd(archive_dir)
+                except Exception:  # noqa: BLE001
+                    pass
+                ftp.rename(src, dst)
+            await self._ftp(run)
+
+    # -- adapter interface --
+
+    async def test(self):
+        entries = await self.list_dir("")
+        return f"Connected to {self._describe()}{self._path()} ({len(entries)} entries)"
+
+    async def send(self, target, body, headers, content_type):
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        ext = "xml" if "xml" in content_type else "json" if "json" in content_type else "txt"
+        pattern = self.config.get("filename_pattern") or "{partner}_{timestamp}_{txn}.{ext}"
+        try:
+            name = pattern.format(partner=headers.get("X-Partner", "payload"),
+                                  txn=str(headers.get("X-Transaction-Id", "manual"))[:8],
+                                  timestamp=now.strftime("%Y%m%dT%H%M%S%f")[:-3], date=now.strftime("%Y-%m-%d"),
+                                  ext=ext)
+        except (KeyError, IndexError) as e:
+            raise AdapterError(f"Unknown placeholder {e} in the outbound file name pattern.", retryable=False) from e
+        if "/" in name or name.startswith("."):
+            raise AdapterError("The outbound file name can't contain '/' or start with '.'.", retryable=False)
+        path = await self.write_file(target, name, body)
+        return f"wrote {path} ({len(body)} bytes) on {self._describe()}"
+
+    async def listen(self, source, handler):
+        import fnmatch
+
+        pattern = self.config.get("file_pattern") or "*"
+        interval = max(3, int(self.config.get("poll_interval") or 15))
+        await self.list_dir(source)  # fail fast if the folder doesn't exist
+        stopped = asyncio.Event()
+        last_sizes: dict[str, int] = {}
+
+        async def run():
+            nonlocal last_sizes
+            while not stopped.is_set():
+                try:
+                    files = [e for e in await self.list_dir(source)
+                             if not e["is_dir"] and not e["name"].startswith(".") and fnmatch.fnmatch(e["name"], pattern)]
+                    sizes = {e["name"]: e["size"] for e in files}
+                    for name, size in sizes.items():
+                        if last_sizes.get(name) != size:
+                            continue  # new or still growing - wait until the size is stable for one poll
+                        body = await self.read_file(f"{source}/{name}" if source else name)
+                        await handler(body, {"headers": {"filename": name},
+                                             "source": f"{self.config.get('protocol')}:{self._path(source, name)}"})
+                        await self.finish(source, name)
+                        sizes.pop(name, None)
+                    last_sizes = sizes
+                except Exception:  # noqa: BLE001
+                    log.exception("file poll on %s failed", source)
+                try:
+                    await asyncio.wait_for(stopped.wait(), interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        task = asyncio.create_task(run(), name=f"ftp-poll-{source}")
+
+        async def stop():
+            stopped.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+        listener = Listener(stop, f"{self.config.get('protocol', 'sftp').upper()} folder "
+                                  f"'{self._path(source)}' ({pattern}, every {interval} s)")
+        listener.alive = lambda: not task.done()
+        return listener
+
+
 # ---------- Databases (SQLAlchemy) ----------
 
 DIALECTS = {"postgresql": "postgresql+psycopg", "mysql": "mysql+pymysql", "sqlserver": "mssql+pymssql",
@@ -600,7 +861,9 @@ class Database(Adapter):
                                            password=self.secret or None, host=c.get("host"),
                                            port=int(c.get("port")) if c.get("port") else None,
                                            database=c.get("database") or None, query=query)
-            self._engine = sa.create_engine(url, pool_pre_ping=True, pool_size=3, max_overflow=2) \
+            connect_args = self.config.get("_connect_args") or {}
+            self._engine = sa.create_engine(url, pool_pre_ping=True, pool_size=3, max_overflow=2,
+                                            connect_args=connect_args) \
                 if eng != "sqlite" else sa.create_engine(url)
         return self._engine
 
@@ -694,6 +957,182 @@ class Database(Adapter):
             sa.Table(name, md, *cols).create(self.engine())
 
         await self._run(run)
+
+    # ---------- table designer ----------
+
+    DESIGN_TYPES = ["varchar", "text", "integer", "bigint", "numeric", "boolean", "date", "timestamp", "json", "uuid"]
+
+    def _column(self, c: dict):
+        import re
+
+        import sqlalchemy as sa
+
+        name = str(c.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name):
+            raise AdapterError(f"Invalid column name '{name}': letters, digits and _, starting with a letter.",
+                               retryable=False)
+        t = c.get("type") or "varchar"
+        if t == "varchar":
+            type_ = sa.String(int(c.get("length") or 255))
+        elif t == "numeric":
+            type_ = sa.Numeric(int(c.get("precision") or 18), int(c.get("scale") or 2))
+        elif t == "timestamp":
+            type_ = sa.DateTime(timezone=True)
+        else:
+            type_ = {"text": sa.Text, "integer": sa.Integer, "bigint": sa.BigInteger, "boolean": sa.Boolean,
+                     "date": sa.Date, "json": sa.JSON, "uuid": sa.Uuid}.get(t)
+            if type_ is None:
+                raise AdapterError(f"Unknown type '{t}' for column '{name}'.", retryable=False)
+            type_ = type_()
+        kwargs = {"nullable": bool(c.get("nullable", True)) and not c.get("primary_key")}
+        default = str(c.get("default") or "").strip()
+        if default:
+            low = default.lower()
+            if low in ("now", "now()", "current_timestamp"):
+                kwargs["server_default"] = sa.func.current_timestamp()
+            elif low in ("true", "false"):
+                kwargs["server_default"] = sa.true() if low == "true" else sa.false()
+            elif re.fullmatch(r"-?\d+(\.\d+)?", default):
+                kwargs["server_default"] = sa.text(default)
+            else:
+                kwargs["server_default"] = sa.text("'" + default.replace("'", "''") + "'")
+        args = []
+        if c.get("auto_increment"):
+            if t not in ("integer", "bigint"):
+                raise AdapterError(f"Auto-increment column '{name}' must be integer or bigint.", retryable=False)
+            if not c.get("primary_key"):
+                raise AdapterError(f"Auto-increment column '{name}' must be part of the primary key.", retryable=False)
+            if self.config.get("engine") in ("oracle", "sqlserver", "postgresql"):
+                args.append(sa.Identity())
+            kwargs["autoincrement"] = True
+            if self.config.get("engine") == "sqlite":
+                type_ = sa.Integer()  # SQLite only auto-increments INTEGER PRIMARY KEY
+        else:
+            kwargs["autoincrement"] = False
+        return sa.Column(name, type_, *args, **kwargs)
+
+    def _table_from_spec(self, spec: dict):
+        import re
+
+        import sqlalchemy as sa
+
+        name = str(spec.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name):
+            raise AdapterError("Table name: letters, digits and _, starting with a letter.", retryable=False)
+        columns = [c for c in spec.get("columns") or [] if str(c.get("name") or "").strip()]
+        if not columns:
+            raise AdapterError("Add at least one column.", retryable=False)
+        names = [str(c["name"]).strip() for c in columns]
+        dupes = {n for n in names if names.count(n) > 1}
+        if dupes:
+            raise AdapterError(f"Column(s) listed twice: {', '.join(sorted(dupes))}", retryable=False)
+        md = sa.MetaData()
+        cols = [self._column(c) for c in columns]
+        pk = [str(c["name"]).strip() for c in columns if c.get("primary_key")]
+        if spec.get("add_tracking", True):
+            if not pk and "id" not in names:
+                cols.insert(0, self._column({"name": "id", "type": "bigint", "primary_key": True,
+                                             "auto_increment": True}))
+                pk = ["id"]
+            for extra, type_ in (("transaction_id", sa.String(36)), ("partner_code", sa.String(80))):
+                if extra not in names:
+                    cols.append(sa.Column(extra, type_))
+            if "stored_at" not in names:
+                cols.append(sa.Column("stored_at", sa.DateTime(timezone=True),
+                                      server_default=sa.func.current_timestamp()))
+        constraints = [sa.PrimaryKeyConstraint(*pk, name=f"{name}_pkey")] if pk else []
+        for c in columns:
+            if c.get("unique") and not c.get("primary_key"):
+                constraints.append(sa.UniqueConstraint(str(c["name"]).strip(), name=f"uq_{name}_{c['name']}"[:63]))
+        for col in cols:
+            col.primary_key = False  # the explicit constraint below defines the key
+        return sa.Table(name, md, *cols, *constraints)
+
+    def ddl(self, spec: dict) -> str:
+        import sqlalchemy as sa
+
+        table = self._table_from_spec(spec)
+        return str(sa.schema.CreateTable(table).compile(dialect=self.engine().dialect)).strip() + ";"
+
+    async def create_designed(self, spec: dict):
+        table = self._table_from_spec(spec)
+        await self._run(lambda: table.create(self.engine()))
+
+    async def schema(self, name: str) -> dict:
+        import sqlalchemy as sa
+
+        def run():
+            insp = sa.inspect(self.engine())
+            pk = insp.get_pk_constraint(name) or {}
+            try:
+                uniques = insp.get_unique_constraints(name)
+            except NotImplementedError:
+                uniques = []
+            return {"name": name,
+                    "columns": [{"name": c["name"], "type": str(c["type"]).lower(), "nullable": c.get("nullable", True),
+                                 "default": c.get("default"),
+                                 "primary_key": c["name"] in (pk.get("constrained_columns") or [])}
+                                for c in insp.get_columns(name)],
+                    "primary_key": {"name": pk.get("name"), "columns": pk.get("constrained_columns") or []},
+                    "unique": [{"name": u.get("name"), "columns": u.get("column_names")} for u in uniques]}
+
+        return await self._run(run)
+
+    async def alter(self, name: str, action: str, body: dict) -> str:
+        """add_column | drop_column | set_primary_key | drop_primary_key | add_unique | drop_unique"""
+        import sqlalchemy as sa
+
+        eng = self.config.get("engine")
+
+        def run():
+            dialect = self.engine().dialect
+            q = dialect.identifier_preparer.quote
+            insp = sa.inspect(self.engine())
+            statements = []
+            if action == "add_column":
+                spec = dict(body.get("column") or {})
+                if spec.get("primary_key") or spec.get("auto_increment"):
+                    raise AdapterError("Add the column first, then set the primary key.", retryable=False)
+                col = self._column(spec)
+                coldef = str(sa.schema.CreateColumn(col).compile(dialect=dialect)).strip()
+                verb = {"oracle": f"ADD ({coldef})", "sqlserver": f"ADD {coldef}"}.get(eng, f"ADD COLUMN {coldef}")
+                statements.append(f"ALTER TABLE {q(name)} {verb}")
+            elif action == "drop_column":
+                statements.append(f"ALTER TABLE {q(name)} DROP COLUMN {q(body['column'])}")
+            elif action in ("set_primary_key", "drop_primary_key"):
+                if eng == "sqlite":
+                    raise AdapterError("SQLite can't change the primary key of an existing table - create a new "
+                                       "table with the key you want.", retryable=False)
+                current = insp.get_pk_constraint(name) or {}
+                if current.get("constrained_columns"):
+                    statements.append(f"ALTER TABLE {q(name)} DROP PRIMARY KEY" if eng == "mysql" else
+                                      f"ALTER TABLE {q(name)} DROP CONSTRAINT {q(current['name'])}")
+                if action == "set_primary_key":
+                    cols = body.get("columns") or []
+                    if not cols:
+                        raise AdapterError("Choose at least one column for the primary key.", retryable=False)
+                    statements.append(f"ALTER TABLE {q(name)} ADD CONSTRAINT {q(name + '_pkey')} PRIMARY KEY "
+                                      f"({', '.join(q(c) for c in cols)})")
+            elif action == "add_unique":
+                if eng == "sqlite":
+                    raise AdapterError("SQLite can't add a unique constraint to an existing table.", retryable=False)
+                cols = body.get("columns") or []
+                if not cols:
+                    raise AdapterError("Choose the column(s) that must be unique.", retryable=False)
+                cname = f"uq_{name}_{'_'.join(cols)}"[:63]
+                statements.append(f"ALTER TABLE {q(name)} ADD CONSTRAINT {q(cname)} UNIQUE "
+                                  f"({', '.join(q(c) for c in cols)})")
+            elif action == "drop_unique":
+                statements.append(f"ALTER TABLE {q(name)} DROP INDEX {q(body['name'])}" if eng == "mysql" else
+                                  f"ALTER TABLE {q(name)} DROP CONSTRAINT {q(body['name'])}")
+            else:
+                raise AdapterError(f"Unknown change '{action}'.", retryable=False)
+            with self.engine().begin() as conn:
+                for stmt in statements:
+                    conn.execute(sa.text(stmt))
+            return "; ".join(statements)
+
+        return await self._run(run)
 
     async def drop_table(self, name: str):
         import sqlalchemy as sa
@@ -832,7 +1271,7 @@ def _typed(value):
             return value
 
 
-ADAPTERS = {cls.kind: cls for cls in (RabbitMQ, ActiveMQ, IBMMQ, HTTP, Kafka, Database)}
+ADAPTERS = {cls.kind: cls for cls in (RabbitMQ, ActiveMQ, IBMMQ, HTTP, Kafka, Database, FileTransfer)}
 
 for _kind, _spec in TYPES.items():
     if _spec["outbound"]:

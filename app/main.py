@@ -789,6 +789,113 @@ async def db_query(conn_id: str, req: QueryIn, request: Request):
         raise HTTPException(400, str(e)) from e
 
 
+# ---------- files on FTP / SFTP connections ----------
+
+async def _files(conn_id: str) -> adapters.FileTransfer:
+    c = await db.get_connection(conn_id)
+    if not c:
+        raise HTTPException(404, "Connection not found.")
+    if c["type"] != "ftp":
+        raise HTTPException(422, "That connection isn't an FTP/SFTP connection.")
+    return await connectors.adapter_for(conn_id)
+
+
+@app.get("/api/connections/{conn_id}/files")
+async def ftp_list(conn_id: str, path: str = ""):
+    try:
+        return await (await _files(conn_id)).list_dir(path)
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+
+
+@app.get("/api/connections/{conn_id}/file")
+async def ftp_read(conn_id: str, path: str):
+    try:
+        data = await (await _files(conn_id)).read_file(path, max_bytes=1_000_000)
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+    return {"path": path, "size": len(data), "text": data.decode("utf-8", errors="replace")}
+
+
+class FileWrite(BaseModel):
+    folder: str = ""
+    name: str = Field(min_length=1, max_length=200, pattern=r"^[^/\\]+$")
+    content: str
+
+
+@app.post("/api/connections/{conn_id}/file", status_code=201)
+async def ftp_write(conn_id: str, req: FileWrite):
+    """Upload a file, e.g. to drop a test message into a partner's inbound folder."""
+    try:
+        path = await (await _files(conn_id)).write_file(req.folder, req.name, req.content.encode())
+    except adapters.AdapterError as e:
+        raise HTTPException(502, str(e)) from e
+    return {"written": path}
+
+
+# ---------- table designer (built-in area or any database connection) ----------
+
+class DesignIn(BaseModel):
+    name: str
+    columns: list[dict]
+    add_tracking: bool = True
+
+
+class AlterIn(BaseModel):
+    action: Literal["add_column", "drop_column", "set_primary_key", "drop_primary_key", "add_unique", "drop_unique"]
+    column: dict | str | None = None
+    columns: list[str] | None = None
+    name: str | None = None
+
+
+async def _db_target(target: str) -> adapters.Database:
+    """'builtin' = the built-in data area; anything else is a database connection id."""
+    if target == "builtin":
+        return datastore.builtin()
+    return await _database(target)
+
+
+@app.post("/api/db/{target}/ddl")
+async def design_preview(target: str, req: DesignIn):
+    """The CREATE TABLE statement the designer would run, for this database's dialect."""
+    try:
+        return {"sql": (await _db_target(target)).ddl(req.model_dump())}
+    except adapters.AdapterError as e:
+        return {"sql": None, "error": str(e)}
+
+
+@app.post("/api/db/{target}/tables", status_code=201)
+async def design_create(target: str, req: DesignIn):
+    try:
+        await (await _db_target(target)).create_designed(req.model_dump())
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"created": req.name.strip()}
+
+
+@app.get("/api/db/{target}/tables/{name}/schema")
+async def design_schema(target: str, name: str):
+    try:
+        return await (await _db_target(target)).schema(name)
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.post("/api/db/{target}/tables/{name}/alter")
+async def design_alter(target: str, name: str, req: AlterIn, request: Request):
+    needed = "delete" if req.action.startswith("drop") else "write"
+    if not auth.allowed(request.state.user, needed):
+        raise HTTPException(403, f"This change needs {needed} permission.")
+    body = req.model_dump()
+    if req.action == "drop_column":
+        body["column"] = req.column if isinstance(req.column, str) else (req.column or {}).get("name")
+    try:
+        done = await (await _db_target(target)).alter(name, req.action, body)
+    except adapters.AdapterError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ran": done}
+
+
 @app.post("/api/partners/{code}/api-key")
 async def rotate_partner_api_key(code: str):
     await _partner_or_404(code)
@@ -800,7 +907,7 @@ async def rotate_partner_api_key(code: str):
 
 class ConnectionIn(BaseModel):
     name: str = Field(min_length=2, max_length=80)
-    type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka", "database"]
+    type: Literal["rabbitmq", "activemq", "ibmmq", "http", "kafka", "database", "ftp"]
     config: dict = Field(default_factory=dict)
     secret: str | None = None  # write-only; None on update keeps the stored one
 

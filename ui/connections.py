@@ -14,6 +14,7 @@ PRESETS = {
     "http": "Partner webhook",
     "kafka": "External Kafka",
     "database": "Partner database",
+    "ftp": "Partner file server",
 }
 
 
@@ -105,6 +106,11 @@ def _add_connection(types):
                        "redistributable client (or MQ for Developers) from IBM, then `pip install ibmmq`. You can save "
                        "the connection now; it will connect once the client is installed.")
         fixed, values = {}, {}
+        if type_key == "ftp":
+            proto = st.selectbox("Protocol", ["sftp", "ftp", "ftps"], key="new_ftp_protocol",
+                                 format_func={"sftp": "SFTP (over SSH)", "ftp": "FTP", "ftps": "FTPS (FTP over TLS)"}.get)
+            fixed = {"protocol": proto}
+            values = {"port": 22 if proto == "sftp" else 21}
         if type_key == "database":
             engine = st.selectbox("Database type", list(DB_PORTS), key="new_db_engine",
                                   format_func={"postgresql": "PostgreSQL", "mysql": "MySQL / MariaDB",
@@ -114,7 +120,7 @@ def _add_connection(types):
             values = {"port": DB_PORTS[engine]}
             if engine == "sqlite":
                 st.caption("For SQLite, only the file path matters (Database / service name / SQLite file).")
-        form_key = f"new_conn_{type_key}" + (f"_{fixed['engine']}" if fixed else "")
+        form_key = f"new_conn_{type_key}" + (f"_{next(iter(fixed.values()))}" if fixed else "")
         with st.form(form_key, clear_on_submit=False):
             name = st.text_input("Name *", value=PRESETS.get(type_key, ""), key=f"new_conn_name_{form_key}")
             config, secret = _fields_form(type_key, spec, values, f"new_{form_key}", fixed=fixed)
@@ -155,6 +161,8 @@ def _connection_card(c, types):
             st.rerun()
         show_send = b[1].toggle("Send", key=f"send_toggle_{c['id']}", disabled=not common.can("write"), help="Send a test message through this connection")
         show_edit = b[2].toggle("Edit", key=f"edit_toggle_{c['id']}", disabled=not common.can("write"))
+        if c["type"] == "ftp" and b[3].toggle("📂 Files", key=f"files_toggle_{c['id']}"):
+            _file_browser(c)
 
         if show_send:
             with st.form(f"send_{c['id']}"):
@@ -192,6 +200,42 @@ def _connection_card(c, types):
                         st.rerun()
 
 
+def _file_browser(c):
+    cid = c["id"]
+    folder = st.text_input("Folder", key=f"files_path_{cid}", placeholder="e.g. inbound - empty = base folder")
+    try:
+        entries = api("GET", f"/api/connections/{cid}/files", params={"path": folder})
+    except ApiError as e:
+        st.error(str(e))
+        return
+    if not entries:
+        st.caption("This folder is empty.")
+    else:
+        rows = [{"": "📁" if e["is_dir"] else "📄", "name": e["name"], "size": None if e["is_dir"] else e["size"]}
+                for e in entries]
+        event = st.dataframe(rows, hide_index=True, width="stretch", on_select="rerun",
+                             selection_mode="single-row", key=f"files_table_{cid}_{folder}",
+                             column_config={"size": st.column_config.NumberColumn("Bytes")})
+        picked = [entries[i] for i in event.selection.rows]
+        if picked and picked[0]["is_dir"]:
+            st.caption(f"Type **{(folder + '/' if folder else '') + picked[0]['name']}** in Folder to open it.")
+        elif picked:
+            path = f"{folder}/{picked[0]['name']}" if folder else picked[0]["name"]
+            f = api("GET", f"/api/connections/{cid}/file", params={"path": path})
+            st.code(f["text"], language="xml" if f["text"].lstrip().startswith("<") else "json")
+    with st.form(f"upload_{cid}_{folder}"):
+        st.markdown(f"**Upload a file to** `{folder or '(base folder)'}`")
+        name = st.text_input("File name", placeholder="e.g. PO-1001.xml", key=f"up_name_{cid}")
+        content = st.text_area("Content", height=120, key=f"up_body_{cid}")
+        if st.form_submit_button("Upload", disabled=not common.can("write")):
+            try:
+                r = api("POST", f"/api/connections/{cid}/file", json={"folder": folder, "name": name, "content": content})
+            except ApiError as e:
+                st.error(str(e))
+            else:
+                st.success(f"Uploaded {r['written']}")
+
+
 def _endpoint(c) -> str:
     cfg = c["config"]
     if c["type"] == "http":
@@ -200,6 +244,8 @@ def _endpoint(c) -> str:
         return cfg.get("bootstrap", "")
     if c["type"] == "ibmmq":
         return f"{cfg.get('queue_manager')} @ {cfg.get('host')}({cfg.get('port')})"
+    if c["type"] == "ftp":
+        return f"{cfg.get('protocol')}://{cfg.get('host')}:{cfg.get('port')}{cfg.get('base_dir') or '/'}"
     if c["type"] == "database":
         if cfg.get("engine") == "sqlite":
             return f"SQLite · {cfg.get('database')}"
