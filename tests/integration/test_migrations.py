@@ -47,7 +47,8 @@ def test_database_from_an_older_version_is_upgraded(scratch_db):
     with psycopg.connect(scratch_db, autocommit=True) as conn:  # what an older Payload Hub created at start-up
         conn.execute(baseline.SCHEMA)
         conn.execute("INSERT INTO connections (id, name, type) VALUES ('kept', 'Kept', 'http')")
-    assert migrate.current() is None and migrate.pending() == ["0001_baseline", "0002_alerts"]
+    pending = migrate.pending()
+    assert migrate.current() is None and pending[:2] == ["0001_baseline", "0002_alerts"] and pending[-1] == migrate.head()
     migrate.upgrade()
     assert migrate.current() == migrate.head()
     assert {"alert_rules", "alert_channels", "alert_events"} <= tables(scratch_db)

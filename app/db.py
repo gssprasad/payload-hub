@@ -11,7 +11,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/payloadhub")
 # The schema lives in migrations/versions (Alembic) and is applied at start-up - see app/migrate.py.
 
 
-USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, created_at, last_login_at"
+USER_COLUMNS = "username, can_read, can_write, can_delete, is_admin, active, created_at, last_login_at, " \
+               "auth_source, locked_until"
 
 PARTNER_FIELDS = ("name", "description", "contact", "input_format", "output_format", "sample_input",
                   "expected_output", "expression", "mapping_source", "queue_mode", "topic_in", "topic_out",
@@ -444,17 +445,18 @@ async def get_user(username, with_hash=False):
         return await cur.fetchone()
 
 
-async def create_user(username, password_hash, can_read, can_write, can_delete, is_admin):
+async def create_user(username, password_hash, can_read, can_write, can_delete, is_admin, auth_source="password"):
     async with pool.connection() as conn:
         cur = await conn.execute(
-            """INSERT INTO users (username, password_hash, can_read, can_write, can_delete, is_admin)
-               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING username""",
-            (username, password_hash, can_read, can_write, can_delete, is_admin))
+            """INSERT INTO users (username, password_hash, can_read, can_write, can_delete, is_admin, auth_source)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING username""",
+            (username, password_hash, can_read, can_write, can_delete, is_admin, auth_source))
         return (await cur.fetchone()) is not None
 
 
 async def update_user(username, **fields):
-    allowed = {"password_hash", "can_read", "can_write", "can_delete", "is_admin", "active"}
+    allowed = {"password_hash", "can_read", "can_write", "can_delete", "is_admin", "active", "locked_until",
+               "failed_logins"}
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
@@ -491,14 +493,46 @@ async def create_session(token_hash, username, hours):
             (token_hash, username, hours))
 
 
-async def get_session_user(token_hash):
+async def get_session_user(token_hash, idle_minutes=60):
+    """The signed-in user, if the session hasn't expired or been idle too long; marks it as used."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            f"""SELECT {', '.join('u.' + c.strip() for c in USER_COLUMNS.split(','))}
-                FROM sessions s JOIN users u ON u.username = s.username
-                WHERE s.token_hash = %s AND s.expires_at > now() AND u.active""",
-            (token_hash,))
+            f"""UPDATE sessions s SET last_seen_at = now() FROM users u
+                WHERE s.token_hash = %s AND u.username = s.username AND u.active AND s.expires_at > now()
+                  AND s.last_seen_at > now() - make_interval(mins => %s)
+                RETURNING {', '.join('u.' + c.strip() for c in USER_COLUMNS.split(','))}""",
+            (token_hash, idle_minutes))
         return await cur.fetchone()
+
+
+async def record_login_attempt(address, username, ok):
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO login_attempts (address, username, ok) VALUES (%s, %s, %s)",
+                           (address, username, ok))
+        await conn.execute("DELETE FROM login_attempts WHERE at < now() - interval '1 day'")
+
+
+async def failed_attempts_from(address, minutes) -> int:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) AS n FROM login_attempts WHERE address = %s AND NOT ok "
+                                 "AND at > now() - make_interval(mins => %s)", (address, minutes))
+        return (await cur.fetchone())["n"]
+
+
+async def register_failed_login(username, max_failures, lock_minutes):
+    """Count a wrong password; lock the account once it reaches max_failures."""
+    async with pool.connection() as conn:
+        await conn.execute(
+            """UPDATE users SET failed_logins = failed_logins + 1,
+                   locked_until = CASE WHEN failed_logins + 1 >= %s THEN now() + make_interval(mins => %s)
+                                       ELSE locked_until END
+               WHERE lower(username) = lower(%s)""", (max_failures, lock_minutes, username))
+
+
+async def clear_failed_logins(username):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE lower(username) = lower(%s)",
+                           (username,))
 
 
 async def delete_session(token_hash):

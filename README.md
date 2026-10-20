@@ -564,6 +564,36 @@ Standard JMESPath plus `concat(a, b, ...)`, `upper(s)`, `lower(s)`, `multiply(a,
 `to_float(v)`. XML input is parsed with xmltodict: attributes are `"@name"` keys and all
 values are strings.
 
+## Sign-in security and single sign-on
+
+- **No token in the URL.** The web console keeps your session in a cookie for this site only (`SameSite=Strict`,
+  `Secure` over HTTPS); signing out removes it and ends the session on the server. Old `?session=` links do nothing.
+- **Sessions** end after 12 hours, or after `PAYLOAD_HUB_IDLE_MINUTES` (default 60) without activity.
+- **Lockout**: 5 wrong passwords in a row lock an account for 15 minutes (administrators can *Unlock* it on the
+  Users page); 20 failed sign-ins from one address within 15 minutes block that address for a while. The web
+  console passes the browser's address on; the backend only believes it from `PAYLOAD_HUB_TRUSTED_PROXIES`
+  (default `127.0.0.1,::1`).
+
+**Single sign-on (Microsoft Entra ID, Google, Okta - any OpenID Connect provider)** uses Streamlit's built-in
+sign-in. Register an app with your identity provider (redirect URI `https://<console>/oauth2callback`), then:
+
+```toml
+# .streamlit/secrets.toml (web console)
+[auth]
+redirect_uri = "https://hub.company.com/oauth2callback"
+cookie_secret = "<long random string>"
+client_id = "<from the identity provider>"
+client_secret = "<from the identity provider>"
+server_metadata_url = "https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration"
+```
+
+and set the same random `PAYLOAD_HUB_SSO_SECRET` for the backend and the web console (the backend accepts
+single sign-on only from a caller that knows it). The login page then shows *Sign in with your company account*
+(`PAYLOAD_HUB_SSO_LABEL`). People sign in with their e-mail as user name: an administrator adds them on the
+Users page first, or `PAYLOAD_HUB_SSO_AUTO_CREATE=true` creates new ones as read-only. Set
+`PAYLOAD_HUB_PASSWORD_LOGIN=false` to hide the password form. *Not yet tried against a real company identity
+provider - test it with yours before relying on it.*
+
 ## Operations: migrations, alerts, backups
 
 See **[docs/OPERATIONS.md](docs/OPERATIONS.md)** for the runbook. In short:

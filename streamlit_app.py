@@ -19,6 +19,7 @@ import threading
 import time as clock
 from pathlib import Path
 
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Payload Hub", page_icon="🔀", layout="wide")
@@ -148,54 +149,88 @@ else:
     common.API = os.getenv("PAYLOAD_HUB_API", "http://localhost:8000")
 
 
-def _restore_session():
-    """Stay signed in across browser refreshes: the session token is kept in the page URL (?session=...)."""
-    token = st.query_params.get("session")
-    if not token or common.token():
-        return
-    st.session_state.auth_token = token
+SSO_LABEL = os.getenv("PAYLOAD_HUB_SSO_LABEL", "company account")
+PASSWORD_LOGIN = os.getenv("PAYLOAD_HUB_PASSWORD_LOGIN", "true").lower() not in ("0", "false", "no")
+
+
+def _sso_enabled() -> bool:
+    """Single sign-on is on when Streamlit's [auth] section is configured in .streamlit/secrets.toml."""
     try:
-        st.session_state.auth_user = common.api("GET", "/api/auth/me")
-    except common.ApiError:
-        common.sign_out()
-        st.query_params.pop("session", None)
+        return "auth" in st.secrets and bool(os.getenv("PAYLOAD_HUB_SSO_SECRET"))
+    except Exception:  # noqa: BLE001 - no secrets file
+        return False
+
+
+def _restore_session():
+    """Stay signed in across refreshes with the session cookie; or exchange a single sign-on identity for a session."""
+    st.query_params.pop("session", None)  # old links carried the token in the URL - never use those
+    if common.token():
+        return
+    token = st.context.cookies.get(common.COOKIE)
+    # the browser keeps sending a cookie until the page that clears it has rendered - never retry a refused one
+    if token and token != st.session_state.get("refused_cookie"):
+        r = requests.get(f"{common.API}/api/auth/me", timeout=15,
+                         headers={"Authorization": f"Bearer {token}", **({"X-Client-Address": common.client_ip()}
+                                                                           if common.client_ip() else {})})
+        if r.status_code == 200:
+            st.session_state.auth_token, st.session_state.auth_user = token, r.json()
+            return
+        st.session_state.refused_cookie = token
+        common.sign_out("Your session ended - please sign in again.")
+    if _sso_enabled() and getattr(st.user, "is_logged_in", False):
+        r = requests.post(f"{common.API}/api/auth/sso", timeout=15,
+                          headers={"X-SSO-Secret": os.environ["PAYLOAD_HUB_SSO_SECRET"]},
+                          json={"email": st.user.get("email") or "", "name": st.user.get("name")})
+        if r.status_code == 200:
+            data = r.json()
+            st.session_state.auth_token, st.session_state.auth_user = data["token"], data["user"]
+            common.remember(data["token"])
+        else:
+            st.session_state.sso_error = r.json().get("detail", r.text)
 
 
 def _login_page():
     with st.sidebar:
         st.markdown("### 🔀 Payload Hub")
-        st.info("Sign in to see the menu: Partners, Connections, AI Agent, Send & Test, Transactions, "
-                "Monitoring and Users.")
+        common.flush_cookie()
     st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
     _, middle, _ = st.columns([1, 1.7, 1])
     with middle:
-        common.hero("🔀 Payload Hub", "Kafka payload transformation · partner adapters · AI mapping agent")
+        common.hero("🔀 Payload Hub", "Integration hub - partners, workflows, adapters and ports")
         if message := st.session_state.pop("login_message", None):
             st.info(message)
-        with st.form("login"):
-            username = st.text_input("Username", autocomplete="username")
-            password = st.text_input("Password", type="password", autocomplete="current-password")
-            if st.form_submit_button("Sign in", type="primary", width="stretch"):
-                try:
-                    r = common.api("POST", "/api/auth/login", json={"username": username, "password": password})
-                except common.ApiError as e:
-                    st.error(str(e))
-                else:
-                    st.session_state.auth_token, st.session_state.auth_user = r["token"], r["user"]
-                    st.query_params["session"] = r["token"]
-                    st.rerun()
+        if _sso_enabled():
+            if error := st.session_state.pop("sso_error", None):
+                st.error(error)
+                if st.button("Use a different account"):
+                    st.logout()
+            elif st.button(f"🔐 Sign in with your {SSO_LABEL}", type="primary", width="stretch"):
+                st.login()
+            if PASSWORD_LOGIN:
+                st.caption("or with a Payload Hub account")
+        if PASSWORD_LOGIN:
+            with st.form("login"):
+                username = st.text_input("Username", autocomplete="username")
+                password = st.text_input("Password", type="password", autocomplete="current-password")
+                if st.form_submit_button("Sign in", type="secondary" if _sso_enabled() else "primary", width="stretch"):
+                    try:
+                        r = common.api("POST", "/api/auth/login", json={"username": username, "password": password})
+                    except common.ApiError as e:
+                        st.error(str(e))
+                    else:
+                        st.session_state.auth_token, st.session_state.auth_user = r["token"], r["user"]
+                        common.remember(r["token"])
+                        st.rerun()
         if EMBEDDED_DEFAULT_ADMIN:
             st.caption("⚠️ Using the built-in Administrator account? Change its default password after signing in "
-                       "(sidebar → My account).")
+                       "(sidebar → your name).")
     st.stop()
 
 
 EMBEDDED_DEFAULT_ADMIN = EMBED_BACKEND and not os.getenv("ADMIN_PASSWORD")
 _restore_session()
 if not common.token():
-    st.query_params.pop("session", None)
     _login_page()
-st.query_params["session"] = common.token()  # keep it in the URL after page changes, so a refresh stays signed in
 
 
 def _account():
@@ -221,6 +256,8 @@ def _account():
                 common.api("POST", "/api/auth/logout")
             finally:
                 common.sign_out("You've signed out.")
+            if getattr(st.user, "is_logged_in", False):
+                st.logout()
             st.rerun()
 
 
@@ -263,6 +300,7 @@ nav = st.navigation(sections, expanded=True)
 
 with st.sidebar:
     st.markdown("### 🔀 Payload Hub")
+    common.flush_cookie()
     _health()
     _account()
     if not EMBED_BACKEND:

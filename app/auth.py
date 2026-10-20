@@ -8,11 +8,16 @@ import hmac
 import os
 import re
 import secrets
+from datetime import datetime, timezone
 
 from . import db
 
 ITERATIONS = 200_000
 SESSION_HOURS = 12
+IDLE_MINUTES = int(os.getenv("PAYLOAD_HUB_IDLE_MINUTES", "60"))  # signed out after this long without activity
+MAX_FAILURES = 5  # wrong passwords in a row before an account is locked
+MAX_FAILURES_PER_ADDRESS = 20  # failed sign-ins from one address before it is refused for a while
+LOCK_MINUTES = 15
 DEFAULT_ADMIN = "Administrator"
 
 # POST endpoints that only read or test, so a read-only user may call them.
@@ -57,21 +62,57 @@ async def ensure_admin():
                              can_read=True, can_write=True, can_delete=True, is_admin=True)
 
 
-async def login(username: str, password: str):
+class LoginBlocked(Exception):
+    pass
+
+
+async def login(username: str, password: str, address: str | None = None):
+    """Check a password. Too many wrong passwords lock the account for a while; too many failed attempts from one
+    address are refused (LoginBlocked)."""
+    if address and await db.failed_attempts_from(address, LOCK_MINUTES) >= MAX_FAILURES_PER_ADDRESS:
+        raise LoginBlocked(f"Too many failed sign-ins from your address - try again in {LOCK_MINUTES} minutes.")
     user = await db.get_user(username, with_hash=True)
-    if not user or not user["active"] or not verify_password(password, user["password_hash"]):
+    if user and user.get("locked_until") and user["locked_until"] > datetime.now(timezone.utc):
+        await db.record_login_attempt(address, username, False)
+        raise LoginBlocked(f"This account is locked after {MAX_FAILURES} wrong passwords - try again after "
+                           f"{user['locked_until'].astimezone():%H:%M}, or ask an administrator to unlock it.")
+    if not user or not user["active"] or user.get("auth_source") == "sso" \
+            or not verify_password(password, user["password_hash"]):
+        await db.record_login_attempt(address, username, False)
+        if user:
+            await db.register_failed_login(user["username"], MAX_FAILURES, LOCK_MINUTES)
         return None
+    await db.record_login_attempt(address, username, True)
+    await db.clear_failed_logins(user["username"])
+    return await start_session(user)
+
+
+async def start_session(user: dict):
     token = secrets.token_urlsafe(32)
     await db.create_session(token_hash(token), user["username"], SESSION_HOURS)
     await db.touch_login(user["username"])
-    user.pop("password_hash", None)
+    user = {k: v for k, v in user.items() if k != "password_hash"}
     return token, user
+
+
+async def sso_login(email: str):
+    """A user signed in through the company identity provider (verified by the web console)."""
+    email = email.strip().lower()
+    user = await db.get_user(email)
+    if user is None:
+        if os.getenv("PAYLOAD_HUB_SSO_AUTO_CREATE", "false").lower() not in ("1", "true", "yes"):
+            return None
+        await db.create_user(email, "!sso", True, False, False, False, auth_source="sso")
+        user = await db.get_user(email)
+    if not user["active"]:
+        return None
+    return await start_session(user)
 
 
 async def user_for_token(token: str | None):
     if not token:
         return None
-    return await db.get_session_user(token_hash(token))
+    return await db.get_session_user(token_hash(token), IDLE_MINUTES)
 
 
 def required_permission(method: str, path: str) -> str:

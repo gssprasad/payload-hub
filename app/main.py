@@ -57,7 +57,7 @@ async def require_login(request: Request, call_next):
     """Every /api call needs a signed-in user with the right permission (read / write / delete / admin).
     Partner endpoints (/inbound), the test receiver, /health and /metrics are outside /api."""
     path = request.url.path
-    if not path.startswith("/api/") or path == "/api/auth/login":
+    if not path.startswith("/api/") or path in ("/api/auth/login", "/api/auth/sso"):
         return await call_next(request)
     header = request.headers.get("authorization", "")
     token = header[7:] if header.lower().startswith("bearer ") else None
@@ -133,12 +133,49 @@ class LoginIn(BaseModel):
     password: str
 
 
+TRUSTED_PROXIES = {a.strip() for a in os.getenv("PAYLOAD_HUB_TRUSTED_PROXIES", "127.0.0.1,::1").split(",") if a.strip()}
+
+
+def client_address(request: Request) -> str | None:
+    """The browser's address. The web console passes it on in X-Client-Address; only trusted callers may do that."""
+    direct = request.client.host if request.client else None
+    forwarded = request.headers.get("x-client-address")
+    return forwarded if forwarded and direct in TRUSTED_PROXIES else direct
+
+
 @app.post("/api/auth/login")
-async def login(req: LoginIn):
-    result = await auth.login(req.username.strip(), req.password)
+async def login(req: LoginIn, request: Request):
+    try:
+        result = await auth.login(req.username.strip(), req.password, client_address(request))
+    except auth.LoginBlocked as e:
+        raise HTTPException(429, str(e)) from e
     if result is None:
         raise HTTPException(401, "Wrong username or password, or the account is disabled.")
     token, user = result
+    return {"token": token, "user": user}
+
+
+class SSOIn(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    name: str | None = None
+
+
+@app.post("/api/auth/sso")
+async def sso_login(req: SSOIn, request: Request):
+    """Called by the web console after the company identity provider signed someone in. Trusted only with the
+    shared PAYLOAD_HUB_SSO_SECRET; disabled when that isn't set."""
+    import hmac
+
+    secret = os.getenv("PAYLOAD_HUB_SSO_SECRET")
+    if not secret:
+        raise HTTPException(404, "Single sign-on isn't enabled.")
+    if not hmac.compare_digest(request.headers.get("x-sso-secret", ""), secret):
+        raise HTTPException(401, "Not allowed.")
+    result = await auth.sso_login(req.email)
+    if result is None:
+        raise HTTPException(403, f"{req.email} has no Payload Hub account yet - ask an administrator to add it.")
+    token, user = result
+    await db.audit(user["username"], "signed in", "user", user["username"], "single sign-on")
     return {"token": token, "user": user}
 
 
@@ -184,6 +221,7 @@ class UserUpdate(BaseModel):
     can_delete: bool | None = None
     is_admin: bool | None = None
     active: bool | None = None
+    unlock: bool | None = None  # clear a lockout after too many wrong passwords
 
 
 @app.get("/api/users")
@@ -204,7 +242,9 @@ async def update_user(username: str, req: UserUpdate, request: Request):
     target = await db.get_user(username)
     if not target:
         raise HTTPException(404, "User not found.")
-    fields = req.model_dump(exclude_unset=True, exclude={"password"})
+    fields = req.model_dump(exclude_unset=True, exclude={"password", "unlock"})
+    if req.unlock:
+        fields.update(locked_until=None, failed_logins=0)
     removing_admin = (fields.get("is_admin") is False or fields.get("active") is False) and target["is_admin"]
     if removing_admin and await db.count_active_admins(excluding=target["username"]) == 0:
         raise HTTPException(409, "There must be at least one active administrator.")

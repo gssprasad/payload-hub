@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.integration,
 
 def test_backup_verify_and_restore(admin):
     m = admin.post("/api/backups").json()
-    assert m["file"].endswith(".dump") and m["size"] > 0 and m["schema_version"] == "0002_alerts"
+    assert m["file"].endswith(".dump") and m["size"] > 0 and m["schema_version"] == __import__("app.migrate").migrate.head()
     assert any(b["file"] == m["file"] for b in admin.get("/api/backups").json()["backups"])
     v = admin.post(f"/api/backups/{m['file']}/verify").json()
     assert v["ok"], v

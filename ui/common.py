@@ -30,10 +30,40 @@ def can(permission: str) -> bool:
     return bool(u.get("is_admin") if permission == "admin" else u.get(f"can_{permission}"))
 
 
+COOKIE = "ph_session"  # keeps the sign-in across browser refreshes (never in the URL)
+
+
+def remember(token: str):
+    """Keep the session in a cookie for this site only (set on the next render)."""
+    st.session_state["_cookie_op"] = token
+
+
+def flush_cookie():
+    """Write or clear the session cookie in the browser, if a sign-in or sign-out asked for it."""
+    import json
+
+    op = st.session_state.pop("_cookie_op", None)
+    if op is None:
+        return
+    value, age = (op, 12 * 3600) if op else ("", 0)
+    st.html(f"""<script>document.cookie = "{COOKIE}=" + {json.dumps(value)} + "; path=/; max-age={age}; SameSite=Strict"
+              + (location.protocol === "https:" ? "; Secure" : "");</script>""", unsafe_allow_javascript=True)
+
+
+def client_ip() -> str | None:
+    try:
+        ip = st.context.ip_address
+    except Exception:  # noqa: BLE001 - not available in tests / bare mode
+        return None
+    return ip if isinstance(ip, str) else None
+
+
 def sign_out(message: str | None = None):
+    if token():
+        st.session_state.refused_cookie = token()  # this session is over, even if the browser still sends it
     for k in ("auth_token", "auth_user"):
         st.session_state.pop(k, None)
-    st.query_params.pop("session", None)
+    st.session_state["_cookie_op"] = ""  # clear the browser cookie
     if message:
         st.session_state.login_message = message
 
@@ -41,7 +71,8 @@ def sign_out(message: str | None = None):
 def api(method: str, path: str, fatal: bool = True, **kwargs):
     """Call the backend as the signed-in user. If it is unreachable, stop the page with a readable message
     (or return None when fatal=False, e.g. for the sidebar health check)."""
-    headers = {**kwargs.pop("headers", {}), **({"Authorization": f"Bearer {token()}"} if token() else {})}
+    headers = {**kwargs.pop("headers", {}), **({"Authorization": f"Bearer {token()}"} if token() else {}),
+               **({"X-Client-Address": ip} if (ip := client_ip()) else {})}
     try:
         r = requests.request(method, f"{API}{path}", timeout=kwargs.pop("timeout", 30), headers=headers, **kwargs)
     except requests.ConnectionError:
