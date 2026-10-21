@@ -1188,3 +1188,22 @@ async def count_failed_transactions(minutes, partner=None) -> int:
             "SELECT count(*) AS n FROM transactions WHERE status = 'FAILED' AND updated_at > now() - make_interval(mins => %s)"
             + (" AND partner_code = %s" if partner else ""), (minutes, partner) if partner else (minutes,))
         return (await cur.fetchone())["n"]
+
+
+# ---------- deployments ----------
+
+async def record_deployment(username, package_name, source_environment, app_version, target_environment, status,
+                            error, backup_file, package_sha256, summary) -> int:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO deployments (username, package_name, source_environment, app_version, target_environment,
+                                        status, error, backup_file, package_sha256, summary)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            (username, package_name, source_environment, app_version, target_environment, status, error, backup_file,
+             package_sha256, Jsonb(summary)))
+        return (await cur.fetchone())["id"]
+
+
+async def list_deployments(limit=50):
+    async with pool.connection() as conn:
+        return await (await conn.execute("SELECT * FROM deployments ORDER BY at DESC LIMIT %s", (limit,))).fetchall()

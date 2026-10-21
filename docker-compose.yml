@@ -14,6 +14,7 @@ x-app-env: &app-env
   PAYLOAD_HUB_TRUSTED_PROXIES: 127.0.0.1,::1,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
   PAYLOAD_HUB_SSO_SECRET: ${PAYLOAD_HUB_SSO_SECRET:-}
   TZ: ${TZ:-UTC}
+  PAYLOAD_HUB_ENVIRONMENT: ${PAYLOAD_HUB_ENVIRONMENT:-DEV}
 
 services:
   postgres:
@@ -55,7 +56,7 @@ services:
 
   backend:
     build: .
-    image: payload-hub:latest
+    image: ${PAYLOAD_HUB_IMAGE:-payload-hub:latest}
     restart: unless-stopped
     environment: *app-env
     ports: ["${PAYLOAD_HUB_API_PORT:-8000}:8000"]
@@ -65,7 +66,7 @@ services:
       kafka: {condition: service_healthy}
 
   console:
-    image: payload-hub:latest
+    image: ${PAYLOAD_HUB_IMAGE:-payload-hub:latest}
     restart: unless-stopped
     command: ["streamlit", "run", "streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0",
               "--server.headless", "true", "--browser.gatherUsageStats", "false"]

@@ -314,3 +314,24 @@ def detail_title(text: str):
     import html
 
     st.html(f'<div class="ph-detail">{html.escape(text)}</div>')
+
+
+ENV_COLORS = {"PROD": "#dc2626", "PRODUCTION": "#dc2626", "PRE-PROD": "#ea580c", "PREPROD": "#ea580c",
+              "STAGING": "#ea580c", "UAT": "#d97706", "TEST": "#d97706", "QA": "#d97706"}
+
+
+def environment_badge():
+    """Which environment this is, and the version - so nobody mistakes production for a test system."""
+    import html
+    import os
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _info(api_url):
+        h = api("GET", "/health", fatal=False) or {}
+        return h.get("environment") or os.getenv("PAYLOAD_HUB_ENVIRONMENT", "DEV"), h.get("version", "")
+
+    env, version = _info(API)
+    color = ENV_COLORS.get(env.upper(), "#2563eb")
+    st.html(f'<div style="display:inline-block;padding:.15rem .6rem;border-radius:999px;background:{color};'
+            f'color:#fff;font-weight:700;font-size:.78rem;letter-spacing:.04em">{html.escape(env)}</div>'
+            f'<span style="opacity:.55;font-size:.75rem;margin-left:.5rem">{html.escape(version)}</span>')

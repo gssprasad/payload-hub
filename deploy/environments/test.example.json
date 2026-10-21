@@ -1,0 +1,19 @@
+{
+  "description": "Overrides for TEST - everything that differs from the environment the package was exported from. Copy to test.json and adjust.",
+  "connections": {
+    "erp-postgres": {"config": {"host": "erp-db.test.company.local", "database": "erp_test"}, "secret_alias": "test.erp.db.password"},
+    "customer-api-mock": {"config": {"base_url": "https://customers.test.company.local/api"}}
+  },
+  "partners": {
+    "acme-retail": {"outbound_target": "test/acme/orders"}
+  },
+  "ports": {
+    "orders-drop-folder": {"config": {"monitor_dir": "/data/test/inbound"}}
+  },
+  "schedules": {
+    "nightly-database-backup": {"enabled": true}
+  },
+  "alert_channels": {
+    "ops-webhook": {"secret_alias": "test.alerts.webhook"}
+  }
+}

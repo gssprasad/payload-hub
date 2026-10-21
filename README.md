@@ -598,6 +598,19 @@ For production, point `DATABASE_URL` and `KAFKA_BOOTSTRAP` at managed PostgreSQL
 ones, put HTTPS in front (a load balancer or reverse proxy), and run more than one `backend` if you need failover
 (see docs/OPERATIONS.md).
 
+## Deployment path to higher environments
+
+DEV → TEST → STAGING → PRODUCTION, in two parts - see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**:
+
+- **Configuration** (partners, connections, workflows, schedules, ports, alert rules) moves as **deployment packages**:
+  *Administer → Deployments* exports them with their dependencies (secret names, never values), checks what deploying
+  into an environment would change (create / update / unchanged, missing secrets), and deploys with that environment's
+  overrides - after a backup, recorded in the history. `scripts/deploy_package.py` does the same from a pipeline.
+- **The application**: tag `v1.4.0` → the *Release* workflow builds and tests one image, publishes it to GitHub
+  Container Registry and deploys it to test, staging and (after approval) production with `deploy/server/deploy.sh`:
+  backup, switch, health check, smoke test, automatic rollback.
+- Every environment shows its name (`PAYLOAD_HUB_ENVIRONMENT`) as a badge, production in red, with the version.
+
 ## Sign-in security and single sign-on
 
 - **No token in the URL.** The web console keeps your session in a cookie for this site only (`SameSite=Strict`,

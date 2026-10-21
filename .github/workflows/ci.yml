@@ -20,6 +20,8 @@ jobs:
       - run: pip install ruff
       - name: Lint (undefined names, unused imports, syntax errors)
         run: ruff check --output-format=github .
+      - name: Lint the GitHub workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -no-color
 
   test:
     runs-on: ubuntu-latest
@@ -52,7 +54,7 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Wait for Kafka
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             python -c "import socket; socket.create_connection(('localhost', 9092), 2)" 2>/dev/null && exit 0
             sleep 2
           done
@@ -81,7 +83,8 @@ jobs:
           POSTGRES_PASSWORD: ci-db-pass
           ADMIN_PASSWORD: ci-admin-pass
         run: |
-          export PAYLOAD_HUB_SECRET_KEY=$(python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          PAYLOAD_HUB_SECRET_KEY=$(python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          export PAYLOAD_HUB_SECRET_KEY
           docker compose up -d --wait --wait-timeout 300
       - name: Smoke test
         run: |

@@ -20,8 +20,8 @@ from pydantic import BaseModel, Field
 
 from psycopg.types.json import Jsonb
 
-from . import (adapters, agent, ai, alerts, auth, backup, cluster, connectors, cron, datastore, db, mapping_doc,
-               metrics, migrate, pipeline, ports, scheduler, vault, workflows)
+from . import (adapters, agent, ai, alerts, auth, backup, cluster, connectors, cron, datastore, db, deploy, mapping_doc,
+               metrics, migrate, pipeline, ports, scheduler, vault, version, workflows)
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -130,7 +130,7 @@ def _diff(before: dict, after: dict | None) -> str:
 
 
 # Calls that change nothing worth auditing (runs, sends, tests, polls) or that write their own audit entries.
-NOT_AUDITED = re.compile(r"^/api/(auth/|transform$|secrets|agent|workflows/[^/]+/run$|workflow-runs/|schedules/[^/]+/run$|"
+NOT_AUDITED = re.compile(r"^/api/(auth/|transform$|secrets|agent|deploy/(plan|export)$|workflows/[^/]+/run$|workflow-runs/|schedules/[^/]+/run$|"
                          r"ports/[^/]+/poll$|connections/[^/]+/(test|send|query|file)$|partners/[^/]+/test$)")
 
 
@@ -1519,6 +1519,55 @@ async def delete_backup(name: str):
         raise HTTPException(404, str(e)) from e
 
 
+# ---------- deployment packages (administrators) ----------
+
+class ExportIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    selection: dict[str, list[str]]
+    with_dependencies: bool = True
+
+
+class ImportIn(BaseModel):
+    package: dict
+    overrides: dict | None = None
+    take_backup: bool = True
+
+
+@app.get("/api/deploy/inventory")
+async def deploy_inventory():
+    return {"environment": deploy.environment(), "version": version.VERSION, "assets": await deploy.inventory(),
+            "labels": deploy.LABELS}
+
+
+@app.post("/api/deploy/export")
+async def deploy_export(req: ExportIn, request: Request):
+    try:
+        return await deploy.export(req.selection, req.name, req.with_dependencies, request.state.user["username"])
+    except deploy.DeployError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.post("/api/deploy/plan")
+async def deploy_plan(req: ImportIn):
+    try:
+        return await deploy.plan(req.package, req.overrides)
+    except deploy.DeployError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.post("/api/deploy/apply")
+async def deploy_apply(req: ImportIn, request: Request):
+    try:
+        return await deploy.apply(req.package, req.overrides, request.state.user["username"], req.take_backup)
+    except deploy.DeployError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.get("/api/deploy/history")
+async def deploy_history(limit: int = 50):
+    return await db.list_deployments(min(limit, 500))
+
+
 @app.get("/api/system/schema")
 async def schema_status():
     return await asyncio.to_thread(migrate.status)
@@ -2234,7 +2283,8 @@ async def health():
     ok = checks["database"] == "up" and checks["kafka"] == "up" and all(
         v == "running" for v in checks["consumers"].values()
     )
-    return JSONResponse({"status": "UP" if ok else "DOWN", **checks}, status_code=200 if ok else 503)
+    return JSONResponse({"status": "UP" if ok else "DOWN", "version": version.VERSION,
+                         "environment": deploy.environment(), **checks}, status_code=200 if ok else 503)
 
 
 @app.get("/metrics")

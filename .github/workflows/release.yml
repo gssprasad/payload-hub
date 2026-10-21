@@ -1,0 +1,79 @@
+# Release: tag a version (git tag v1.4.0 && git push origin v1.4.0) and it goes through the environments:
+#   build + test the image once -> TEST -> STAGING -> PRODUCTION
+# Each environment is a GitHub Environment (Settings -> Environments) holding its server details; add
+# "Required reviewers" to production (and staging) so a person approves before it deploys there.
+# Environments without a DEPLOY_HOST are skipped with a notice. See docs/DEPLOYMENT.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to (re)deploy, e.g. v1.4.0 - also how you roll back to an earlier release"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref }}
+      - name: Image name
+        id: meta
+        run: |
+          VERSION="${{ inputs.version || github.ref_name }}"
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$OWNER/payload-hub:$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: |
+          docker build --build-arg VERSION=${{ steps.meta.outputs.version }} --build-arg COMMIT=${{ github.sha }} \
+            -t ${{ steps.meta.outputs.image }} .
+      - name: Test the image (PostgreSQL, Kafka, backend, console + smoke test)
+        env:
+          POSTGRES_PASSWORD: ci-db-pass
+          ADMIN_PASSWORD: ci-admin-pass
+          PAYLOAD_HUB_IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          PAYLOAD_HUB_SECRET_KEY=$(python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          export PAYLOAD_HUB_SECRET_KEY
+          docker compose up -d --wait --wait-timeout 300
+          pip install httpx
+          python scripts/smoke_test.py http://localhost:8000 ci-admin-pass http://localhost:8501
+          docker compose down -v
+      - name: Publish to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push ${{ steps.meta.outputs.image }}
+
+  test:
+    needs: build
+    uses: ./.github/workflows/deploy-environment.yml
+    with: {environment: test, image: "${{ needs.build.outputs.image }}", version: "${{ inputs.version || github.ref_name }}"}
+    secrets: inherit
+
+  staging:
+    needs: [build, test]
+    uses: ./.github/workflows/deploy-environment.yml
+    with: {environment: staging, image: "${{ needs.build.outputs.image }}", version: "${{ inputs.version || github.ref_name }}"}
+    secrets: inherit
+
+  production:
+    needs: [build, staging]
+    uses: ./.github/workflows/deploy-environment.yml
+    with: {environment: production, image: "${{ needs.build.outputs.image }}", version: "${{ inputs.version || github.ref_name }}"}
+    secrets: inherit

@@ -1,0 +1,44 @@
+# Payload Hub on a server of a higher environment (TEST, STAGING, PROD): the backend and the web console only.
+# PostgreSQL and Kafka are the environment's own (managed / highly available) services - set them in .env.
+# deploy.sh in this folder switches versions safely; don't run "docker compose up" with a new tag by hand.
+name: payload-hub
+
+x-app-env: &app-env
+  DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+  KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:?set KAFKA_BOOTSTRAP in .env}
+  KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}
+  KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-SCRAM-SHA-256}
+  KAFKA_USERNAME: ${KAFKA_USERNAME:-}
+  KAFKA_PASSWORD: ${KAFKA_PASSWORD:-}
+  KAFKA_CA_CERT: ${KAFKA_CA_CERT:-}
+  KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
+  PAYLOAD_HUB_SECRET_KEY: ${PAYLOAD_HUB_SECRET_KEY:?set PAYLOAD_HUB_SECRET_KEY in .env}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+  PAYLOAD_HUB_ENVIRONMENT: ${PAYLOAD_HUB_ENVIRONMENT:?set PAYLOAD_HUB_ENVIRONMENT (TEST, STAGING, PROD) in .env}
+  PAYLOAD_HUB_APP_URL: ${PAYLOAD_HUB_APP_URL:-}
+  PAYLOAD_HUB_GRAFANA_URL: ${PAYLOAD_HUB_GRAFANA_URL:-}
+  PAYLOAD_HUB_TRUSTED_PROXIES: ${PAYLOAD_HUB_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8}
+  PAYLOAD_HUB_SSO_SECRET: ${PAYLOAD_HUB_SSO_SECRET:-}
+  TZ: ${TZ:-UTC}
+
+services:
+  backend:
+    image: ${PAYLOAD_HUB_IMAGE:?deploy.sh sets the image}
+    restart: unless-stopped
+    environment: *app-env
+    ports: ["${PAYLOAD_HUB_API_PORT:-8000}:8000"]
+    volumes: [hub-data:/app/data]
+
+  console:
+    image: ${PAYLOAD_HUB_IMAGE:?deploy.sh sets the image}
+    restart: unless-stopped
+    command: ["streamlit", "run", "streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0",
+              "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+    environment:
+      <<: *app-env
+      PAYLOAD_HUB_API: http://backend:8000
+    ports: ["${PAYLOAD_HUB_CONSOLE_PORT:-8501}:8501"]
+    depends_on: [backend]
+
+volumes:
+  hub-data:

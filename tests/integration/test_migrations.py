@@ -81,3 +81,16 @@ def test_without_auto_migration_the_app_refuses_an_old_schema(scratch_db, monkey
         migrate.on_startup()
     migrate.upgrade()
     migrate.on_startup()  # up to date: starts fine
+
+
+def test_an_older_release_starts_on_a_newer_schema(scratch_db, monkeypatch):
+    """After rolling back the app, the database stays on the newer schema - the older release must still start."""
+    import psycopg
+
+    migrate.upgrade()
+    with psycopg.connect(scratch_db, autocommit=True) as conn:
+        conn.execute("UPDATE alembic_version SET version_num = '9999_from_the_future'")
+    migrate.on_startup()  # warns, runs
+    monkeypatch.setenv("PAYLOAD_HUB_ALLOW_NEWER_SCHEMA", "false")
+    with pytest.raises(migrate.MigrationError, match="newer than this release"):
+        migrate.on_startup()

@@ -125,7 +125,7 @@ def _start_backend():
 
 from ui import (agent, common, connections, data, monitoring, overview, partners, ports, schedulers, send,  # noqa: E402
                 transactions, users, workflows)
-from ui import alerts, backups  # noqa: E402
+from ui import alerts, backups, deployments  # noqa: E402
 from ui import secrets as secrets_page  # noqa: E402
 
 common.style()
@@ -293,7 +293,8 @@ sections = {
 if common.can("admin"):
     sections["Administer"] = [_page(users.page, "Users", "👥", "users"),
                               _page(secrets_page.page, "Secrets", "🔐", "secrets"),
-                              _page(backups.page, "Backups", "💾", "backups")]
+                              _page(backups.page, "Backups", "💾", "backups"),
+                              _page(deployments.page, "Deployments", "🚚", "deployments")]
 pages = [pg for group in sections.values() for pg in group]
 common.PAGES = {pg.url_path: pg for pg in pages}
 nav = st.navigation(sections, expanded=True)
@@ -301,6 +302,7 @@ nav = st.navigation(sections, expanded=True)
 with st.sidebar:
     st.markdown("### 🔀 Payload Hub")
     common.flush_cookie()
+    common.environment_badge()
     _health()
     _account()
     if not EMBED_BACKEND:

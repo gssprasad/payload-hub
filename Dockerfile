@@ -3,6 +3,9 @@
 # Debian trixie brings PostgreSQL 17 client tools, so backups (pg_dump) work against PostgreSQL 17 and older.
 FROM python:3.13-slim-trixie
 
+ARG VERSION=dev
+ARG COMMIT=""
+ENV PAYLOAD_HUB_VERSION=${VERSION} PAYLOAD_HUB_COMMIT=${COMMIT}
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update \

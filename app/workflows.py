@@ -81,6 +81,15 @@ async def _database(conn_id: str) -> adapters.Database:
     return await connectors.adapter_for(conn_id)
 
 
+def _walk_steps(steps):
+    """Every step, including those inside branches."""
+    for s in steps or []:
+        yield s
+        if s.get("type") == "branch":
+            yield from _walk_steps(s.get("then"))
+            yield from _walk_steps(s.get("else"))
+
+
 def validate(steps: list[dict], names: set | None = None, where: str = "") -> list[dict]:
     """Check a workflow's steps (including the steps inside branches) before saving. Returns cleaned steps."""
     names = set() if names is None else names

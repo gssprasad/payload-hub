@@ -1,0 +1,57 @@
+# Deploy one release to one environment: switch the server to the new image (deploy/server/deploy.sh - backup,
+# health check, smoke test, automatic rollback), then deploy the configuration packages in deploy/packages with
+# that environment's overrides (deploy/environments/<environment>.json).
+#
+# GitHub Environment settings it reads:
+#   variables: DEPLOY_HOST, DEPLOY_USER (default deploy), DEPLOY_PATH (default /opt/payload-hub), HUB_URL
+#   secrets:   DEPLOY_SSH_KEY (private key allowed on the server), HUB_ADMIN_PASSWORD
+name: Deploy to an environment
+
+on:
+  workflow_call:
+    inputs:
+      environment: {type: string, required: true}
+      image: {type: string, required: true}
+      version: {type: string, required: true}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.HUB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+      - name: Not set up yet?
+        if: vars.DEPLOY_HOST == ''
+        run: echo "::notice::No DEPLOY_HOST for '${{ inputs.environment }}' - skipped. See docs/DEPLOYMENT.md to set it up."
+      - name: Switch the server to ${{ inputs.image }}
+        if: vars.DEPLOY_HOST != ''
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          TARGET: ${{ vars.DEPLOY_USER || 'deploy' }}@${{ vars.DEPLOY_HOST }}
+          DIR: ${{ vars.DEPLOY_PATH || '/opt/payload-hub' }}
+        run: |
+          install -m 600 /dev/null ~/deploy_key && echo "$SSH_KEY" > ~/deploy_key
+          SSH="ssh -i ~/deploy_key -o StrictHostKeyChecking=accept-new"
+          scp -i ~/deploy_key -o StrictHostKeyChecking=accept-new \
+            deploy/server/docker-compose.yml deploy/server/deploy.sh scripts/smoke_test.py "$TARGET:$DIR/"
+          $SSH "$TARGET" "cd $DIR && ./deploy.sh ${{ inputs.image }}"
+      - name: Deploy configuration packages
+        if: vars.DEPLOY_HOST != '' && hashFiles('deploy/packages/*.json') != ''
+        env:
+          PAYLOAD_HUB_PASSWORD: ${{ secrets.HUB_ADMIN_PASSWORD }}
+        run: |
+          pip install httpx
+          OVERRIDES=()
+          if [ -f "deploy/environments/${{ inputs.environment }}.json" ]; then
+            OVERRIDES=(--overrides "deploy/environments/${{ inputs.environment }}.json")
+          fi
+          for pkg in deploy/packages/*.json; do
+            echo "::group::$pkg"
+            python scripts/deploy_package.py apply "${{ vars.HUB_URL }}" "$pkg" "${OVERRIDES[@]}"
+            echo "::endgroup::"
+          done

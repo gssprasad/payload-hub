@@ -80,8 +80,32 @@ def downgrade(revision: str):
     command.downgrade(_config(), revision)
 
 
+def _newer_than_me() -> str | None:
+    """The database's revision, if it was migrated by a newer release than this one (e.g. after a rollback)."""
+    from alembic.script import ScriptDirectory
+
+    now = current()
+    if now is None:
+        return None
+    try:
+        ScriptDirectory.from_config(_config()).get_revision(now)
+        return None
+    except Exception:  # noqa: BLE001 - alembic: unknown revision
+        return now
+
+
 def on_startup():
-    """Bring the schema up to date (or check it is, when auto-migration is off). Runs before the app starts."""
+    """Bring the schema up to date (or check it is, when auto-migration is off). Runs before the app starts.
+
+    Rolling back to the previous release leaves the database on the newer schema. That's allowed (migrations are
+    written to be backward compatible for one release - add columns/tables, don't drop or rename in the same
+    release), so an older version starts with a warning instead of refusing; set PAYLOAD_HUB_ALLOW_NEWER_SCHEMA=false
+    to refuse instead."""
+    if newer := _newer_than_me():
+        if os.getenv("PAYLOAD_HUB_ALLOW_NEWER_SCHEMA", "true").lower() in ("0", "false", "no"):
+            raise MigrationError(f"The database is on {newer}, newer than this release ({head()}).")
+        log.warning("the database is on %s, newer than this release (%s) - running anyway (rollback)", newer, head())
+        return
     if os.getenv("PAYLOAD_HUB_AUTO_MIGRATE", "true").lower() in ("0", "false", "no"):
         todo = pending()
         if todo:
