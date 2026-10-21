@@ -65,9 +65,17 @@ async def adapter_for(conn_id: str) -> adapters.Adapter:
 
 # ---------- intake ----------
 
-async def ingest(partner: dict, payload: str, source: str, wait: float | None = 15):
+async def ingest(partner: dict, payload: str, source: str, wait: float | None = 15,
+                 idempotency_key: str | None = None):
     """Create a transaction for a partner's payload and publish it to the partner's Kafka queue.
-    With wait, returns the finished transaction (or None if still running after `wait` seconds)."""
+    With wait, returns the finished transaction (or None if still running after `wait` seconds).
+    With an idempotency_key the partner already used, nothing new happens: the original transaction is returned
+    (marked "replayed") - so a partner retrying after a timeout never creates a second order."""
+    import hashlib
+
+    request_hash = hashlib.sha256(payload.encode()).hexdigest() if idempotency_key else None
+    if idempotency_key and (existing := await db.find_by_idempotency_key(partner["code"], idempotency_key)):
+        return await _replay(existing, request_hash, wait)
     if not partner["active"]:
         raise IngestError(409, f"Partner '{partner['name']}' is inactive.")
     if not partner["expression"]:
@@ -77,10 +85,29 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
            "topic_in": partner["topic_in"], "topic_out": partner["topic_out"], "topic_dlq": partner["topic_dlq"],
            "partner_code": partner["code"], "source": source}
     txn_id = str(uuid.uuid4())
-    await db.create_transaction(txn_id, msg["mapping_name"], msg["input_format"], msg["output_format"],
-                                msg["expression"], payload, msg["partner_code"], msg["topic_in"], source)
+    try:
+        await db.create_transaction(txn_id, msg["mapping_name"], msg["input_format"], msg["output_format"],
+                                    msg["expression"], payload, msg["partner_code"], msg["topic_in"], source,
+                                    idempotency_key, request_hash)
+    except db.DuplicateKey:  # the same key arrived twice at the same moment
+        return await _replay(await db.find_by_idempotency_key(partner["code"], idempotency_key), request_hash, wait)
     result = await pipeline.submit(txn_id, {"id": txn_id, "payload": payload, **msg}, wait_seconds=wait or 0.01)
     return txn_id, result
+
+
+async def _replay(existing: dict, request_hash: str, wait: float | None):
+    if existing["request_hash"] != request_hash:
+        raise IngestError(409, "This Idempotency-Key was already used for a different payload - use a new key for "
+                               "a new message.")
+    txn_id = str(existing["id"])
+    await db.record_event(txn_id, "REPLAYED", "the partner sent the same Idempotency-Key again - "
+                                              "answered with this transaction, nothing processed twice")
+    deadline = asyncio.get_running_loop().time() + (wait or 0)
+    txn = existing
+    while txn["status"] not in db.FINAL_STATUSES and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.1)
+        txn = await db.get_transaction(txn_id)
+    return txn_id, ({**txn, "replayed": True} if txn["status"] in db.FINAL_STATUSES else None)
 
 
 # ---------- forward to another API and reply ----------
@@ -104,7 +131,7 @@ async def forward(partner: dict, txn: dict) -> dict:
         payload, content_type = _for_system_b(partner, txn)
         conn = await db.get_connection(partner["reply_connection"]) or {}
         adapter = await adapter_for(partner["reply_connection"])
-        headers = {"X-Transaction-Id": txn_id, "X-Partner": partner["code"]}
+        headers = {"X-Transaction-Id": txn_id, "X-Partner": partner["code"], "Idempotency-Key": txn_id}
         policy = adapters.retry_policy(adapter.config)
         is_http = isinstance(adapter, adapters.HTTP)
         retry_statuses = adapter._retry_statuses() if is_http else set()
@@ -180,8 +207,12 @@ async def deliver(msg: dict):
     if not partner["outbound_connection"]:
         return
     txn_id = msg["id"]
+    if not await db.claim_delivery(txn_id):  # already delivered (or being delivered) - never send twice
+        await db.record_event(txn_id, "DUPLICATE", "delivery already done or in progress - not sent again")
+        return
     content_type = "application/xml" if msg["output_format"] == "xml" else "application/json"
-    headers = {"X-Transaction-Id": txn_id, "X-Partner": code}
+    # Idempotency-Key lets the receiving system recognise a message it has already seen
+    headers = {"X-Transaction-Id": txn_id, "X-Partner": code, "Idempotency-Key": txn_id}
     target = partner["outbound_target"] or ""
     last_error, attempts = None, 1
     try:
@@ -294,11 +325,21 @@ async def _stop(code):
             log.exception("stopping listener for %s", code)
 
 
+INTERRUPTED_DELIVERY_MINUTES = 15
+
+
 async def _supervise():
+    from . import alerts
+
     while True:
         await asyncio.sleep(SUPERVISE_SECONDS)
         try:
             await sync()
+            for r in await db.interrupted_deliveries(INTERRUPTED_DELIVERY_MINUTES):
+                alerts.emit("delivery_failed", f"Delivery interrupted for {r['partner_code']}",
+                            "The instance delivering it stopped. It was not resent automatically, to avoid a "
+                            "duplicate - check the target system and resend if needed.",
+                            partner=r["partner_code"], transaction=str(r["id"]))
         except Exception:  # noqa: BLE001
             log.exception("listener supervisor")
 

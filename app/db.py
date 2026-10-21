@@ -3,6 +3,7 @@ import os
 import re
 
 from psycopg.rows import dict_row
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
@@ -40,15 +41,23 @@ async def close():
     await pool.close()
 
 
+class DuplicateKey(Exception):
+    """A partner reused an Idempotency-Key."""
+
+
 async def create_transaction(txn_id, mapping_name, input_format, output_format, expression, payload,
-                             partner_code=None, topic=None, source=None):
+                             partner_code=None, topic=None, source=None, idempotency_key=None, request_hash=None):
     async with pool.connection() as conn:
-        await conn.execute(
-            """INSERT INTO transactions (id, status, mapping_name, input_format, output_format, expression, input_payload,
-                                         partner_code, topic, source)
-               VALUES (%s, 'RECEIVED', %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (txn_id, mapping_name, input_format, output_format, expression, payload, partner_code, topic, source),
-        )
+        try:
+            await conn.execute(
+                """INSERT INTO transactions (id, status, mapping_name, input_format, output_format, expression,
+                                             input_payload, partner_code, topic, source, idempotency_key, request_hash)
+                   VALUES (%s, 'RECEIVED', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (txn_id, mapping_name, input_format, output_format, expression, payload, partner_code, topic, source,
+                 idempotency_key, request_hash),
+            )
+        except UniqueViolation as e:
+            raise DuplicateKey(idempotency_key) from e
         source = f"{source or 'UI'}" + (f" for partner {partner_code}" if partner_code else "")
         await conn.execute(
             "INSERT INTO transaction_events (txn_id, stage, detail) VALUES (%s, 'RECEIVED', %s)",
@@ -57,6 +66,53 @@ async def create_transaction(txn_id, mapping_name, input_format, output_format, 
 
 
 FINAL_STATUSES = ("COMPLETED", "FAILED")
+
+
+async def find_by_idempotency_key(partner_code, key):
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM transactions WHERE partner_code = %s AND idempotency_key = %s",
+                                 (partner_code, key))
+        return await cur.fetchone()
+
+
+async def finish_once(txn_id, status, detail, **fields) -> bool:
+    """Move a transaction to COMPLETED / FAILED - only once. A second attempt (Kafka delivering the same message
+    again) changes nothing, is recorded as DUPLICATE, and returns False."""
+    sets = ", ".join(f"{k} = %s" for k in {"status": status, **fields})
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                f"UPDATE transactions SET {sets}, updated_at = now() WHERE id = %s "
+                "AND status NOT IN ('COMPLETED', 'FAILED') RETURNING id", (status, *fields.values(), txn_id))
+            first = await cur.fetchone() is not None
+            await conn.execute("INSERT INTO transaction_events (txn_id, stage, detail) VALUES (%s, %s, %s)",
+                               (txn_id, status if first else "DUPLICATE",
+                                detail if first else f"{status} again (message delivered twice) - ignored"))
+            return first
+
+
+async def claim_delivery(txn_id) -> bool:
+    """Only one instance, once, may deliver a transaction's result."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "UPDATE transactions SET delivery_status = 'DELIVERING', delivery_claimed_at = now() "
+            "WHERE id = %s AND delivery_status IS NULL RETURNING id", (txn_id,))
+        return await cur.fetchone() is not None
+
+
+async def interrupted_deliveries(minutes):
+    """Deliveries claimed long ago and never finished - the instance doing them stopped."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """UPDATE transactions SET delivery_status = 'DELIVERY_FAILED', updated_at = now()
+               WHERE delivery_status = 'DELIVERING' AND delivery_claimed_at < now() - make_interval(mins => %s)
+               RETURNING id, partner_code""", (minutes,))
+        rows = await cur.fetchall()
+        for r in rows:
+            await conn.execute("INSERT INTO transaction_events (txn_id, stage, detail) VALUES (%s, 'DELIVERY_FAILED', %s)",
+                               (r["id"], "delivery interrupted (the instance stopped) - not resent automatically, "
+                                         "to avoid a duplicate; check the target system and resend if needed"))
+        return rows
 
 
 async def finished_transactions(ids):
@@ -75,17 +131,20 @@ async def record_event(txn_id, stage, detail=None, **fields):
     guard = ""
     if fields.get("status") and fields["status"] not in FINAL_STATUSES:
         guard = " AND status NOT IN ('COMPLETED', 'FAILED')"
+    applied = True
     async with pool.connection() as conn:
         async with conn.transaction():
             if fields:
-                await conn.execute(
+                cur = await conn.execute(
                     f"UPDATE transactions SET {sets}, updated_at = now() WHERE id = %s{guard}",
                     (*fields.values(), txn_id),
                 )
+                applied = cur.rowcount > 0
             await conn.execute(
                 "INSERT INTO transaction_events (txn_id, stage, detail) VALUES (%s, %s, %s)",
                 (txn_id, stage, detail),
             )
+    return applied  # False: the transaction had already finished, so the status was left alone
 
 
 async def list_transactions(limit=50, status=None, q=None, since=None, until=None, partner=None):

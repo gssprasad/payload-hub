@@ -1849,11 +1849,21 @@ async def _inbound(code: str, request: Request, wait: bool, x_api_key: str | Non
     body = (await request.body()).decode("utf-8", errors="replace")
     if not body.strip():
         raise HTTPException(422, "Empty body - send the payload as the request body.")
+    key = (request.headers.get("idempotency-key") or "").strip() or None
+    if key and len(key) > 200:
+        raise HTTPException(422, "Idempotency-Key is too long (at most 200 characters).")
     try:
-        txn_id, result = await connectors.ingest(p, body, "HTTP", wait=15 if wait else None)
+        txn_id, result = await connectors.ingest(p, body, "HTTP", wait=15 if wait else None, idempotency_key=key)
     except connectors.IngestError as e:
         raise HTTPException(e.status, str(e)) from e
-    headers = {"X-Transaction-Id": txn_id}
+    headers = {"X-Transaction-Id": txn_id, **({"Idempotent-Replayed": "true"} if result and result.get("replayed")
+                                              else {})}
+    if result and result.get("replayed") and result["status"] == "COMPLETED" and p["reply_mode"] == "forward":
+        # a repeated call: answer with the target system's original response - don't call it again
+        fmt = {"input": p["input_format"], "json": "json", "xml": "xml"}.get(p.get("response_format") or "input")
+        media = {"xml": "application/xml", "json": "application/json"}.get(fmt, "text/plain")
+        return Response(result.get("response_payload") or "", status_code=result.get("upstream_status") or 200,
+                        media_type=media, headers={**headers, "X-Status": "RESPONDED"})
     if result and result["status"] == "COMPLETED" and p["reply_mode"] == "forward":
         reply = await connectors.reply_for(p, txn_id, result)
         if not reply["ok"] and "body" not in reply:
@@ -1895,7 +1905,7 @@ async def test_receiver(name: str, request: Request):
     at = _now_iso()
     _received.appendleft({"at": at, "name": name, "method": request.method,
                           "headers": {k: v for k, v in request.headers.items()
-                                      if k.lower().startswith(("x-", "content-type"))},
+                                      if k.lower().startswith(("x-", "content-type", "idempotency-key"))},
                           "body": body})
     # A realistic acknowledgement, so forwarding demos have a response to convert and return.
     return {"status": "ACCEPTED", "reference": f"TR-{secrets.token_hex(4).upper()}",

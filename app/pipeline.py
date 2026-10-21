@@ -40,6 +40,7 @@ TXN_TOTAL = Counter("payload_transactions_total", "Transactions by final status"
 TRANSFORM_SECONDS = Histogram("payload_transform_seconds", "Time spent in the transformer step")
 END_TO_END_SECONDS = Histogram("payload_end_to_end_seconds", "API receive -> result stored")
 IN_FLIGHT = Gauge("payload_in_flight", "Transactions published but not yet completed")
+DUPLICATES = Counter("payload_duplicates_total", "Messages Kafka delivered again after their transaction finished")
 
 producer: AIOKafkaProducer | None = None
 _tasks: list[asyncio.Task] = []
@@ -145,9 +146,12 @@ async def _transformer(consumer: AIOKafkaConsumer):
             msg = rec.value
             txn_id = msg["id"]
             topic_out, topic_dlq = msg.get("topic_out", TOPIC_OUT), msg.get("topic_dlq", TOPIC_DLQ)
-            await db.record_event(
+            started = await db.record_event(
                 txn_id, "TRANSFORMING", f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}", status="TRANSFORMING"
             )
+            if not started:  # Kafka delivered it again after it had finished (e.g. after a crash) - nothing to do
+                await db.record_event(txn_id, "DUPLICATE", "already finished - the repeated message was ignored")
+                continue
             t0 = time.perf_counter()
             try:
                 output = transform(msg["payload"], msg["input_format"], msg["expression"], msg["output_format"])
@@ -177,11 +181,13 @@ async def _result_sink(consumer: AIOKafkaConsumer):
         async for rec in consumer:
             msg = rec.value
             try:
-                await _finish(msg, "COMPLETED", output_payload=msg["output"],
-                              detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
+                first = await _finish(msg, "COMPLETED", output_payload=msg["output"],
+                                      detail=f"consumed from {rec.topic}[{rec.partition}]@{rec.offset}, stored output")
             except Exception:  # keep the consumer alive on unexpected errors
                 log.exception("result sink failed on %s", msg.get("id"))
                 continue
+            if not first:
+                continue  # a repeated message: deliveries and storage already happened once
             for callback in on_completed:
                 asyncio.create_task(callback(msg))
     finally:
@@ -193,15 +199,18 @@ def _log_crash(task: asyncio.Task):
         log.error("consumer %s stopped", task.get_name(), exc_info=task.exception())
 
 
-async def _finish(msg, status, detail, **fields):
+async def _finish(msg, status, detail, **fields) -> bool:
+    """Finish a transaction (once). Returns False when it had already finished - a message delivered twice."""
     txn_id = msg["id"]
-    started = _started_at.pop(txn_id, None)
+    started = _started_at.get(txn_id)
     total_ms = (time.perf_counter() - started) * 1000 if started else None
-    if started:
+    if not await db.finish_once(txn_id, status, detail, total_ms=total_ms, **fields):
+        DUPLICATES.inc()
+        return False
+    if _started_at.pop(txn_id, None):
         END_TO_END_SECONDS.observe(total_ms / 1000)
         IN_FLIGHT.dec()
     TXN_TOTAL.labels(status=status, mapping=msg["mapping_name"], partner=msg.get("partner_code") or "-").inc()
-    await db.record_event(txn_id, status, detail, status=status, total_ms=total_ms, **fields)
     if status == "FAILED":
         from . import alerts
 
@@ -213,6 +222,7 @@ async def _finish(msg, status, detail, **fields):
         fut = _waiters.get(txn_id)
         if fut and not fut.done():  # no await between the check and set_result: the waiter watch may answer too
             fut.set_result(txn)
+    return True
 
 
 

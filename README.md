@@ -564,6 +564,21 @@ Standard JMESPath plus `concat(a, b, ...)`, `upper(s)`, `lower(s)`, `multiply(a,
 `to_float(v)`. XML input is parsed with xmltodict: attributes are `"@name"` keys and all
 values are strings.
 
+## Nothing happens twice
+
+- **Partner retries** - a partner can send an `Idempotency-Key` header (any unique value per message, e.g. its
+  order number). If the same key arrives again - say the partner retried after a timeout - nothing new is
+  processed: the answer of the original transaction comes back, with `Idempotent-Replayed: true` (and for a
+  forwarding route, the target system's original response - it isn't called again). The same key with a different
+  payload is refused with `409`.
+- **Kafka delivering a message again** (after a crash or a rebalance) - a transaction finishes only once; a repeat
+  is recorded as `DUPLICATE` and ignored, so deliveries, stored rows and alerts happen once
+  (`payload_duplicates_total` counts them).
+- **Deliveries** are claimed before sending, so only one instance sends each, once. Outgoing messages carry
+  `Idempotency-Key: <transaction id>` (and `X-Transaction-Id`) so target systems can recognise a repeat too. A
+  delivery interrupted by a crash is not resent automatically - after 15 minutes it is marked `DELIVERY_FAILED`
+  with a note and raises a `delivery_failed` alert, so someone checks the target system first.
+
 ## Run with Docker
 
 Everything - PostgreSQL, Kafka, the backend and the web console - with one command:
