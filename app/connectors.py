@@ -79,7 +79,9 @@ async def ingest(partner: dict, payload: str, source: str, wait: float | None = 
     if not partner["active"]:
         raise IngestError(409, f"Partner '{partner['name']}' is inactive.")
     if not partner["expression"]:
-        raise IngestError(409, f"Partner '{partner['name']}' has no mapping yet.")
+        raise IngestError(409, f"Partner '{partner['name']}' has no mapping yet - add one on Partners → "
+                               f"{partner['name']} → Mapping (write it, or generate it with the AI agent), then "
+                               "send the message again.")
     msg = {"mapping_name": partner["code"], "input_format": partner["input_format"],
            "output_format": partner["output_format"], "expression": partner["expression"],
            "topic_in": partner["topic_in"], "topic_out": partner["topic_out"], "topic_dlq": partner["topic_dlq"],

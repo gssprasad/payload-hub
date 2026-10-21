@@ -135,6 +135,12 @@ def _friendly(e: Exception) -> str:
     text = str(e)
     if any(s in text for s in ("401", "403", "invalid_api_key", "API key not valid", "authentication", "Unauthorized")):
         return "The API key was rejected - check it and paste it again."
+    if any(s in text for s in ("429", "RESOURCE_EXHAUSTED", "rate_limit", "quota", "insufficient_quota")):
+        return ("The AI provider refused: your API key's quota or rate limit is used up (HTTP 429). Wait a minute and "
+                "try again, check the plan/billing of that key, or pick a regular (non-preview, non-'deep-research') "
+                "model or another provider under AI Agent → AI providers. Nothing was saved.")
+    if any(s in text for s in ("404", "NOT_FOUND", "model_not_found", "does not exist")):
+        return "The provider doesn't offer this model to your key - pick another one under AI Agent → AI providers."
     return f"{type(e).__name__}: {text[:300]}"
 
 
