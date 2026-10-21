@@ -581,6 +581,8 @@ values are strings.
 
 ## Run with Docker
 
+Installing on another Linux or Windows machine, step by step: **[docs/INSTALL.md](docs/INSTALL.md)**.
+
 Everything - PostgreSQL, Kafka, the backend and the web console - with one command:
 
 ```bash
