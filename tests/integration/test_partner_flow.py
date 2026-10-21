@@ -59,3 +59,13 @@ def test_xml_output_on_dedicated_queues(base_url, admin):
     r = call(base_url, p)
     assert r.status_code == 200, r.text
     assert "application/xml" in r.headers["content-type"] and "<order_id>A-100</order_id>" in r.text
+
+
+def test_metrics_for_monitoring(base_url, partner):
+    call(base_url, partner)
+    text = wait_for(lambda: httpx.get(f"{base_url}/metrics").text,
+                    lambda t: "payload_component_up" in t and "payload_kafka_backlog" in t, timeout=30)
+    assert f'payload_inbound_seconds_count{{code="200",partner="{partner["code"]}"}}' in text
+    for name in ("payload_transactions_total", "payload_component_up", "payload_db_pool_connections",
+                 "payload_instance_info"):
+        assert name in text, name

@@ -363,6 +363,10 @@ async def run(wf: dict, input_: dict | None, source: str, dry_run: bool = False,
     await db.update_run(run_id, status=outcome.status, error=outcome.error, failed_step=outcome.failed,
                         steps_log=steps_log, context=_jsonable(_public(ctx)), finished_at=datetime.now(timezone.utc),
                         duration_ms=round((time.perf_counter() - started) * 1000, 1))
+    from . import metrics
+
+    metrics.WORKFLOW_RUNS.labels(wf["id"], outcome.status).inc()
+    metrics.WORKFLOW_SECONDS.labels(wf["id"]).observe(time.perf_counter() - started)
     if outcome.status == "FAILED":
         from . import alerts
 

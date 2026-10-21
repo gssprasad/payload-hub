@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files: [alerts.yml]
+
+alerting:
+  alertmanagers:
+    - static_configs: [{targets: ["alertmanager:9093"]}]
+
+scrape_configs:
+  - job_name: payload-hub
+    metrics_path: /metrics
+    file_sd_configs:
+      - files: [targets.json]   # edit to list your instances; reloaded automatically
+        refresh_interval: 1m

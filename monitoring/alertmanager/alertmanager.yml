@@ -1,0 +1,24 @@
+# Where Prometheus' alerts go. Out of the box they are only shown (Alertmanager UI, Grafana); uncomment a receiver
+# and point the route at it to get messages. (Payload Hub's own Alerts page can also notify you - this one keeps
+# working when Payload Hub itself is down.)
+route:
+  receiver: none
+  group_by: [alertname]
+  group_wait: 30s
+  repeat_interval: 4h
+  # receiver: team
+
+receivers:
+  - name: none
+  # - name: team
+  #   slack_configs:
+  #     - api_url: https://hooks.slack.com/services/...      # Slack incoming webhook
+  #       channel: "#integration-alerts"
+  #   msteams_configs:
+  #     - webhook_url: https://....webhook.office.com/...    # Microsoft Teams
+  #   email_configs:
+  #     - to: ops@company.com
+  #       from: alerts@company.com
+  #       smarthost: smtp.company.com:587
+  #       auth_username: alerts@company.com
+  #       auth_password: "..."

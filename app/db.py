@@ -993,6 +993,9 @@ async def delete_port(pid):
 
 async def record_port_event(pid, item, status, detail=None, ref=None):
     ok = status in ("OK", "ACCEPTED")
+    from . import metrics
+
+    metrics.PORT_ITEMS.labels(pid, status.lower()).inc()
     if not ok:
         from . import alerts
 

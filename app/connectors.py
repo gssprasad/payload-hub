@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from . import adapters, cluster, db, pipeline
+from . import adapters, cluster, db, metrics, pipeline
 from .transform import TransformError, convert_response, to_csv
 
 log = logging.getLogger("connectors")
@@ -163,10 +163,13 @@ async def forward(partner: dict, txn: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         error = str(e) or type(e).__name__
     if status is None:
+        metrics.FORWARDS.labels(partner["code"], "unreachable").inc()
         await db.record_event(txn_id, "FORWARD_FAILED", error)
         await db.set_response(txn_id, None, None)
         return {"ok": False, "status": 502, "error": f"Target system unreachable: {error}"}
     ms = (time.perf_counter() - started) * 1000
+    metrics.FORWARDS.labels(partner["code"], "ok" if status < 400 else f"http_{status // 100}xx").inc()
+    metrics.FORWARD_SECONDS.labels(partner["code"]).observe(ms / 1000)
     await db.record_event(txn_id, "FORWARDED", f"{where} → {'HTTP ' + str(status) if is_http else 'delivered'} "
                                                f"in {ms:.0f} ms")
     try:
@@ -237,10 +240,12 @@ async def deliver(msg: dict):
                 await asyncio.sleep(wait)
             continue
         await db.set_delivery(txn_id, "DELIVERED")
+        metrics.DELIVERIES.labels(code, "delivered").inc()
         await db.record_event(txn_id, "DELIVERED", f"{detail} via connection '{partner['outbound_connection']}'"
                                                   + (f" (attempt {attempt})" if attempt > 1 else ""))
         return
     await db.set_delivery(txn_id, "DELIVERY_FAILED")
+    metrics.DELIVERIES.labels(code, "failed").inc()
     await db.record_event(txn_id, "DELIVERY_FAILED", f"gave up after {attempts} attempt(s): {last_error}")
     from . import alerts
 

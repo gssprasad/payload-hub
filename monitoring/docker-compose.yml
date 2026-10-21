@@ -1,0 +1,42 @@
+# Monitoring for Payload Hub: Prometheus (collects the metrics), Alertmanager (sends its alerts) and Grafana
+# (the dashboard). It runs on its own, so it keeps working - and alerting - when Payload Hub itself has trouble.
+#   cd monitoring && docker compose up -d
+# Grafana http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD) · Prometheus http://localhost:9090
+# Which Payload Hub instances to watch: prometheus/targets.json (picked up within a minute, no restart).
+name: payload-hub-monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d",
+              "--web.enable-lifecycle"]
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]  # reach Payload Hub on this machine (Linux too)
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    volumes: ["./alertmanager:/etc/alertmanager:ro"]
+    ports: ["${ALERTMANAGER_PORT:-9094}:9093"]  # 9093 is often Kafka's controller port
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/payload-hub.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  prometheus-data:
+  grafana-data:

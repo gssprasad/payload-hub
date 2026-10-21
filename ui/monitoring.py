@@ -1,4 +1,5 @@
 """Monitoring page: overall and per-partner health, throughput, latency and Kafka queue backlog."""
+import os
 from datetime import datetime
 
 import pandas as pd
@@ -10,6 +11,9 @@ from .common import CRITICAL, GOOD, api, status_label
 
 def page():
     common.hero("📊 Monitoring", "Throughput, latency and failures by partner, adapter and queue.")
+    grafana = os.getenv("PAYLOAD_HUB_GRAFANA_URL", "http://localhost:3000/d/payload-hub")
+    st.caption(f"📈 Weeks of history, every instance together, and alerts that keep working when Payload Hub is down: "
+               f"[open the Grafana dashboard]({grafana}) (see monitoring/README.md to run it).")
     partner_names = {p["code"]: p["name"] for p in common.partners()}
     c1, c2 = st.columns([2, 1])
     scope = c1.selectbox("Show", ["", "-", *partner_names],

@@ -67,6 +67,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Check the monitoring config (alert rules, Prometheus config, generated dashboard)
+        run: |
+          docker run --rm -v "$PWD/monitoring/prometheus:/p" --entrypoint promtool prom/prometheus:v3.5.0 check rules /p/alerts.yml
+          docker run --rm -v "$PWD/monitoring/prometheus:/etc/prometheus" --entrypoint promtool prom/prometheus:v3.5.0 \
+            check config /etc/prometheus/prometheus.yml
+          cp monitoring/grafana/dashboards/payload-hub.json /tmp/committed.json
+          python3 monitoring/build_dashboard.py && diff -q /tmp/committed.json monitoring/grafana/dashboards/payload-hub.json
       - name: Build the image
         run: docker build -t payload-hub:latest .
       - name: Start the stack (PostgreSQL, Kafka, backend, console)

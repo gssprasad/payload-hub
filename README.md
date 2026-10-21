@@ -643,6 +643,14 @@ See **[docs/OPERATIONS.md](docs/OPERATIONS.md)** for the runbook. In short:
   database for a restore drill). The master key is not in backups - keep it separately.
 - **Audit trail** - who changed what, with before → after values; each partner's *Activity* tab shows its history.
 
+## Monitoring with Grafana
+
+`monitoring/` is a separate, ready-to-run stack - **Prometheus + Alertmanager + Grafana** with a prepared Payload Hub
+dashboard and alert rules (instance down, component down, failure rate, slow partner calls, Kafka backlog,
+delivery failures, database pool). It runs apart from Payload Hub so it keeps history and keeps alerting when Payload
+Hub has trouble: `cd monitoring && docker compose up -d`, then http://localhost:3000. Details:
+[monitoring/README.md](monitoring/README.md). The Monitoring page links to it (`PAYLOAD_HUB_GRAFANA_URL`).
+
 ## Performance
 
 About **350 partner calls per second per instance** on a laptop, more with more instances (two gave +60%), with no

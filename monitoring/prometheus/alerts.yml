@@ -1,0 +1,59 @@
+groups:
+  - name: payload-hub
+    rules:
+      - alert: PayloadHubInstanceDown
+        expr: up{job="payload-hub"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Payload Hub instance {{ $labels.instance }} is not answering"
+          description: "Prometheus can't read /metrics from it for over a minute - it is down or unreachable."
+
+      - alert: PayloadHubComponentDown
+        expr: payload_component_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.kind }} {{ $labels.name }} is down on {{ $labels.instance }}"
+          description: "A service (database, Kafka), pipeline worker, partner listener, workflow trigger or port is in error."
+
+      - alert: PayloadHubHighFailureRate
+        expr: |
+          sum(rate(payload_transactions_total{status="FAILED"}[5m]))
+            / clamp_min(sum(rate(payload_transactions_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of transactions are failing"
+          description: "Check the Transactions page for the errors (mapping or payload problems)."
+
+      - alert: PayloadHubSlowPartnerCalls
+        expr: histogram_quantile(0.95, sum by (le) (rate(payload_inbound_seconds_bucket[5m]))) > 2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Partner calls are slow (p95 above 2 s)"
+          description: "The instances may be overloaded - add an instance, or check the database and Kafka."
+
+      - alert: PayloadHubKafkaBacklog
+        expr: sum(max by (queue, kind) (payload_kafka_backlog)) > 1000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} messages waiting in Payload Hub's Kafka queues"
+          description: "Messages arrive faster than they are processed, or processing has stopped."
+
+      - alert: PayloadHubDeliveryFailures
+        expr: sum by (partner) (increase(payload_deliveries_total{result="failed"}[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Deliveries to {{ $labels.partner }} are failing"
+          description: "Failed after their retries - check the partner's outbound connection."
+
+      - alert: PayloadHubDatabasePoolExhausted
+        expr: max(payload_db_pool_connections{state="waiting"}) > 5
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Requests are queueing for database connections"
+          description: "Raise PAYLOAD_HUB_DB_POOL_MAX or add an instance."

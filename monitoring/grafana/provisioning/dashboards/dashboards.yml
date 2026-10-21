@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: payload-hub
+    folder: Payload Hub
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

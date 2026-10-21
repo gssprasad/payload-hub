@@ -103,4 +103,6 @@ Start several backends against the same PostgreSQL database and Kafka cluster (b
 
 - `GET /health` - 200 when the database, Kafka and the pipeline workers are up, 503 otherwise (for load balancers
   and uptime monitors).
-- `GET /metrics` - Prometheus metrics.
+- `GET /metrics` - Prometheus metrics; `monitoring/` has Prometheus, Alertmanager and a Grafana dashboard for them
+  (see monitoring/README.md). Use both kinds of alerts: Payload Hub's own (Alerts page - what happened inside) and
+  Prometheus' (they still fire when Payload Hub is down).

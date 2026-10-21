@@ -123,6 +123,9 @@ async def execute(task: dict, trigger: str) -> dict:
         status, detail, ref = "FAILED", f"{type(e).__name__}: {e}", None
     ms = round((time.perf_counter() - started) * 1000, 1)
     await db.finish_schedule_run(run_id, status, (detail or "")[:2000], ref, ms)
+    from . import metrics
+
+    metrics.SCHEDULE_RUNS.labels(task["id"], status).inc()
     if status == "FAILED":
         from . import alerts
 

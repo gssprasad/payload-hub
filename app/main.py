@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from psycopg.types.json import Jsonb
 
 from . import (adapters, agent, ai, alerts, auth, backup, cluster, connectors, cron, datastore, db, mapping_doc,
-               migrate, pipeline, ports, scheduler, vault, workflows)
+               metrics, migrate, pipeline, ports, scheduler, vault, workflows)
 from .transform import SAMPLES, TransformError, parse, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -42,7 +42,9 @@ async def lifespan(_app):
     await ports.start()
     await scheduler.start()
     await alerts.start()
+    await metrics.start()
     yield
+    await metrics.stop()
     await alerts.stop()
     await scheduler.stop()
     await ports.stop()
@@ -1839,8 +1841,14 @@ async def inbound(code: str, request: Request, wait: bool = True,
     wait=true (default) returns the transformed output; wait=false returns 202 with a transaction id.
     X-Processing-Ms in the answer says how long the server spent on the call."""
     started = time.perf_counter()
-    response = await _inbound(code, request, wait, x_api_key)
-    response.headers["X-Processing-Ms"] = f"{(time.perf_counter() - started) * 1000:.1f}"
+    try:
+        response = await _inbound(code, request, wait, x_api_key)
+    except HTTPException as e:
+        metrics.INBOUND_SECONDS.labels(code, str(e.status_code)).observe(time.perf_counter() - started)
+        raise
+    elapsed = time.perf_counter() - started
+    metrics.INBOUND_SECONDS.labels(code, str(response.status_code)).observe(elapsed)
+    response.headers["X-Processing-Ms"] = f"{elapsed * 1000:.1f}"
     return response
 
 
@@ -2230,5 +2238,5 @@ async def health():
 
 
 @app.get("/metrics")
-async def metrics():
+async def prometheus_metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

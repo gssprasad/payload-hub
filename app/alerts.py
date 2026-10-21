@@ -20,7 +20,7 @@ from email.message import EmailMessage
 
 import httpx
 
-from . import db
+from . import db, metrics
 
 log = logging.getLogger("alerts")
 
@@ -105,6 +105,7 @@ async def _fire(rule: dict, event: str, key: str, subject: str, detail: str, att
     if not recovery and rule["cooldown_minutes"] > 0 and await db.alert_sent_since(
             rule["id"], key, datetime.now(timezone.utc) - timedelta(minutes=rule["cooldown_minutes"])):
         await db.record_alert(rule["id"], event, key, subject, detail, "suppressed", [])
+        metrics.ALERTS.labels(event, "suppressed").inc()
         return
     results, sent = [], 0
     for ch in await db.alert_channels(rule["channels"]):
@@ -119,6 +120,7 @@ async def _fire(rule: dict, event: str, key: str, subject: str, detail: str, att
             await db.update_alert_channel_state(ch["id"], str(e) or type(e).__name__)
     status = "no_channel" if not results else "sent" if sent == len(results) else "partial" if sent else "failed"
     await db.record_alert(rule["id"], event, key, subject, detail, status, results)
+    metrics.ALERTS.labels(event, status).inc()
     await db.mark_rule_fired(rule["id"])
 
 
