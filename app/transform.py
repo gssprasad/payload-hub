@@ -113,6 +113,28 @@ def to_csv(payload: str, fmt: str, delimiter: str = ",") -> str:
     return buf.getvalue()
 
 
+def query_target(target: str, payload: str, fmt: str) -> str:
+    """Encode the mapped JSON object as query parameters, preserving the configured query."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    if fmt != "json":
+        raise TransformError("Query parameters require JSON output from the request mapping.")
+    data = parse(payload, fmt)
+    if not isinstance(data, dict):
+        raise TransformError("Query parameters require a JSON object.")
+    pairs = []
+    for key, value in data.items():
+        for item in value if isinstance(value, list) else [value]:
+            if item is None:
+                continue
+            if isinstance(item, (dict, list)):
+                raise TransformError(f"Query parameter '{key}' must contain scalar values, not objects or nested lists.")
+            pairs.append((key, str(item).lower() if isinstance(item, bool) else str(item)))
+    parts = urlsplit(target)
+    existing = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in data]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(existing + pairs), parts.fragment))
+
+
 def convert_response(body: str, content_type: str, expression: str | None, response_format: str,
                      request_format: str) -> tuple[str, str]:
     """Turn an upstream API's response into the format the original caller expects.

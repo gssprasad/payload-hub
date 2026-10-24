@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 
 from . import adapters, cluster, db, metrics, pipeline
-from .transform import TransformError, convert_response, to_csv
+from .transform import TransformError, convert_response, query_target, to_csv
 
 log = logging.getLogger("connectors")
 
@@ -134,6 +134,11 @@ async def forward(partner: dict, txn: dict) -> dict:
         conn = await db.get_connection(partner["reply_connection"]) or {}
         adapter = await adapter_for(partner["reply_connection"])
         headers = {"X-Transaction-Id": txn_id, "X-Partner": partner["code"], "Idempotency-Key": txn_id}
+        target = partner["reply_path"] or ""
+        if partner.get("send_format") == "query":
+            if not isinstance(adapter, adapters.HTTP):
+                raise TransformError("Query parameters require an HTTP connection.")
+            target = query_target(target, txn["output_payload"], txn["output_format"])
         policy = adapters.retry_policy(adapter.config)
         is_http = isinstance(adapter, adapters.HTTP)
         retry_statuses = adapter._retry_statuses() if is_http else set()
@@ -141,7 +146,8 @@ async def forward(partner: dict, txn: dict) -> dict:
             try:
                 if is_http:
                     status, ctype, body, url = await adapter.request(
-                        partner["reply_path"] or "", payload.encode(), headers, content_type, partner.get("reply_method"))
+                        target, b"" if partner.get("send_format") == "query" else payload.encode(),
+                        headers, content_type, partner.get("reply_method"))
                     where = f"{(partner.get('reply_method') or adapter.config.get('method') or 'POST').upper()} {url}"
                 else:
                     detail = await adapter.send(partner["reply_path"] or "", payload.encode(), headers, content_type)

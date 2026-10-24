@@ -40,7 +40,7 @@ def flow_diagram(p: dict, listeners: dict, conns: dict) -> str:
         fmt = {"input": p["input_format"].upper(), "json": "JSON", "xml": "XML", "unchanged": "as-is"}.get(
             p.get("response_format") or "input")
         kind = {"http": "API", "ftp": "file", "database": "table"}.get(c.get("type"), "queue")
-        csv = " · CSV" if p.get("send_format") == "csv" else ""
+        csv = {"csv": " · CSV", "query": " · URL query parameters"}.get(p.get("send_format"), "")
         answer = "response" if c.get("type") == "http" else "receipt"
         lines.append(node("api", f"🎯 Target system: {c.get('name', p['reply_connection'])}\\n{kind} {path.lstrip('/')}{csv}", fill))
         lines.append(f'"out" -> "api" [label="send"]; "api" -> "http" [style=dashed, color="#4f46e5", '
@@ -237,12 +237,16 @@ def _route_form(p, conns, types):
                                    placeholder={"ftp": "e.g. outbound/orders", "database": "e.g. orders_in"}.get(t, f"e.g. {code}.out"))
         f1, f2 = st.columns([3, 1])
         formats = {"output": f"As transformed ({p['output_format'].upper()})", "csv": "CSV"}
+        if t == "http":
+            formats["query"] = "URL query parameters (mapped JSON fields)"
         if t == "database":
             formats = {"output": "Rows (JSON fields → columns)"}
         cur_f = p.get("send_format") or "output"
         send_format = f1.radio("Target system receives", list(formats), list(formats).index(cur_f) if cur_f in formats else 0,
                                format_func=formats.get, horizontal=True,
-                               help="CSV: one row per item of the transformed list (or one row for an object); "
+                               help="Query parameters: map the request to a JSON object; its fields become URL parameters. "
+                                    "Null values are omitted and lists become repeated parameters. "
+                                    "CSV: one row per item of the transformed list (or one row for an object); "
                                     "nested fields become columns like customer.name.")
         delims = {",": "comma", ";": "semicolon", "|": "pipe", "\t": "tab"}
         delim = f2.selectbox("CSV separator", list(delims), list(delims).index(p.get("csv_delimiter") or ",")

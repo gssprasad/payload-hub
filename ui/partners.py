@@ -113,7 +113,8 @@ def api_access_dialog(p):
                               + ("👤 dedicated to this partner" if rc.get("owner_partner") else "🌍 common endpoint")),
                  ("Sends to", f"<code>{((p.get('reply_method') or rc['config'].get('method', 'POST')) + ' ') if http else ''}"
                               f"{common.connection_address(rc, p.get('reply_path'))}</code>"),
-                 ("Sends", f"Content-Type <code>{sends}</code>"),
+                 ("Sends", "URL query parameters (no request body)" if p.get("send_format") == "query"
+                  else f"Content-Type <code>{sends}</code>"),
                  ("Returns to caller", f"Content-Type <code>{MIME[fmt]}</code> (translated)" if fmt
                   else "the target system's answer as is"),
                  ("Response mapping", f"<code>{p['response_expression']}</code>" if p.get("response_expression") else "none")])

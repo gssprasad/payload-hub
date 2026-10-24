@@ -793,7 +793,7 @@ class PartnerReply(BaseModel):
     reply_connection: str | None = None  # the target system
     reply_path: str | None = None  # API path, folder, table, queue or topic
     reply_method: Literal["POST", "PUT", "PATCH", "GET", "DELETE"] | None = None
-    send_format: Literal["output", "csv"] = "output"
+    send_format: Literal["output", "csv", "query"] = "output"
     csv_delimiter: str | None = Field(default=None, max_length=1)
     response_format: Literal["input", "json", "xml", "unchanged"] = "input"
     response_expression: str | None = None
@@ -803,7 +803,7 @@ class PartnerReply(BaseModel):
 async def set_partner_reply(code: str, req: PartnerReply):
     """The the target system route: send the transformed payload to the target system (API, file, database, queue) and return its
     answer to the caller - translated or as is. 'transformed' returns the transformed payload directly."""
-    await _partner_or_404(code)
+    partner = await _partner_or_404(code)
     if req.reply_mode == "forward":
         c = await db.get_connection(req.reply_connection or "")
         if not c:
@@ -814,6 +814,8 @@ async def set_partner_reply(code: str, req: PartnerReply):
             raise HTTPException(422, f"'{c['name']}' belongs to partner {c['owner_partner']}.")
         if c["type"] != "http" and not (req.reply_path or "").strip():
             raise HTTPException(422, "Give the folder, table, queue or topic to send to.")
+        if req.send_format == "query" and (c["type"] != "http" or partner["output_format"] != "json"):
+            raise HTTPException(422, "Query parameters require an HTTP connection and JSON mapping output.")
         if c["type"] == "database" and req.send_format == "csv":
             raise HTTPException(422, "A database table takes rows, not CSV - choose 'as transformed' (JSON).")
     await db.update_partner(code, reply_mode=req.reply_mode,

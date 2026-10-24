@@ -265,7 +265,7 @@ def partner_endpoints(p: dict, conns: dict) -> list[dict]:
         rows.append({"Direction": "🎯 Target system (sync)",
                      "Type": f"{c['type'].upper()} ({c['name']}) · " + ("👤 dedicated" if c.get("owner_partner") else "🌍 common"),
                      "Address": method + connection_address(c, p.get("reply_path")),
-                     "Details": ("sends CSV · " if p.get("send_format") == "csv" else "")
+                     "Details": {"csv": "sends CSV · ", "query": "sends URL query parameters · "}.get(p.get("send_format"), "")
                                 + ("response" if http else "delivery receipt") + " returned to caller "
                                 + ("as is" if p.get("response_format") == "unchanged" else "translated")
                                 + f" · retry: {retry_summary(c)}"})
